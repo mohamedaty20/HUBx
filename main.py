@@ -454,6 +454,7 @@ def dashboard_page():
         gemini_label = ui.label("Gemini calls: 0")
         kb_label = ui.label("Knowledge: 0")
         refined_label = ui.label("Refined: 0")
+        pending_label = ui.label("Queue: 0")
         error_label = ui.label("").classes("text-red-500")
 
     debug_label = ui.label("").classes("text-gray-600 mt-2")
@@ -497,6 +498,7 @@ def dashboard_page():
         gemini_label.text = f"Gemini calls: {s['gemini_calls']}"
         kb_label.text = f"Knowledge: {s['knowledge_total']}"
         refined_label.text = f"Refined: {s['knowledge_refined']}"
+        pending_label.text = f"Queue: {s.get('pending_topics', 0)}"
         error_label.text = s["last_error"][:200]
         debug_label.text = s["last_debug"]
         gemini_err_label.text = (
