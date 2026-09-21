@@ -1,6 +1,5 @@
 # db.py
-# Turso schema + CRUD. Refuses to fall back to a local file on Render,
-# because Render's filesystem is ephemeral and would lose all data.
+# Turso schema + CRUD. Refuses to fall back to a local file on Render.
 
 import os
 import json
@@ -11,10 +10,30 @@ from typing import Any
 import libsql
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-TURSO_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+
+def _clean(v: str) -> str:
+    """Strip whitespace AND accidental surrounding quotes."""
+    v = (v or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return v
+
+
+TURSO_URL = _clean(os.getenv("TURSO_DATABASE_URL", ""))
+TURSO_TOKEN = _clean(os.getenv("TURSO_AUTH_TOKEN", ""))
 ON_RENDER = bool(os.getenv("RENDER"))
+
+# --- boot-time diagnostics: visible in Render logs ---
+print("=== HUBx env check ===")
+print(f"RENDER              = {os.getenv('RENDER')!r}")
+print(f"TURSO_DATABASE_URL  = len={len(TURSO_URL)} startswith_libsql="
+      f"{TURSO_URL.startswith('libsql://')} head={TURSO_URL[:30]!r}")
+print(f"TURSO_AUTH_TOKEN    = len={len(TURSO_TOKEN)} head={TURSO_TOKEN[:8]!r}")
+print(f"GEMINI_API_KEY      = len={len(os.getenv('GEMINI_API_KEY',''))}")
+print(f"GEMINI_MODEL        = {os.getenv('GEMINI_MODEL')!r}")
+print("=====================")
 
 _conn = None
 _conn_info = "not connected"
@@ -25,25 +44,24 @@ def get_conn():
     if _conn is not None:
         return _conn
 
-    if TURSO_URL and TURSO_URL.startswith("libsql://"):
+    if TURSO_URL.startswith("libsql://"):
         _conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
         _conn_info = f"turso: {TURSO_URL[:40]}..."
         logger.info("Connected to Turso: %s", TURSO_URL[:40])
-    elif TURSO_URL and TURSO_URL.startswith("file:"):
+    elif TURSO_URL.startswith("file:"):
         if ON_RENDER:
             raise RuntimeError(
-                "TURSO_DATABASE_URL is set to a local file but you are on "
-                "Render. Render's filesystem is ephemeral - all data will "
-                "be lost on every deploy. Set TURSO_DATABASE_URL to your "
-                "libsql:// URL in the Render Environment tab."
+                "TURSO_DATABASE_URL is a local file but you are on Render. "
+                "Set it to your libsql:// URL in the Render Environment tab."
             )
         _conn = libsql.connect(TURSO_URL.replace("file:", ""))
         _conn_info = f"local file: {TURSO_URL}"
     else:
         if ON_RENDER:
             raise RuntimeError(
-                "TURSO_DATABASE_URL is not set. Add it to the Render "
-                "Environment tab: TURSO_DATABASE_URL=libsql://..."
+                "TURSO_DATABASE_URL is not set or is malformed. It must "
+                "start with libsql://. Current value length="
+                f"{len(TURSO_URL)}. Add it in the Render Environment tab."
             )
         _conn = libsql.connect("hubx.db")
         _conn_info = "local file: hubx.db (dev only)"
@@ -51,7 +69,6 @@ def get_conn():
 
 
 def db_health() -> dict:
-    """Returns connection info + row counts for the dashboard."""
     info = {"connection": _conn_info, "ok": False, "error": ""}
     try:
         conn = get_conn()
@@ -106,10 +123,6 @@ def init_db():
     """)
     conn.commit()
 
-
-# ---------------------------------------------------------------
-# knowledge
-# ---------------------------------------------------------------
 
 def upsert_knowledge(topic: str, category: str, content: str,
                      confidence: float = 0.5) -> int:
@@ -190,10 +203,6 @@ def knowledge_stats():
     return {"total": total, "refined": refined}
 
 
-# ---------------------------------------------------------------
-# learning_runs
-# ---------------------------------------------------------------
-
 def log_learning_run(cycle: int, topic: str, added: int, refined: int,
                      calls: int, error: str = ""):
     conn = get_conn()
@@ -214,10 +223,6 @@ def recent_learning_runs(limit: int = 20):
         FROM learning_runs ORDER BY id DESC LIMIT ?
     """, (limit,)).fetchall()
 
-
-# ---------------------------------------------------------------
-# check_reports
-# ---------------------------------------------------------------
 
 def save_check_report(filename: str, file_type: str, original_text: str,
                       issues: list, score: float, summary: str) -> int:
