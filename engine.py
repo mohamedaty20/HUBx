@@ -10,7 +10,7 @@ from typing import Optional
 
 import feedparser
 
-from sources import SOURCES, LIVE_FETCH_URLS, get_tier
+from sources import SOURCES, LIVE_FETCH_URLS, FALLBACK_URLS, get_tier
 from compliance import safe_fetch, ComplianceError
 from db import (get_active_strategy, save_strategy, start_run, finish_run,
                 log_failure, insert_job, recent_failures)
@@ -93,21 +93,38 @@ class Engine:
                 if not url:
                     debug_lines.append(f"{domain}: no live URL configured")
                     continue
+
                 try:
                     text = await safe_fetch(url)
                     fetched += 1
                     all_jobs = self._parse_feed_or_html(text, domain)
                     kept_before = kept
+                    first_reject = ""
 
                     for job in all_jobs[:MAX_JOBS_PER_CYCLE]:
                         if self.paused:
                             break
                         iso_date = self._normalize_date(job.get("posted_date"))
                         if not iso_date:
+                            if not first_reject:
+                                first_reject = (
+                                    f"no date: "
+                                    f"{(job.get('title') or '')[:40]}"
+                                )
                             continue
                         if not self._within_window(iso_date, MAX_AGE_DAYS):
+                            if not first_reject:
+                                first_reject = (
+                                    f"old ({iso_date}): "
+                                    f"{(job.get('title') or '')[:40]}"
+                                )
                             continue
                         if not self._is_egypt_civil(job):
+                            if not first_reject:
+                                first_reject = (
+                                    f"filter: "
+                                    f"{(job.get('title') or '')[:40]}"
+                                )
                             continue
 
                         job["posted_date"] = iso_date
@@ -116,14 +133,55 @@ class Engine:
                         insert_job(job)
                         kept += 1
 
-                    debug_lines.append(
+                    line = (
                         f"{domain}: {len(all_jobs)} entries, "
                         f"{kept - kept_before} kept"
                     )
+                    if first_reject:
+                        line += f" [1st reject: {first_reject}]"
+                    debug_lines.append(line)
+
                 except ComplianceError as e:
-                    errors += 1
-                    debug_lines.append(f"{domain}: compliance - {e}")
-                    log_failure(strategy_id, "", domain, "compliance", str(e))
+                    # Try fallback URLs for this domain
+                    fallbacks = FALLBACK_URLS.get(domain, [])
+                    recovered = False
+                    for fb in fallbacks:
+                        if self.paused:
+                            break
+                        try:
+                            text = await safe_fetch(fb)
+                            all_jobs = self._parse_feed_or_html(text, domain)
+                            kept_before = kept
+                            for job in all_jobs[:MAX_JOBS_PER_CYCLE]:
+                                iso_date = self._normalize_date(
+                                    job.get("posted_date"))
+                                if not iso_date:
+                                    continue
+                                if not self._within_window(
+                                        iso_date, MAX_AGE_DAYS):
+                                    continue
+                                if not self._is_egypt_civil(job):
+                                    continue
+                                job["posted_date"] = iso_date
+                                job["source_domain"] = domain
+                                job["source_tier"] = get_tier(domain)
+                                insert_job(job)
+                                kept += 1
+                            debug_lines.append(
+                                f"{domain} (fallback): "
+                                f"{len(all_jobs)} entries, "
+                                f"{kept - kept_before} kept"
+                            )
+                            recovered = True
+                            break
+                        except Exception:
+                            continue
+                    if not recovered:
+                        errors += 1
+                        debug_lines.append(f"{domain}: {e}")
+                        log_failure(strategy_id, "", domain,
+                                    "compliance", str(e))
+
                 except Exception as e:
                     errors += 1
                     debug_lines.append(f"{domain}: fetch error - {e}")
