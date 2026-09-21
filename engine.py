@@ -1,5 +1,7 @@
 # engine.py
 # 70-second loop with pause/start, cancellation, counters.
+# Pause is REAL: when paused, no Gemini call is initiated, and any
+# in-flight call's response is discarded, not stored.
 
 import asyncio
 import datetime
@@ -159,7 +161,7 @@ class Engine:
             )
             strategy = get_active_strategy()
             self.last_debug = (
-                f"rebuilt strategy → sources: {bootstrap_sources}"
+                f"rebuilt strategy -> sources: {bootstrap_sources}"
             )
         return strategy
 
@@ -199,7 +201,7 @@ class Engine:
         jobs = []
         feed = feedparser.parse(text)
         for entry in feed.entries[:100]:
-            # Prefer struct_time from feedparser — more reliable than the string
+            # Prefer struct_time from feedparser - more reliable than the string
             iso = ""
             for key in ("published_parsed", "updated_parsed"):
                 t = entry.get(key)
@@ -279,15 +281,17 @@ class Engine:
             (job.get("title") or "").lower(),
             (job.get("description_full") or "").lower(),
         ])
-        egypt_terms = ("egypt", "cairo", "alexandria", "giza",
-                       "mena", "egyptian", "north africa")
+        egypt_terms = (
+            "egypt", "cairo", "alexandria", "giza", "mena",
+            "egyptian", "north africa", "mısır", "misr", "qahira",
+        )
         civil_terms = (
             "civil", "structural", "geotechnical", "transportation",
             "water resources", "construction", "site engineer",
             "quantity survey", "infrastructure", "highway", "bridge",
-            "sanitation", "watsan", "wash", "shelter",
-            "roads", "dams", "foundations", "building",
-            "engineer",  # UN posts use just "Engineer"
+            "sanitation", "watsan", "wash", "shelter", "urban planning",
+            "roads", "dams", "foundations", "building", "engineer",
+            "architect", "water", "energy", "environment",
         )
         return any(w in blob for w in egypt_terms) and \
                any(w in blob for w in civil_terms)
