@@ -158,8 +158,6 @@ def init_db():
     conn.commit()
 
 
-# ---------------- knowledge ----------------
-
 def upsert_knowledge(topic, category, content, confidence=0.5):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
@@ -290,8 +288,6 @@ def runs_per_cycle(limit=40):
     """, (limit,)).fetchall()[::-1]
 
 
-# ---------------- templates ----------------
-
 def upsert_template(name, category, content, confidence=0.5):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
@@ -382,8 +378,6 @@ def template_stats():
     return {"total": total, "refined": refined, "pending": pending}
 
 
-# ---------------- pending_topics ----------------
-
 def add_pending_topic(topic, category, source="ai", parent_topic=""):
     conn = get_conn()
     topic = (topic or "").strip()
@@ -425,8 +419,6 @@ def pending_count():
     return conn.execute(
         "SELECT COUNT(*) FROM pending_topics").fetchone()[0]
 
-
-# ---------------- pending_templates ----------------
 
 def add_pending_template(name, category, source="ai", parent_name=""):
     conn = get_conn()
@@ -470,8 +462,6 @@ def pending_template_count():
         "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
 
 
-# ---------------- runs ----------------
-
 def log_learning_run(cycle, topic, added, refined, calls, error=""):
     conn = get_conn()
     conn.execute("""
@@ -511,8 +501,6 @@ def recent_template_runs(limit=20):
         FROM template_runs ORDER BY id DESC LIMIT ?
     """, (limit,)).fetchall()
 
-
-# ---------------- check_reports ----------------
 
 def save_check_report(filename, file_type, original_text, issues,
                       score, summary, compliance=""):
