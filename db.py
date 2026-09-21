@@ -1,6 +1,6 @@
 # db.py
-# Turso / SQLite schema + CRUD helpers.
-# Personal data stored only if verbatim in the public posting.
+# Turso schema + CRUD for the self-learning knowledge store,
+# learning run log, and user check reports.
 
 import os
 import json
@@ -28,175 +28,173 @@ def get_conn():
 def init_db():
     conn = get_conn()
     conn.executescript("""
-    CREATE TABLE IF NOT EXISTS jobs (
+    CREATE TABLE IF NOT EXISTS knowledge (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        company TEXT,
-        location TEXT,
-        posted_date TEXT,
-        url TEXT,
-        description_full TEXT,
-        recruiter_name TEXT,
-        recruiter_title TEXT,
-        recruiter_contact TEXT,
-        source_domain TEXT,
-        source_tier TEXT,
-        relevance_score REAL,
-        quality_score REAL,
-        first_seen TEXT,
-        expires_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS strategies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        topic TEXT UNIQUE,
+        category TEXT,
+        content TEXT,
+        refined_content TEXT,
+        version INTEGER DEFAULT 1,
+        confidence REAL DEFAULT 0.5,
         created_at TEXT,
-        queries_json TEXT,
-        sources_json TEXT,
-        reasoning TEXT,
-        confidence REAL,
-        active INTEGER DEFAULT 0
+        updated_at TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS runs (
+    CREATE TABLE IF NOT EXISTS learning_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        strategy_id INTEGER,
-        started_at TEXT,
-        finished_at TEXT,
-        fetched INTEGER DEFAULT 0,
-        kept INTEGER DEFAULT 0,
-        errors INTEGER DEFAULT 0
+        cycle INTEGER,
+        topic_processed TEXT,
+        items_added INTEGER DEFAULT 0,
+        items_refined INTEGER DEFAULT 0,
+        gemini_calls INTEGER DEFAULT 0,
+        error TEXT,
+        created_at TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS failures (
+    CREATE TABLE IF NOT EXISTS check_reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        strategy_id INTEGER,
-        query TEXT,
-        domain TEXT,
-        error_type TEXT,
-        error_msg TEXT,
+        filename TEXT,
+        file_type TEXT,
+        original_text TEXT,
+        issues_json TEXT,
+        score REAL,
+        summary TEXT,
         created_at TEXT
     );
     """)
     conn.commit()
 
 
-def insert_job(job: dict[str, Any]) -> int:
+# ---------------------------------------------------------------
+# knowledge
+# ---------------------------------------------------------------
+
+def upsert_knowledge(topic: str, category: str, content: str,
+                     confidence: float = 0.5) -> int:
     conn = get_conn()
-    cur = conn.execute("""
-        INSERT INTO jobs (title, company, location, posted_date, url,
-            description_full, recruiter_name, recruiter_title,
-            recruiter_contact, source_domain, source_tier,
-            relevance_score, quality_score, first_seen, expires_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        job.get("title"), job.get("company"), job.get("location"),
-        job.get("posted_date"), job.get("url"),
-        job.get("description_full"),
-        job.get("recruiter_name"), job.get("recruiter_title"),
-        job.get("recruiter_contact"), job.get("source_domain"),
-        job.get("source_tier"), job.get("relevance_score"),
-        job.get("quality_score"),
-        datetime.datetime.utcnow().isoformat(),
-        job.get("expires_at"),
-    ))
-    conn.commit()
-    return cur.lastrowid
-
-
-def get_jobs(limit: int = 200, date_from: str | None = None,
-             date_to: str | None = None, location: str | None = None):
-    conn = get_conn()
-    q = "SELECT * FROM jobs WHERE 1=1"
-    params = []
-    if date_from:
-        q += " AND posted_date >= ?"
-        params.append(date_from)
-    if date_to:
-        q += " AND posted_date <= ?"
-        params.append(date_to)
-    if location:
-        q += " AND location LIKE ?"
-        params.append(f"%{location}%")
-    q += " ORDER BY first_seen DESC LIMIT ?"
-    params.append(limit)
-    return conn.execute(q, params).fetchall()
-
-
-def delete_jobs_by_date(cutoff_iso: str) -> int:
-    """Retention: delete records older than cutoff. Returns rows deleted."""
-    conn = get_conn()
-    cur = conn.execute("DELETE FROM jobs WHERE first_seen < ?", (cutoff_iso,))
-    conn.commit()
-    return cur.rowcount
-
-
-def save_strategy(queries: list, sources: list, reasoning: str,
-                  confidence: float, active: bool = True) -> int:
-    conn = get_conn()
-    conn.execute("UPDATE strategies SET active = 0")
-    cur = conn.execute("""
-        INSERT INTO strategies (created_at, queries_json, sources_json,
-            reasoning, confidence, active)
-        VALUES (?,?,?,?,?,?)
-    """, (
-        datetime.datetime.utcnow().isoformat(),
-        json.dumps(queries), json.dumps(sources),
-        reasoning, confidence, 1 if active else 0,
-    ))
-    conn.commit()
-    return cur.lastrowid
-
-
-def get_active_strategy():
-    conn = get_conn()
+    now = datetime.datetime.utcnow().isoformat()
     row = conn.execute(
-        "SELECT * FROM strategies WHERE active = 1 ORDER BY id DESC LIMIT 1"
+        "SELECT id, version FROM knowledge WHERE topic = ?", (topic,)
     ).fetchone()
     if row:
-        return {
-            "id": row[0], "created_at": row[1],
-            "queries": json.loads(row[2]) if row[2] else [],
-            "sources": json.loads(row[3]) if row[3] else [],
-            "reasoning": row[4], "confidence": row[5],
-        }
-    return None
-
-
-def start_run(strategy_id: int) -> int:
-    conn = get_conn()
+        conn.execute("""
+            UPDATE knowledge
+            SET content = ?, confidence = ?, version = version + 1,
+                updated_at = ?
+            WHERE id = ?
+        """, (content, confidence, now, row[0]))
+        conn.commit()
+        return row[0]
     cur = conn.execute("""
-        INSERT INTO runs (strategy_id, started_at, fetched, kept, errors)
-        VALUES (?,?,0,0,0)
-    """, (strategy_id, datetime.datetime.utcnow().isoformat()))
+        INSERT INTO knowledge (topic, category, content, refined_content,
+            version, confidence, created_at, updated_at)
+        VALUES (?,?,?,?,1,?,?,?)
+    """, (topic, category, content, "", confidence, now, now))
     conn.commit()
     return cur.lastrowid
 
 
-def finish_run(run_id: int, fetched: int, kept: int, errors: int):
+def set_refined(knowledge_id: int, refined: str, confidence: float = 0.7):
     conn = get_conn()
     conn.execute("""
-        UPDATE runs SET finished_at = ?, fetched = ?, kept = ?, errors = ?
+        UPDATE knowledge
+        SET refined_content = ?, confidence = ?, updated_at = ?
         WHERE id = ?
-    """, (datetime.datetime.utcnow().isoformat(), fetched, kept, errors, run_id))
+    """, (refined, confidence,
+          datetime.datetime.utcnow().isoformat(), knowledge_id))
     conn.commit()
 
 
-def log_failure(strategy_id: int, query: str, domain: str,
-                error_type: str, error_msg: str):
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO failures (strategy_id, query, domain, error_type,
-            error_msg, created_at)
-        VALUES (?,?,?,?,?,?)
-    """, (strategy_id, query, domain, error_type,
-          error_msg[:500], datetime.datetime.utcnow().isoformat()))
-    conn.commit()
-
-
-def recent_failures(strategy_id: int, limit: int = 20):
+def oldest_knowledge_for_refinement(limit: int = 1):
+    """Return the oldest-updated knowledge rows to refine next."""
     conn = get_conn()
     return conn.execute("""
-        SELECT query, domain, error_type, error_msg
-        FROM failures WHERE strategy_id = ?
-        ORDER BY id DESC LIMIT ?
-    """, (strategy_id, limit)).fetchall()
+        SELECT id, topic, category, content, refined_content, version
+        FROM knowledge
+        ORDER BY updated_at ASC
+        LIMIT ?
+    """, (limit,)).fetchall()
+
+
+def get_all_knowledge(category: str | None = None, limit: int = 200):
+    conn = get_conn()
+    if category:
+        return conn.execute("""
+            SELECT id, topic, category, content, refined_content, version,
+                   confidence, updated_at
+            FROM knowledge WHERE category = ?
+            ORDER BY updated_at DESC LIMIT ?
+        """, (category, limit)).fetchall()
+    return conn.execute("""
+        SELECT id, topic, category, content, refined_content, version,
+               confidence, updated_at
+        FROM knowledge
+        ORDER BY updated_at DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+
+def get_knowledge_by_id(knowledge_id: int):
+    conn = get_conn()
+    return conn.execute(
+        "SELECT * FROM knowledge WHERE id = ?", (knowledge_id,)
+    ).fetchone()
+
+
+def knowledge_stats():
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
+    refined = conn.execute(
+        "SELECT COUNT(*) FROM knowledge WHERE refined_content != ''"
+    ).fetchone()[0]
+    return {"total": total, "refined": refined}
+
+
+# ---------------------------------------------------------------
+# learning_runs
+# ---------------------------------------------------------------
+
+def log_learning_run(cycle: int, topic: str, added: int, refined: int,
+                     calls: int, error: str = ""):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO learning_runs (cycle, topic_processed, items_added,
+            items_refined, gemini_calls, error, created_at)
+        VALUES (?,?,?,?,?,?,?)
+    """, (cycle, topic, added, refined, calls, error[:500],
+          datetime.datetime.utcnow().isoformat()))
+    conn.commit()
+
+
+def recent_learning_runs(limit: int = 20):
+    conn = get_conn()
+    return conn.execute("""
+        SELECT cycle, topic_processed, items_added, items_refined,
+               gemini_calls, error, created_at
+        FROM learning_runs ORDER BY id DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+
+# ---------------------------------------------------------------
+# check_reports
+# ---------------------------------------------------------------
+
+def save_check_report(filename: str, file_type: str, original_text: str,
+                      issues: list, score: float, summary: str) -> int:
+    conn = get_conn()
+    cur = conn.execute("""
+        INSERT INTO check_reports (filename, file_type, original_text,
+            issues_json, score, summary, created_at)
+        VALUES (?,?,?,?,?,?,?)
+    """, (filename, file_type, original_text,
+          json.dumps(issues), score, summary,
+          datetime.datetime.utcnow().isoformat()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def recent_check_reports(limit: int = 50):
+    conn = get_conn()
+    return conn.execute("""
+        SELECT id, filename, file_type, score, summary, created_at
+        FROM check_reports ORDER BY id DESC LIMIT ?
+    """, (limit,)).fetchall()
