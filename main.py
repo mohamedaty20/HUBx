@@ -58,7 +58,7 @@ ui.add_head_html("""
 .hubx-cat-btn-selected { background: #1976d2 !important;
                          color: white !important; }
 </style>
-""")
+""", shared=True)
 
 
 def _header():
