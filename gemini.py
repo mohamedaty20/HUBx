@@ -1,5 +1,6 @@
 # gemini.py
-# Gemini wrapper. Validates and cleans the model name, tries fallbacks.
+# Uses GEMINI_MODEL exactly as you set it. No overriding.
+# Fallbacks only run if your model truly fails, and they include modern names.
 
 import os
 import asyncio
@@ -19,26 +20,21 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 
-def _clean_model(v):
+def _strip(v):
+    """Only strip whitespace and surrounding quotes. Nothing else."""
     v = (v or "").strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
         v = v[1:-1].strip()
-    # If the value is literally the env var name, it's a config error.
-    if v.upper() in ("GEMINI_MODEL", "MODEL", ""):
-        return ""
-    # Strip a leading "models/" if present.
-    if v.startswith("models/"):
-        v = v[len("models/"):]
-    # Must start with "gemini-"
-    if not v.startswith("gemini-"):
-        return ""
     return v
 
 
-_preferred = _clean_model(os.getenv("GEMINI_MODEL", ""))
+# Use YOUR model first, exactly as set. Only add fallbacks that are known-alive.
+_user_model = _strip(os.getenv("GEMINI_MODEL", ""))
 MODEL_CANDIDATES = []
-for m in [_preferred, "gemini-2.0-flash", "gemini-2.0-flash-lite",
-          "gemini-2.5-flash", "gemini-1.5-flash"]:
+if _user_model:
+    MODEL_CANDIDATES.append(_user_model)
+for m in ("gemini-3.5-flash-lite", "gemini-3.6-flash",
+          "gemini-3.5-flash", "gemini-3.0-flash-lite"):
     if m and m not in MODEL_CANDIDATES:
         MODEL_CANDIDATES.append(m)
 
@@ -119,10 +115,6 @@ async def _call(prompt, json_mode=False):
     logger.error("All models failed. last_error=%s", last_error)
     return ""
 
-
-# ---------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------
 
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
