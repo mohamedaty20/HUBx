@@ -18,6 +18,15 @@ PORT = int(os.getenv("PORT", "8080"))
 init_db()
 
 
+def _render_header():
+    with ui.header().classes("items-center justify-between"):
+        ui.label("HUBx").classes("text-xl font-bold")
+        with ui.row():
+            ui.link("Home", "/").classes("text-white")
+            ui.link("Dashboards", "/dashboards").classes("text-white")
+            ui.link("Manual Paste", "/paste").classes("text-white")
+
+
 async def _keepalive():
     while True:
         await asyncio.sleep(600)
@@ -35,6 +44,7 @@ app.on_startup(lambda: asyncio.create_task(_keepalive()))
 
 @ui.page("/")
 def home():
+    _render_header()
     ui.label("HUBx - Civil Engineering Jobs (Egypt)").classes(
         "text-3xl font-bold")
 
@@ -106,6 +116,7 @@ def home():
 
 @ui.page("/dashboards")
 def dashboards():
+    _render_header()
     ui.label("Dashboards").classes("text-2xl font-bold")
     rows = get_jobs(limit=1000)
 
@@ -180,6 +191,7 @@ def dashboards():
 
 @ui.page("/paste")
 def manual_paste():
+    _render_header()
     ui.label("Manual Paste (Tier C sites)").classes("text-2xl font-bold")
 
     domain = ui.select(MANUAL_PASTE_DOMAINS, label="Domain").classes("w-64")
@@ -221,10 +233,5 @@ def manual_paste():
     ui.button("Parse", on_click=do_parse)
     ui.button("Confirm & Store", on_click=do_store).props("color=green")
 
-
-with ui.header():
-    ui.link("Home", "/")
-    ui.link("Dashboards", "/dashboards")
-    ui.link("Manual Paste", "/paste")
 
 ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx")
