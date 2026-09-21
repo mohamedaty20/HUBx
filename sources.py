@@ -11,24 +11,15 @@ TIER_C = "C"
 TIER_D = "D"
 
 TOs_FORBIDDEN = {
-    "wuzzuf.net",
-    "bayt.com",
-    "linkedin.com",
-    "indeed.com",
-    "tanqeeb.com",
-    "forasna.com",
-    "gulfTalent.com",
-    "unjobs.org",       # explicitly forbids automated access
-    "reliefweb.int",    # RSS blocked by robots.txt; API needs appname
+    "wuzzuf.net", "bayt.com", "linkedin.com", "indeed.com",
+    "tanqeeb.com", "forasna.com", "gulfTalent.com",
+    "unjobs.org", "reliefweb.int",
 }
 
 SOURCES = {
-    # Tier A - official RSS feeds that actually work
     "unjoblink.org": TIER_A,
-    "untalent.org": TIER_A,
     "weworkremotely.com": TIER_A,
 
-    # Tier C - manual paste only
     "wuzzuf.net": TIER_C,
     "bayt.com": TIER_C,
     "linkedin.com": TIER_C,
@@ -37,26 +28,21 @@ SOURCES = {
     "forasna.com": TIER_C,
     "gulfTalent.com": TIER_C,
     "unjobs.org": TIER_C,
+    "naqrajobs.com": TIER_C,
 
-    # Tier D - blocked
     "facebook.com": TIER_D,
     "twitter.com": TIER_D,
 }
 
-# UNJobLink WordPress RSS feed (works, no auth needed).
-# UN Talent open API (fair use free with attribution).
 LIVE_FETCH_URLS = {
     "unjoblink.org": "https://unjoblink.org/?feed=job_feed",
-    "untalent.org": "https://untalent.org/api/jobs?format=rss",
     "weworkremotely.com": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
 }
 
 FALLBACK_URLS = {
     "unjoblink.org": [
-        "https://unjoblink.org/feed/",
-    ],
-    "untalent.org": [
-        "https://untalent.org/jobs/rss",
+        "https://unjoblink.org/?feed=job_feed&iwj_location=cairo",
+        "https://unjoblink.org/?feed=job_feed&iwj_location=egypt",
     ],
 }
 
