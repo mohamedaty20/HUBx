@@ -1,12 +1,8 @@
 # main.py
-# NiceGUI app with three tabs:
-# 1. Check Document (upload + OCR + analysis + download reports)
-# 2. Knowledge (browse the self-learned civil quality knowledge base)
-# 3. Dashboard (learning loop stats)
-
 import os
 import asyncio
 import tempfile
+from collections import Counter
 
 from nicegui import ui, app
 
@@ -15,7 +11,7 @@ from db import (init_db, get_all_knowledge, get_knowledge_by_id,
                 recent_learning_runs, knowledge_stats)
 from engine import engine
 from file_reader import extract_text
-from gemini import check_document
+from gemini import check_document, last_error as gemini_last_error
 from report_builder import build_txt, build_pdf, build_xlsx
 
 PORT = int(os.getenv("PORT", "8080"))
@@ -76,6 +72,7 @@ def check_page():
 
     summary_box = ui.markdown("").classes("mt-2")
     score_label = ui.label("").classes("text-xl font-bold mt-2")
+    err_label = ui.label("").classes("text-red-500")
 
     async def handle_upload(e):
         data = await e.content.read()
@@ -103,8 +100,10 @@ def check_page():
         ui.notify("Analysing with Gemini…")
         result = await check_document(filename, ftype, text)
         if not result:
+            err_label.text = f"Gemini error: {gemini_last_error}"
             ui.notify("Gemini returned no result.", color="red")
             return
+        err_label.text = ""
 
         state["result"] = result
         score = float(result.get("score", 0.0))
@@ -129,24 +128,25 @@ def check_page():
     score_label
     summary_box
     issues_table
+    err_label
 
     def dl_txt():
         if not state["result"]:
             ui.notify("Upload a file first.", color="orange"); return
-        data = build_txt(state["filename"], state["result"])
-        ui.download(data, filename="hubx_report.txt")
+        ui.download(build_txt(state["filename"], state["result"]),
+                    filename="hubx_report.txt")
 
     def dl_pdf():
         if not state["result"]:
             ui.notify("Upload a file first.", color="orange"); return
-        data = build_pdf(state["filename"], state["result"])
-        ui.download(data, filename="hubx_report.pdf")
+        ui.download(build_pdf(state["filename"], state["result"]),
+                    filename="hubx_report.pdf")
 
     def dl_xlsx():
         if not state["result"]:
             ui.notify("Upload a file first.", color="orange"); return
-        data = build_xlsx(state["filename"], state["result"])
-        ui.download(data, filename="hubx_report.xlsx")
+        ui.download(build_xlsx(state["filename"], state["result"]),
+                    filename="hubx_report.xlsx")
 
     with ui.row().classes("gap-2 mt-4"):
         ui.button("Download TXT", on_click=dl_txt)
@@ -155,78 +155,95 @@ def check_page():
 
 
 # =================================================================
-# Tab 2 — Knowledge
+# Tab 2 — Knowledge (sidebar + reader)
 # =================================================================
 
 @ui.page("/knowledge")
 def knowledge_page():
     _header()
-    ui.label("Self-Learned Civil Quality Knowledge").classes(
-        "text-2xl font-bold")
 
-    stats = knowledge_stats()
-    ui.label(
-        f"Total topics: {stats['total']}  |  Refined: {stats['refined']}"
-    ).classes("text-gray-600")
+    with ui.row().classes("w-full gap-4 items-center"):
+        ui.label("Self-Learned Civil Quality Knowledge").classes(
+            "text-2xl font-bold")
+        ui.space()
+        stats_label = ui.label("").classes("text-gray-600")
 
-    categories = ["all"] + sorted({
-        r[2] for r in get_all_knowledge(limit=1000) if r[2]
-    })
-    cat_select = ui.select(categories, value="all",
-                           label="Category").classes("w-64 mt-2")
+    selected = {"id": None}
 
-    table = ui.table(
-        columns=[
-            {"name": "topic", "label": "Topic", "field": "topic",
-             "align": "left"},
-            {"name": "category", "label": "Category", "field": "category"},
-            {"name": "version", "label": "Ver", "field": "version"},
-            {"name": "confidence", "label": "Conf",
-             "field": "confidence"},
-            {"name": "updated_at", "label": "Updated",
-             "field": "updated_at"},
-        ],
-        rows=[],
-        row_key="id",
-    ).classes("w-full mt-4")
+    with ui.row().classes("w-full gap-4 mt-4 no-wrap"):
+        # -------- sidebar --------
+        with ui.card().classes("w-72 shrink-0 h-[75vh] overflow-auto"):
+            ui.label("Categories").classes("font-bold")
+            cat_container = ui.column().classes("w-full gap-1")
+            ui.separator()
+            ui.label("Topics").classes("font-bold mt-2")
+            topic_container = ui.column().classes("w-full gap-1")
 
-    detail_box = ui.markdown("").classes(
-        "mt-4 p-4 border rounded w-full whitespace-pre-wrap")
+        # -------- reader --------
+        with ui.card().classes("flex-1 h-[75vh] overflow-auto"):
+            detail = ui.markdown("").classes("whitespace-pre-wrap")
 
-    def load():
-        cat = None if cat_select.value == "all" else cat_select.value
-        rows = get_all_knowledge(category=cat, limit=500)
-        table.rows = [
-            {
-                "id": r[0], "topic": r[1], "category": r[2],
-                "version": r[5], "confidence": round(r[6] or 0, 2),
-                "updated_at": (r[7] or "")[:19],
-            }
-            for r in rows
-        ]
-
-    def on_row_click(e):
-        row = e.args[1] if isinstance(e.args, list) else e.args
-        kid = row.get("id") if isinstance(row, dict) else None
-        if not kid:
-            return
+    def show_item(kid: int):
+        selected["id"] = kid
         k = get_knowledge_by_id(kid)
         if not k:
             return
         body = k[4] or k[3] or "(empty)"
-        detail_box.content = (
-            f"### {k[1]}\n\n"
-            f"*Category: {k[2]} — version {k[5]} — "
-            f"confidence {round(k[6] or 0, 2)}*\n\n"
-            f"{body}"
+        detail.content = (
+            f"# {k[1]}\n\n"
+            f"**Category:** {k[2]}  \n"
+            f"**Version:** {k[5]}  \n"
+            f"**Confidence:** {round(k[6] or 0, 2)}  \n"
+            f"**Created:** {k[7]}  \n"
+            f"**Updated:** {k[8]}\n\n"
+            f"---\n\n{body}"
         )
 
-    table.on("rowClick", on_row_click)
-    cat_select.on("update:model-value", lambda _: load())
-    load()
+    def refresh_sidebar():
+        cat_container.clear()
+        topic_container.clear()
+        rows = get_all_knowledge(limit=1000)
+        s = knowledge_stats()
+        stats_label.text = (
+            f"{s['total']} topics, {s['refined']} refined")
 
-    ui.label("Click a row to read the full note.").classes(
-        "text-gray-500 text-sm mt-2")
+        cats = Counter(r[2] for r in rows if r[2])
+        with cat_container:
+            for cat, n in cats.most_common():
+                ui.button(f"{cat} ({n})",
+                          on_click=lambda c=cat: filter_by(c)
+                          ).props("flat dense align=left").classes(
+                              "w-full justify-start")
+            ui.button("show all",
+                      on_click=lambda: filter_by(None)
+                      ).props("flat dense align=left color=primary"
+                              ).classes("w-full justify-start")
+
+        with topic_container:
+            for r in rows[:200]:
+                kid = r[0]
+                topic = r[1]
+                ui.button(
+                    topic[:45],
+                    on_click=lambda k=kid: show_item(k),
+                ).props("flat dense align=left").classes(
+                    "w-full justify-start text-left")
+
+    def filter_by(cat):
+        topic_container.clear()
+        rows = get_all_knowledge(category=cat, limit=1000)
+        with topic_container:
+            for r in rows[:200]:
+                kid = r[0]
+                topic = r[1]
+                ui.button(
+                    topic[:45],
+                    on_click=lambda k=kid: show_item(k),
+                ).props("flat dense align=left").classes(
+                    "w-full justify-start text-left")
+
+    refresh_sidebar()
+    ui.timer(5.0, refresh_sidebar)
 
 
 # =================================================================
@@ -247,6 +264,7 @@ def dashboard_page():
         error_label = ui.label("").classes("text-red-500")
 
     debug_label = ui.label("").classes("text-gray-600 mt-2")
+    gemini_err_label = ui.label("").classes("text-orange-500 mt-1")
 
     async def do_start():
         await engine.start()
@@ -269,6 +287,8 @@ def dashboard_page():
         refined_label.text = f"Refined: {s['knowledge_refined']}"
         error_label.text = s["last_error"][:200]
         debug_label.text = s["last_debug"]
+        gemini_err_label.text = (
+            f"Gemini: {gemini_last_error}" if gemini_last_error else "")
 
     ui.timer(2.0, refresh)
 
