@@ -1,7 +1,4 @@
 # main.py
-# NiceGUI app: home, dashboards, manual paste.
-# Binds to 0.0.0.0:$PORT as Render requires.
-
 import os
 import asyncio
 import datetime
@@ -54,6 +51,9 @@ def home():
         gemini_label = ui.label("Gemini calls: 0")
         error_label = ui.label("").classes("text-red-500")
 
+    debug_label = ui.label("(waiting for first cycle…)").classes(
+        "text-gray-500 text-sm mt-1")
+
     async def refresh_status():
         status_badge.text = engine.last_status
         status_badge.props(
@@ -61,6 +61,7 @@ def home():
         cycles_label.text = f"Cycles: {engine.cycles_completed}"
         gemini_label.text = f"Gemini calls: {engine.gemini_calls}"
         error_label.text = engine.last_error[:200]
+        debug_label.text = engine.last_debug or "(no debug yet)"
 
     async def do_start():
         await engine.start()
@@ -195,8 +196,7 @@ def manual_paste():
     ui.label("Manual Paste (Tier C sites)").classes("text-2xl font-bold")
 
     domain = ui.select(MANUAL_PASTE_DOMAINS, label="Domain").classes("w-64")
-    text = ui.textarea("Paste job text or HTML here").classes(
-        "w-full h-64")
+    text = ui.textarea("Paste job text or HTML here").classes("w-full h-64")
     preview_table = ui.table(
         columns=[
             {"name": "title", "label": "Title", "field": "title"},
