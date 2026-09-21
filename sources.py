@@ -1,12 +1,11 @@
 # sources.py
-# Seed topics + categories. The engine will EXPAND this list dynamically
-# by asking Gemini for sub-topics, so this is only the starting point.
+# Seed topics + categories. The engine EXPANDS this list by asking Gemini
+# for sub-topics, so this is only the starting point.
 
 LEARNING_INTERVAL_SECONDS = 20
-REFINE_EVERY_N_CYCLES = 4        # 1 refine per 4 generates -> more growth
-EXPAND_EVERY_N = 1               # ask for new sub-topics every cycle
-SUGGESTIONS_PER_CYCLE = 3        # how many new topics to ask Gemini for
-MAX_KNOWLEDGE_ITEMS = 2000       # hard cap
+REFINE_EVERY_N_CYCLES = 4
+SUGGESTIONS_PER_CYCLE = 3
+MAX_KNOWLEDGE_ITEMS = 2000
 
 SEED_TOPICS = [
     # ---- concrete ----
@@ -92,7 +91,8 @@ SEED_TOPICS = [
     # ---- egyptian_codes ----
     ("Egyptian Code ECP 203: concrete design and quality", "egyptian_codes"),
     ("Egyptian Code ECP 204: steel construction quality", "egyptian_codes"),
-    ("Egyptian Code ECP 202: soil mechanics and foundations", "egyptian_codes"),
+    ("Egyptian Code ECP 202: soil mechanics and foundations",
+     "egyptian_codes"),
     ("Egyptian Standard Specifications for materials", "egyptian_codes"),
     ("HBRC guidelines and approvals", "egyptian_codes"),
     ("Egyptian fire code requirements", "egyptian_codes"),
@@ -113,31 +113,28 @@ SEED_TOPICS = [
     ("Setting out accuracy checks", "surveying"),
     ("As-built surveying requirements", "surveying"),
     ("Total station calibration and use", "surveying"),
-    ("Level and verticality tolerances", "surveying"),
+    ("Surveying level and verticality tolerances", "surveying"),
     ("Dimensional control for structures", "surveying"),
 ]
 
-# Prompt for asking Gemini to invent new sub-topics.
-SUGGEST_TOPICS_SYSTEM = """
-You are a curriculum designer for Egyptian civil quality engineering.
-Given a topic the student just finished, propose NEW related sub-topics
-that are not the same as the parent. Focus on specifics that an Egyptian
-site engineer would actually need on site.
+# System prompt with NO curly braces - safe to pass directly.
+SUGGEST_TOPICS_SYSTEM = (
+    "You are a curriculum designer for Egyptian civil quality engineering. "
+    "Given a topic the student just finished, propose NEW related "
+    "sub-topics that are different from the parent. Focus on specifics "
+    "that an Egyptian site engineer would actually need on site. "
+    "Return ONLY a JSON object with a single key called subtopics whose "
+    "value is an array of objects. Each object has a topic string and a "
+    "category string. "
+    "The category must be one of: concrete, steel, soil, water, roads, "
+    "quality_management, egyptian_codes, safety, surveying. "
+    "No LaTeX. No dollar signs. No markdown fences."
+)
 
-Return ONLY valid JSON with this shape:
-{"subtopics": [{"topic": "...", "category": "..."}]}
-
-Categories must be one of:
-concrete, steel, soil, water, roads, quality_management,
-egyptian_codes, safety, surveying
-
-Propose exactly {n} sub-topics. No LaTeX. No dollar signs.
-"""
-
-SUGGEST_TOPICS_USER = """
-Parent topic: {topic}
-Parent category: {category}
-
-Propose {n} new sub-topics in the same or closely related category.
-Each sub-topic must be a specific, checkable engineering topic.
-"""
+SUGGEST_TOPICS_USER = (
+    "Parent topic: {topic}\n"
+    "Parent category: {category}\n\n"
+    "Propose exactly {n} new sub-topics in the same or closely related "
+    "category. Each sub-topic must be a specific, checkable engineering "
+    "topic with a clear title under 80 characters."
+)
