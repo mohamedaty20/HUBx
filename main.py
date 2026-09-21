@@ -11,7 +11,8 @@ from db import (init_db, get_all_knowledge, get_knowledge_by_id,
                 recent_learning_runs, knowledge_stats, db_health)
 from engine import engine
 from file_reader import extract_text
-from gemini import check_document, last_error as gemini_last_error
+from gemini import check_document
+import gemini as gemini_mod
 from report_builder import build_txt, build_pdf, build_xlsx
 
 PORT = int(os.getenv("PORT", "8080"))
@@ -44,6 +45,28 @@ def _header():
             ui.link("Dashboard", "/dashboard").classes("text-white")
 
 
+def _db_banner():
+    """Show a warning banner if we fell back to local SQLite."""
+    h = db_health()
+    if h["mode"] == "local":
+        with ui.row().classes(
+                "bg-orange-100 text-orange-900 p-2 rounded w-full "
+                "items-center gap-2"):
+            ui.icon("warning")
+            ui.label(
+                "Running on LOCAL SQLite — data will be lost on every "
+                "redeploy. To persist data, set TURSO_DATABASE_URL and "
+                "TURSO_AUTH_TOKEN in Render's Environment tab. "
+                f"Reason: {h['error']}"
+            )
+    elif h["mode"] == "turso":
+        with ui.row().classes(
+                "bg-green-50 text-green-800 p-1 rounded w-full "
+                "items-center gap-2"):
+            ui.icon("cloud_done")
+            ui.label(f"Connected to Turso: {h['connection']}")
+
+
 # =================================================================
 # Tab 1 — Check Document
 # =================================================================
@@ -51,6 +74,7 @@ def _header():
 @ui.page("/")
 def check_page():
     _header()
+    _db_banner()
     ui.label("Engineering Document Review").classes("text-2xl font-bold")
     ui.label(
         "Upload a PDF, TXT, XLSX, PNG or JPG. The AI checks it against "
@@ -100,7 +124,7 @@ def check_page():
         ui.notify("Analysing with Gemini…")
         result = await check_document(filename, ftype, text)
         if not result:
-            err_label.text = f"Gemini error: {gemini_last_error}"
+            err_label.text = f"Gemini error: {gemini_mod.last_error}"
             ui.notify("Gemini returned no result.", color="red")
             return
         err_label.text = ""
@@ -114,9 +138,13 @@ def check_page():
         summary_box.content = result.get("summary", "")
         issues_table.rows = result.get("issues", []) or []
 
-        save_check_report(filename, ftype, text,
-                          result.get("issues", []), score,
-                          result.get("summary", ""))
+        try:
+            save_check_report(filename, ftype, text,
+                              result.get("issues", []), score,
+                              result.get("summary", ""))
+        except Exception as ex:
+            ui.notify(f"Could not save report: {ex}", color="orange")
+
         ui.notify(f"Found {len(result.get('issues', []))} issue(s).")
 
     ui.upload(on_upload=handle_upload,
@@ -161,6 +189,7 @@ def check_page():
 @ui.page("/knowledge")
 def knowledge_page():
     _header()
+    _db_banner()
     ui.label("Self-Learned Civil Quality Knowledge").classes(
         "text-2xl font-bold")
 
@@ -193,23 +222,38 @@ def knowledge_page():
             f"---\n\n{body}"
         )
 
+    def render_topics(rows):
+        topic_container.clear()
+        with topic_container:
+            for r in rows[:300]:
+                kid = r[0]
+                topic = r[1]
+                ui.button(
+                    topic[:45],
+                    on_click=lambda k=kid: show_item(k),
+                ).props("flat dense align=left").classes(
+                    "w-full justify-start text-left")
+
+    def filter_by(cat):
+        try:
+            rows = get_all_knowledge(category=cat, limit=1000)
+        except Exception:
+            rows = []
+        render_topics(rows)
+
     def refresh_sidebar():
         cat_container.clear()
         topic_container.clear()
 
-        h = db_health()
-        rows = []
-        if h["ok"]:
+        try:
+            s = knowledge_stats()
             rows = get_all_knowledge(limit=1000)
             status_bar.text = (
-                f"DB: {h['connection']}  |  "
-                f"Knowledge rows: {h['knowledge']}  |  "
-                f"Runs: {h['runs']}  |  Checks: {h['checks']}"
+                f"Knowledge rows: {s['total']}  |  Refined: {s['refined']}"
             )
-        else:
-            status_bar.text = (
-                f"DB ERROR: {h['error']}  |  connection: {h['connection']}"
-            )
+        except Exception as ex:
+            status_bar.text = f"DB error: {ex}"
+            rows = []
 
         cats = Counter(r[2] for r in rows if r[2])
         with cat_container:
@@ -223,28 +267,7 @@ def knowledge_page():
                           ).props("flat dense align=left").classes(
                               "w-full justify-start")
 
-        with topic_container:
-            for r in rows[:300]:
-                kid = r[0]
-                topic = r[1]
-                ui.button(
-                    topic[:45],
-                    on_click=lambda k=kid: show_item(k),
-                ).props("flat dense align=left").classes(
-                    "w-full justify-start text-left")
-
-    def filter_by(cat):
-        topic_container.clear()
-        rows = get_all_knowledge(category=cat, limit=1000)
-        with topic_container:
-            for r in rows[:300]:
-                kid = r[0]
-                topic = r[1]
-                ui.button(
-                    topic[:45],
-                    on_click=lambda k=kid: show_item(k),
-                ).props("flat dense align=left").classes(
-                    "w-full justify-start text-left")
+        render_topics(rows)
 
     refresh_sidebar()
     ui.timer(5.0, refresh_sidebar)
@@ -257,9 +280,10 @@ def knowledge_page():
 @ui.page("/dashboard")
 def dashboard_page():
     _header()
+    _db_banner()
     ui.label("Learning Dashboard").classes("text-2xl font-bold")
 
-    with ui.row().classes("gap-4 items-center mt-2"):
+    with ui.row().classes("gap-4 items-center mt-2 flex-wrap"):
         status_badge = ui.badge("idle", color="grey")
         cycles_label = ui.label("Cycles: 0")
         gemini_label = ui.label("Gemini calls: 0")
@@ -269,21 +293,21 @@ def dashboard_page():
 
     debug_label = ui.label("").classes("text-gray-600 mt-2")
     gemini_err_label = ui.label("").classes("text-orange-500 mt-1")
-    db_label = ui.label("").classes("text-sm text-blue-700 mt-1")
 
     async def do_start():
         await engine.start()
+        refresh()
 
     async def do_pause():
         await engine.pause()
+        refresh()
 
     async def do_one_cycle():
         ui.notify("Running one cycle…")
         try:
             await engine._cycle()
             engine.cycles_completed += 1
-            ui.notify("Cycle complete. Check the debug line.",
-                      color="green")
+            ui.notify("Cycle complete.", color="green")
         except Exception as e:
             ui.notify(f"Cycle failed: {e}", color="red")
         refresh()
@@ -295,7 +319,12 @@ def dashboard_page():
             "color=blue")
 
     def refresh():
-        s = engine.stats()
+        try:
+            s = engine.stats()
+        except Exception as e:
+            s = {"cycles": 0, "gemini_calls": 0, "knowledge_total": 0,
+                 "knowledge_refined": 0, "last_status": f"error: {e}",
+                 "last_error": str(e), "last_debug": ""}
         status_badge.text = s["last_status"]
         status_badge.props(
             f'color={"green" if not engine.paused else "orange"}')
@@ -306,14 +335,11 @@ def dashboard_page():
         error_label.text = s["last_error"][:200]
         debug_label.text = s["last_debug"]
         gemini_err_label.text = (
-            f"Gemini: {gemini_last_error}" if gemini_last_error else "")
-        h = db_health()
-        db_label.text = (
-            f"DB: {h['connection']}"
-            + (f"  |  ERROR: {h['error']}" if not h["ok"] else "")
-        )
+            f"Gemini: {gemini_mod.last_error}" if gemini_mod.last_error
+            else "")
 
     ui.timer(2.0, refresh)
+    refresh()
 
     ui.label("Recent learning runs").classes("text-lg font-bold mt-6")
     runs_table = ui.table(
@@ -332,7 +358,10 @@ def dashboard_page():
     ).classes("w-full mt-2")
 
     def refresh_runs():
-        rows = recent_learning_runs(30)
+        try:
+            rows = recent_learning_runs(30)
+        except Exception:
+            rows = []
         runs_table.rows = [
             {
                 "cycle": r[0], "topic": r[1], "added": r[2],
@@ -360,7 +389,10 @@ def dashboard_page():
     ).classes("w-full mt-2")
 
     def refresh_checks():
-        rows = recent_check_reports(30)
+        try:
+            rows = recent_check_reports(30)
+        except Exception:
+            rows = []
         checks_table.rows = [
             {
                 "filename": r[1], "type": r[2],
