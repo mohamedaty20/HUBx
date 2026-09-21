@@ -1,8 +1,8 @@
 # gemini.py
-# Model name is HARDCODED. Env var is ignored (it kept getting misconfigured).
-# To change the model, edit the MODEL constant below.
+# Gemini wrapper. Model is HARDCODED. All text is sanitized (no LaTeX).
 
 import os
+import re
 import asyncio
 import logging
 import time
@@ -18,7 +18,7 @@ from prompts import (
 logger = logging.getLogger(__name__)
 
 # ==================================================================
-# HARDCODED MODEL. Edit this line if you want a different model.
+# HARDCODED MODEL. Edit this line to change model. Env var is ignored.
 # ==================================================================
 MODEL = "gemini-3.5-flash-lite"
 # ==================================================================
@@ -34,6 +34,91 @@ _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 MIN_CALL_GAP = 2.0
 
+
+# ---------------------------------------------------------------
+# LaTeX sanitizer
+# ---------------------------------------------------------------
+
+_LATEX_SIMPLE = [
+    (r"\\times\b", "×"),
+    (r"\\cdot\b", "·"),
+    (r"\\div\b", "÷"),
+    (r"\\pm\b", "±"),
+    (r"\\mp\b", "∓"),
+    (r"\\geq\b", "≥"),
+    (r"\\ge\b", "≥"),
+    (r"\\leq\b", "≤"),
+    (r"\\le\b", "≤"),
+    (r"\\neq\b", "≠"),
+    (r"\\ne\b", "≠"),
+    (r"\\approx\b", "≈"),
+    (r"\\sim\b", "~"),
+    (r"\\propto\b", "∝"),
+    (r"\\infty\b", "∞"),
+    (r"\\rightarrow\b", "→"),
+    (r"\\to\b", "→"),
+    (r"\\leftarrow\b", "←"),
+    (r"\\degree\b", "°"),
+    (r"\\circ\b", "°"),
+    (r"\\left\b", ""),
+    (r"\\right\b", ""),
+    (r"\\displaystyle\b", ""),
+    (r"\\quad\b", " "),
+    (r"\\qquad\b", "  "),
+    (r"\\,", " "),
+    (r"\\;", " "),
+    (r"\\!", ""),
+    (r"\\%", "%"),
+    (r"\\&", "&"),
+    (r"\\#", "#"),
+    (r"\\_", "_"),
+    (r"\\\$", "$"),
+]
+
+
+def sanitize_text(s):
+    """Convert any LaTeX / math markup to plain readable text."""
+    if not s:
+        return s
+    s = str(s)
+
+    # \text{...}, \mathrm{...}, \mathbf{...}, \mathit{...} -> inner
+    s = re.sub(r"\\text(?:bf|it|rm|sf|tt)?\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\math(?:bf|it|rm|sf|tt)\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", s)
+
+    # \frac{a}{b} -> (a)/(b)
+    s = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", s)
+
+    # \sqrt{x} -> √(x)
+    s = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", s)
+
+    # x^{...} -> x^(...)  ; x_{...} -> x_(...)
+    s = re.sub(r"\^\{([^{}]*)\}", r"^(\1)", s)
+    s = re.sub(r"_\{([^{}]*)\}", r"_\1", s)
+    s = re.sub(r"\^([0-9A-Za-z])", r"^\1", s)
+
+    # Simple replacements
+    for pat, rep in _LATEX_SIMPLE:
+        s = re.sub(pat, rep, s)
+
+    # Remove math delimiters
+    s = s.replace("$$", " ")
+    s = s.replace("$", "")
+
+    # Any leftover \command
+    s = re.sub(r"\\[A-Za-z]+\b", "", s)
+    s = s.replace("\\", "")
+
+    # Collapse whitespace
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+# ---------------------------------------------------------------
+# Low-level call
+# ---------------------------------------------------------------
 
 async def _throttle():
     global _last_call_time
@@ -84,7 +169,7 @@ async def _call(prompt, json_mode=False):
             text = _extract_text(resp)
             if text:
                 last_error = ""
-                return text
+                return sanitize_text(text)
             last_error = f"{MODEL}: empty response"
         except Exception as e:
             last_error = f"{MODEL}: {type(e).__name__}: {e}"
@@ -126,9 +211,18 @@ async def check_document(filename, file_type, text):
         return {}
     if not isinstance(result, dict):
         return {}
+
+    # Sanitize every string field
+    result["summary"] = sanitize_text(result.get("summary", ""))
+    issues = result.get("issues", []) or []
+    for it in issues:
+        if not isinstance(it, dict):
+            continue
+        for k in ("location", "problem", "fix", "reference", "severity"):
+            if k in it:
+                it[k] = sanitize_text(it[k])
+    result["issues"] = issues
     result.setdefault("score", 0.0)
-    result.setdefault("summary", "")
-    result.setdefault("issues", [])
     return result
 
 
@@ -146,7 +240,7 @@ async def ocr_image(path):
             ["Transcribe every word of text in this image. "
              "Preserve line breaks. Return plain text only.", img],
         )
-        return _extract_text(resp)
+        return sanitize_text(_extract_text(resp))
     except Exception as e:
         last_error = f"OCR: {e}"
         return ""
