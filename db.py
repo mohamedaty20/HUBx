@@ -1,11 +1,12 @@
 # db.py
-# Turso schema + CRUD. Refuses to fall back to a local file on Render.
+# Turso with automatic local-SQLite fallback so the app never brick-walls.
+# If TURSO_DATABASE_URL is valid we use Turso (persistent).
+# If not, we use a local file (works, but data is lost on Render redeploy).
 
 import os
 import json
 import datetime
 import logging
-from typing import Any
 
 import libsql
 
@@ -13,75 +14,71 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def _clean(v: str) -> str:
-    """Strip whitespace AND accidental surrounding quotes."""
+def _clean(v):
     v = (v or "").strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
         v = v[1:-1].strip()
     return v
 
 
-TURSO_URL = _clean(os.getenv("TURSO_DATABASE_URL", ""))
-TURSO_TOKEN = _clean(os.getenv("TURSO_AUTH_TOKEN", ""))
-ON_RENDER = bool(os.getenv("RENDER"))
-
-# --- boot-time diagnostics: visible in Render logs ---
-print("=== HUBx env check ===")
-print(f"RENDER              = {os.getenv('RENDER')!r}")
-print(f"TURSO_DATABASE_URL  = len={len(TURSO_URL)} startswith_libsql="
-      f"{TURSO_URL.startswith('libsql://')} head={TURSO_URL[:30]!r}")
-print(f"TURSO_AUTH_TOKEN    = len={len(TURSO_TOKEN)} head={TURSO_TOKEN[:8]!r}")
-print(f"GEMINI_API_KEY      = len={len(os.getenv('GEMINI_API_KEY',''))}")
-print(f"GEMINI_MODEL        = {os.getenv('GEMINI_MODEL')!r}")
-print("=====================")
+_TURSO_URL_RAW = _clean(os.getenv("TURSO_DATABASE_URL", ""))
+_TURSO_TOKEN_RAW = _clean(os.getenv("TURSO_AUTH_TOKEN", ""))
 
 _conn = None
-_conn_info = "not connected"
+_db_mode = "not connected"
+_db_error = ""
+
+
+def _try_turso():
+    """Return a connection or raise. Also validates the token works."""
+    if not _TURSO_URL_RAW.startswith("libsql://"):
+        raise ValueError("TURSO_DATABASE_URL missing or not libsql://")
+    if not _TURSO_TOKEN_RAW:
+        raise ValueError("TURSO_AUTH_TOKEN missing")
+    conn = libsql.connect(_TURSO_URL_RAW, auth_token=_TURSO_TOKEN_RAW)
+    # Force a real round-trip so a bad token fails here, not later.
+    conn.execute("SELECT 1").fetchone()
+    return conn
 
 
 def get_conn():
-    global _conn, _conn_info
+    global _conn, _db_mode, _db_error
     if _conn is not None:
         return _conn
 
-    if TURSO_URL.startswith("libsql://"):
-        _conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
-        _conn_info = f"turso: {TURSO_URL[:40]}..."
-        logger.info("Connected to Turso: %s", TURSO_URL[:40])
-    elif TURSO_URL.startswith("file:"):
-        if ON_RENDER:
-            raise RuntimeError(
-                "TURSO_DATABASE_URL is a local file but you are on Render. "
-                "Set it to your libsql:// URL in the Render Environment tab."
-            )
-        _conn = libsql.connect(TURSO_URL.replace("file:", ""))
-        _conn_info = f"local file: {TURSO_URL}"
-    else:
-        if ON_RENDER:
-            raise RuntimeError(
-                "TURSO_DATABASE_URL is not set or is malformed. It must "
-                "start with libsql://. Current value length="
-                f"{len(TURSO_URL)}. Add it in the Render Environment tab."
-            )
-        _conn = libsql.connect("hubx.db")
-        _conn_info = "local file: hubx.db (dev only)"
+    print(f"=== HUBx DB init ===")
+    print(f"TURSO url len={len(_TURSO_URL_RAW)} "
+          f"starts_libsql={_TURSO_URL_RAW.startswith('libsql://')}")
+    print(f"TURSO token len={len(_TURSO_TOKEN_RAW)}")
+
+    # 1) Try Turso
+    try:
+        _conn = _try_turso()
+        _db_mode = "turso"
+        _db_error = ""
+        print(f"DB MODE = turso ({_TURSO_URL_RAW[:40]}...)")
+        print("====================")
+        return _conn
+    except Exception as e:
+        _db_error = f"{type(e).__name__}: {e}"
+        print(f"Turso failed: {_db_error}")
+        print("Falling back to local SQLite (data lost on redeploy).")
+
+    # 2) Fallback to local file
+    _conn = libsql.connect("hubx.db")
+    _db_mode = "local"
+    print(f"DB MODE = local SQLite (hubx.db in container)")
+    print("====================")
     return _conn
 
 
-def db_health() -> dict:
-    info = {"connection": _conn_info, "ok": False, "error": ""}
-    try:
-        conn = get_conn()
-        info["knowledge"] = conn.execute(
-            "SELECT COUNT(*) FROM knowledge").fetchone()[0]
-        info["runs"] = conn.execute(
-            "SELECT COUNT(*) FROM learning_runs").fetchone()[0]
-        info["checks"] = conn.execute(
-            "SELECT COUNT(*) FROM check_reports").fetchone()[0]
-        info["ok"] = True
-    except Exception as e:
-        info["error"] = f"{type(e).__name__}: {e}"
-    return info
+def db_health():
+    return {
+        "mode": _db_mode,
+        "connection": _TURSO_URL_RAW[:40] if _db_mode == "turso" else "hubx.db",
+        "error": _db_error,
+        "ok": _db_mode == "turso",
+    }
 
 
 def init_db():
@@ -98,7 +95,6 @@ def init_db():
         created_at TEXT,
         updated_at TEXT
     );
-
     CREATE TABLE IF NOT EXISTS learning_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         cycle INTEGER,
@@ -109,7 +105,6 @@ def init_db():
         error TEXT,
         created_at TEXT
     );
-
     CREATE TABLE IF NOT EXISTS check_reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         filename TEXT,
@@ -124,8 +119,7 @@ def init_db():
     conn.commit()
 
 
-def upsert_knowledge(topic: str, category: str, content: str,
-                     confidence: float = 0.5) -> int:
+def upsert_knowledge(topic, category, content, confidence=0.5):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
     row = conn.execute(
@@ -133,10 +127,8 @@ def upsert_knowledge(topic: str, category: str, content: str,
     ).fetchone()
     if row:
         conn.execute("""
-            UPDATE knowledge
-            SET content = ?, confidence = ?, version = version + 1,
-                updated_at = ?
-            WHERE id = ?
+            UPDATE knowledge SET content=?, confidence=?,
+                version=version+1, updated_at=? WHERE id=?
         """, (content, confidence, now, row[0]))
         conn.commit()
         return row[0]
@@ -149,49 +141,44 @@ def upsert_knowledge(topic: str, category: str, content: str,
     return cur.lastrowid
 
 
-def set_refined(knowledge_id: int, refined: str, confidence: float = 0.7):
+def set_refined(knowledge_id, refined, confidence=0.7):
     conn = get_conn()
     conn.execute("""
-        UPDATE knowledge
-        SET refined_content = ?, confidence = ?, updated_at = ?
-        WHERE id = ?
+        UPDATE knowledge SET refined_content=?, confidence=?, updated_at=?
+        WHERE id=?
     """, (refined, confidence,
           datetime.datetime.utcnow().isoformat(), knowledge_id))
     conn.commit()
 
 
-def oldest_knowledge_for_refinement(limit: int = 1):
+def oldest_knowledge_for_refinement(limit=1):
     conn = get_conn()
     return conn.execute("""
         SELECT id, topic, category, content, refined_content, version
-        FROM knowledge
-        ORDER BY updated_at ASC
-        LIMIT ?
+        FROM knowledge ORDER BY updated_at ASC LIMIT ?
     """, (limit,)).fetchall()
 
 
-def get_all_knowledge(category: str | None = None, limit: int = 200):
+def get_all_knowledge(category=None, limit=200):
     conn = get_conn()
     if category:
         return conn.execute("""
             SELECT id, topic, category, content, refined_content, version,
                    confidence, updated_at
-            FROM knowledge WHERE category = ?
+            FROM knowledge WHERE category=?
             ORDER BY updated_at DESC LIMIT ?
         """, (category, limit)).fetchall()
     return conn.execute("""
         SELECT id, topic, category, content, refined_content, version,
                confidence, updated_at
-        FROM knowledge
-        ORDER BY updated_at DESC LIMIT ?
+        FROM knowledge ORDER BY updated_at DESC LIMIT ?
     """, (limit,)).fetchall()
 
 
-def get_knowledge_by_id(knowledge_id: int):
+def get_knowledge_by_id(knowledge_id):
     conn = get_conn()
     return conn.execute(
-        "SELECT * FROM knowledge WHERE id = ?", (knowledge_id,)
-    ).fetchone()
+        "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone()
 
 
 def knowledge_stats():
@@ -203,8 +190,7 @@ def knowledge_stats():
     return {"total": total, "refined": refined}
 
 
-def log_learning_run(cycle: int, topic: str, added: int, refined: int,
-                     calls: int, error: str = ""):
+def log_learning_run(cycle, topic, added, refined, calls, error=""):
     conn = get_conn()
     conn.execute("""
         INSERT INTO learning_runs (cycle, topic_processed, items_added,
@@ -215,7 +201,7 @@ def log_learning_run(cycle: int, topic: str, added: int, refined: int,
     conn.commit()
 
 
-def recent_learning_runs(limit: int = 20):
+def recent_learning_runs(limit=20):
     conn = get_conn()
     return conn.execute("""
         SELECT cycle, topic_processed, items_added, items_refined,
@@ -224,21 +210,20 @@ def recent_learning_runs(limit: int = 20):
     """, (limit,)).fetchall()
 
 
-def save_check_report(filename: str, file_type: str, original_text: str,
-                      issues: list, score: float, summary: str) -> int:
+def save_check_report(filename, file_type, original_text, issues,
+                      score, summary):
     conn = get_conn()
     cur = conn.execute("""
         INSERT INTO check_reports (filename, file_type, original_text,
             issues_json, score, summary, created_at)
         VALUES (?,?,?,?,?,?,?)
-    """, (filename, file_type, original_text,
-          json.dumps(issues), score, summary,
-          datetime.datetime.utcnow().isoformat()))
+    """, (filename, file_type, original_text, json.dumps(issues), score,
+          summary, datetime.datetime.utcnow().isoformat()))
     conn.commit()
     return cur.lastrowid
 
 
-def recent_check_reports(limit: int = 50):
+def recent_check_reports(limit=50):
     conn = get_conn()
     return conn.execute("""
         SELECT id, filename, file_type, score, summary, created_at
