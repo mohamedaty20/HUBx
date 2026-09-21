@@ -10,7 +10,6 @@ TIER_B = "B"
 TIER_C = "C"
 TIER_D = "D"
 
-# Sites whose ToS explicitly forbid scraping. NEVER fetched live.
 TOs_FORBIDDEN = {
     "wuzzuf.net",
     "bayt.com",
@@ -22,16 +21,12 @@ TOs_FORBIDDEN = {
 }
 
 SOURCES = {
-    # Tier A — official API / RSS
-    "remoteok.com": TIER_A,
-    "weworkremotely.com": TIER_A,
-    "jobs.lever.co": TIER_A,
-    "greenhouse.io": TIER_A,
+    # Tier A - official API / RSS feeds that work
+    "reliefweb.int": TIER_A,      # UN OCHA - RSS of humanitarian jobs, Egypt + infra common
+    "unjobs.org": TIER_A,         # UN jobs aggregator, RSS
+    "weworkremotely.com": TIER_A, # RSS (remote dev, low yield but valid)
 
-    # Tier B — HTML allowed only after robots.txt check
-    # "example-eng-board.com": TIER_B,
-
-    # Tier C — manual paste only
+    # Tier C - manual paste only
     "wuzzuf.net": TIER_C,
     "bayt.com": TIER_C,
     "linkedin.com": TIER_C,
@@ -40,16 +35,15 @@ SOURCES = {
     "forasna.com": TIER_C,
     "gulfTalent.com": TIER_C,
 
-    # Tier D — blocked
+    # Tier D - blocked
     "facebook.com": TIER_D,
     "twitter.com": TIER_D,
 }
 
 LIVE_FETCH_URLS = {
-    "remoteok.com": "https://remoteok.com/api",
+    "reliefweb.int": "https://reliefweb.int/jobs/rss.xml",
+    "unjobs.org": "https://unjobs.org/rss.xml",
     "weworkremotely.com": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
-    "jobs.lever.co": None,
-    "greenhouse.io": None,
 }
 
 MANUAL_PASTE_DOMAINS = [d for d, t in SOURCES.items() if t == TIER_C]
