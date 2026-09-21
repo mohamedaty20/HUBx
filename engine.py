@@ -12,7 +12,7 @@ from sources import SEED_TOPICS, LEARNING_INTERVAL_SECONDS, \
 from db import (upsert_knowledge, set_refined,
                 oldest_knowledge_for_refinement, log_learning_run,
                 knowledge_stats)
-from gemini import generate_knowledge, refine_knowledge
+from gemini import generate_knowledge, refine_knowledge, last_error as gemini_last_error
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -100,8 +100,8 @@ class Engine:
             self.last_debug = f"generated: {topic}"
         else:
             log_learning_run(self.cycles_completed, topic, 0, 0, 1,
-                             error="empty response")
-            self.last_debug = f"no content for: {topic}"
+                             error=gemini_last_error or "empty response")
+            self.last_debug = f"no content for: {topic} | {gemini_last_error}"
 
     async def _refine_one(self):
         if self.paused:
@@ -132,8 +132,8 @@ class Engine:
             self.last_debug = f"refined: {topic} (v{version + 1})"
         else:
             log_learning_run(self.cycles_completed, topic, 0, 0, 1,
-                             error="no change")
-            self.last_debug = f"no refinement for: {topic}"
+                             error=gemini_last_error or "no change")
+            self.last_debug = f"no refinement for: {topic} | {gemini_last_error}"
 
     def stats(self) -> dict:
         s = knowledge_stats()
