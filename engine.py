@@ -1,30 +1,21 @@
 # engine.py
-# 70-second loop with pause/start, cancellation, counters.
-# Pause is REAL: when paused, no Gemini call is initiated, and any
-# in-flight call's response is discarded, not stored.
+# Self-learning loop. Every LEARNING_INTERVAL_SECONDS the engine either
+# generates new knowledge for the next seed topic or refines the oldest
+# existing knowledge item. All AI calls are guarded by the pause flag.
 
 import asyncio
-import datetime
 import logging
-import re
 from typing import Optional
 
-import feedparser
-
-from sources import SOURCES, LIVE_FETCH_URLS, FALLBACK_URLS, get_tier
-from compliance import safe_fetch, ComplianceError
-from db import (get_active_strategy, save_strategy, start_run, finish_run,
-                log_failure, insert_job, recent_failures)
-from gemini import refine_strategy
+from sources import SEED_TOPICS, LEARNING_INTERVAL_SECONDS, \
+    REFINE_EVERY_N_CYCLES
+from db import (upsert_knowledge, set_refined,
+                oldest_knowledge_for_refinement, log_learning_run,
+                knowledge_stats)
+from gemini import generate_knowledge, refine_knowledge
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-CYCLE_INTERVAL = 70
-REFINE_EVERY_N = 5
-MAX_JOBS_PER_CYCLE = 50
-MAX_AGE_DAYS = 14          # widened from 7 - feed publication lags are real
-MAX_TITLES_IN_DEBUG = 3
 
 
 class Engine:
@@ -35,7 +26,8 @@ class Engine:
         self.gemini_calls = 0
         self.last_status = "idle"
         self.last_error = ""
-        self.last_debug = ""
+        self.last_debug = "waiting for first cycle"
+        self._topic_index = 0
         self._task: Optional[asyncio.Task] = None
 
     async def start(self):
@@ -70,317 +62,89 @@ class Engine:
                 except Exception as e:
                     self.last_error = str(e)
                     self.last_status = f"error: {e}"
-                    logger.exception("Cycle error")
+                    logger.exception("Learning cycle failed")
 
-                for _ in range(CYCLE_INTERVAL):
+                for _ in range(LEARNING_INTERVAL_SECONDS):
                     if self.paused:
                         return
                     await asyncio.sleep(1)
         except asyncio.CancelledError:
-            logger.info("Engine loop cancelled.")
+            logger.info("Learning loop cancelled.")
             raise
 
     async def _cycle(self):
-        strategy = self._ensure_fresh_strategy()
-        strategy_id = strategy["id"]
-        run_id = start_run(strategy_id)
-        fetched = kept = errors = 0
-        debug_lines = []
+        if self.cycles_completed % REFINE_EVERY_N_CYCLES == 1:
+            await self._refine_one()
+        else:
+            await self._generate_one()
 
-        try:
-            for domain in strategy.get("sources", []):
-                if self.paused:
-                    break
-                url = LIVE_FETCH_URLS.get(domain)
-                if not url:
-                    debug_lines.append(f"{domain}: no live URL configured")
-                    continue
-
-                try:
-                    text = await safe_fetch(url)
-                    fetched += 1
-                    all_jobs = self._parse_feed_or_html(text, domain)
-                    kept_before = kept
-                    rejected_titles = []
-
-                    for job in all_jobs[:MAX_JOBS_PER_CYCLE]:
-                        if self.paused:
-                            break
-                        iso_date = self._normalize_date(job.get("posted_date"))
-                        if iso_date and not self._within_window(
-                                iso_date, MAX_AGE_DAYS):
-                            if len(rejected_titles) < MAX_TITLES_IN_DEBUG:
-                                rejected_titles.append(
-                                    f"old({iso_date}) "
-                                    f"{(job.get('title') or '')[:30]}"
-                                )
-                            continue
-                        if not self._is_egypt_civil(job):
-                            if len(rejected_titles) < MAX_TITLES_IN_DEBUG:
-                                rejected_titles.append(
-                                    f"filter "
-                                    f"{(job.get('title') or '')[:30]}"
-                                )
-                            continue
-
-                        job["posted_date"] = iso_date or \
-                            datetime.date.today().isoformat()
-                        job["source_domain"] = domain
-                        job["source_tier"] = get_tier(domain)
-                        insert_job(job)
-                        kept += 1
-
-                    line = (
-                        f"{domain}: {len(all_jobs)} entries, "
-                        f"{kept - kept_before} kept"
-                    )
-                    if rejected_titles:
-                        line += f" [rejects: {'; '.join(rejected_titles)}]"
-                    debug_lines.append(line)
-
-                except ComplianceError as e:
-                    fallbacks = FALLBACK_URLS.get(domain, [])
-                    recovered = False
-                    for fb in fallbacks:
-                        if self.paused:
-                            break
-                        try:
-                            text = await safe_fetch(fb)
-                            all_jobs = self._parse_feed_or_html(text, domain)
-                            kept_before = kept
-                            for job in all_jobs[:MAX_JOBS_PER_CYCLE]:
-                                iso_date = self._normalize_date(
-                                    job.get("posted_date"))
-                                if iso_date and not self._within_window(
-                                        iso_date, MAX_AGE_DAYS):
-                                    continue
-                                if not self._is_egypt_civil(job):
-                                    continue
-                                job["posted_date"] = iso_date or \
-                                    datetime.date.today().isoformat()
-                                job["source_domain"] = domain
-                                job["source_tier"] = get_tier(domain)
-                                insert_job(job)
-                                kept += 1
-                            debug_lines.append(
-                                f"{domain} (fallback): "
-                                f"{len(all_jobs)} entries, "
-                                f"{kept - kept_before} kept"
-                            )
-                            recovered = True
-                            break
-                        except Exception:
-                            continue
-                    if not recovered:
-                        errors += 1
-                        debug_lines.append(f"{domain}: {e}")
-                        log_failure(strategy_id, "", domain,
-                                    "compliance", str(e))
-
-                except Exception as e:
-                    errors += 1
-                    debug_lines.append(f"{domain}: fetch error - {e}")
-                    log_failure(strategy_id, "", domain, "fetch", str(e))
-
-            self.last_debug = " | ".join(debug_lines) or "no sources configured"
-
-            if (self.cycles_completed + 1) % REFINE_EVERY_N == 0 \
-                    and not self.paused:
-                await self._refine(strategy_id, strategy)
-
-        finally:
-            finish_run(run_id, fetched, kept, errors)
-
-    # ------------------------------------------------------------------
-    # Auto-rebuild the strategy when the DB one is stale
-    # ------------------------------------------------------------------
-
-    def _ensure_fresh_strategy(self) -> dict:
-        strategy = get_active_strategy()
-        live_keys = set(LIVE_FETCH_URLS.keys())
-
-        if strategy is None or not (
-                set(strategy.get("sources", [])) & live_keys):
-            bootstrap_sources = [d for d, t in SOURCES.items()
-                                 if t in ("A", "B")]
-            save_strategy(
-                queries=["civil engineer Egypt", "structural engineer Cairo",
-                         "WASH engineer Egypt", "infrastructure Egypt",
-                         "construction engineer Egypt"],
-                sources=bootstrap_sources,
-                reasoning="auto-bootstrap: previous strategy had no live sources",
-                confidence=0.5,
-            )
-            strategy = get_active_strategy()
-            self.last_debug = (
-                f"rebuilt strategy -> sources: {bootstrap_sources}"
-            )
-        return strategy
-
-    async def _refine(self, strategy_id: int, strategy: dict):
+    async def _generate_one(self):
         if self.paused:
             return
-        failures = recent_failures(strategy_id, 20)
-        today = datetime.date.today().isoformat()
-        allowed = {d: t for d, t in SOURCES.items() if t in ("A", "B")}
+        topic, category = SEED_TOPICS[self._topic_index % len(SEED_TOPICS)]
+        self._topic_index += 1
 
+        if self.paused:
+            return
         self.gemini_calls += 1
-        result = await refine_strategy(today, strategy, failures, allowed)
+        content = await generate_knowledge(topic, category)
 
         if self.paused:
-            logger.info("Discarding Gemini refinement - paused during call.")
-            return
-        if not result:
+            logger.info("Discarding knowledge response - paused mid-call.")
             return
 
-        proposed = result.get("sources", strategy.get("sources", []))
-        safe_sources = [d for d in proposed if d in LIVE_FETCH_URLS] or \
-                       strategy.get("sources", [])
-        save_strategy(
-            queries=result.get("queries", strategy.get("queries", [])),
-            sources=safe_sources,
-            reasoning=result.get("reasoning", ""),
-            confidence=float(result.get("confidence", 0.5)),
-        )
+        if content:
+            upsert_knowledge(topic, category, content, confidence=0.6)
+            log_learning_run(self.cycles_completed, topic, 1, 0, 1)
+            self.last_debug = f"generated: {topic}"
+        else:
+            log_learning_run(self.cycles_completed, topic, 0, 0, 1,
+                             error="empty response")
+            self.last_debug = f"no content for: {topic}"
 
-    # ------------------------------------------------------------------
-    # Parsing helpers
-    # ------------------------------------------------------------------
+    async def _refine_one(self):
+        if self.paused:
+            return
+        rows = oldest_knowledge_for_refinement(1)
+        if not rows:
+            await self._generate_one()
+            return
 
-    @staticmethod
-    def _strip_html(text: str) -> str:
-        """Remove tags and CDATA markers from feed text."""
-        if not text:
-            return ""
-        text = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", text, flags=re.S)
-        text = re.sub(r"<[^>]+>", " ", text)
-        return re.sub(r"\s+", " ", text).strip()
+        row = rows[0]
+        kid, topic, category, content, refined, version = row
+        existing = refined or content
+        if not existing:
+            return
 
-    @staticmethod
-    def _parse_feed_or_html(text: str, domain: str) -> list[dict]:
-        jobs = []
-        feed = feedparser.parse(text)
-        for entry in feed.entries[:100]:
-            iso = ""
-            for key in ("published_parsed", "updated_parsed"):
-                t = entry.get(key)
-                if t:
-                    try:
-                        iso = datetime.date(*t[:3]).isoformat()
-                        break
-                    except Exception:
-                        continue
+        if self.paused:
+            return
+        self.gemini_calls += 1
+        improved = await refine_knowledge(topic, existing)
 
-            title = Engine._strip_html(entry.get("title", ""))
-            summary = Engine._strip_html(entry.get("summary", "")
-                                         or entry.get("description", ""))
-            # UNJobLink puts location / company in custom tags
-            location = (
-                Engine._strip_html(entry.get("location", ""))
-                or Engine._location_from_tags(entry)
-                or Engine._field(entry, "location")
-            )
-            company = (
-                Engine._strip_html(entry.get("author", ""))
-                or Engine._source_name(entry)
-                or Engine._field(entry, "company")
-            )
-            category = Engine._field(entry, "category")
+        if self.paused:
+            logger.info("Discarding refinement - paused mid-call.")
+            return
 
-            jobs.append({
-                "title": title,
-                "company": company,
-                "location": location,
-                "posted_date": iso,
-                "url": entry.get("link", ""),
-                "description_full": f"{summary} {category}".strip(),
-                "recruiter_name": "",
-                "recruiter_title": "",
-                "recruiter_contact": "",
-            })
-        return jobs
+        if improved and improved != existing:
+            set_refined(kid, improved, confidence=0.8)
+            log_learning_run(self.cycles_completed, topic, 0, 1, 1)
+            self.last_debug = f"refined: {topic} (v{version + 1})"
+        else:
+            log_learning_run(self.cycles_completed, topic, 0, 0, 1,
+                             error="no change")
+            self.last_debug = f"no refinement for: {topic}"
 
-    @staticmethod
-    def _field(entry, name: str) -> str:
-        """Read a non-standard feed field (UNJobLink custom tags)."""
-        val = entry.get(name)
-        if isinstance(val, str):
-            return Engine._strip_html(val)
-        if isinstance(val, list) and val:
-            first = val[0]
-            if isinstance(first, str):
-                return Engine._strip_html(first)
-        return ""
-
-    @staticmethod
-    def _source_name(entry) -> str:
-        src = entry.get("source") or {}
-        if isinstance(src, dict):
-            return src.get("title", "")
-        return ""
-
-    @staticmethod
-    def _location_from_tags(entry) -> str:
-        tags = entry.get("tags", []) or []
-        for t in tags:
-            term = (t.get("term") or "").strip()
-            if any(k in term.lower() for k in (
-                    "egypt", "cairo", "alexandria", "giza", "mena")):
-                return term
-        return ""
-
-    @staticmethod
-    def _normalize_date(raw: str) -> str:
-        if not raw:
-            return ""
-        raw = raw.strip()
-        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
-            return raw[:10]
-        for fmt in (
-            "%a, %d %b %Y %H:%M:%S %z",
-            "%a, %d %b %Y %H:%M:%S %Z",
-            "%Y-%m-%dT%H:%M:%S%z",
-            "%Y-%m-%dT%H:%M:%SZ",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d",
-        ):
-            try:
-                return datetime.datetime.strptime(raw, fmt).date().isoformat()
-            except ValueError:
-                continue
-        return ""
-
-    @staticmethod
-    def _within_window(iso_date: str, days: int) -> bool:
-        try:
-            d = datetime.date.fromisoformat(iso_date)
-        except ValueError:
-            return False
-        today = datetime.date.today()
-        return (today - d).days <= days and d <= today
-
-    @staticmethod
-    def _is_egypt_civil(job: dict) -> bool:
-        blob = " ".join([
-            (job.get("location") or "").lower(),
-            (job.get("title") or "").lower(),
-            (job.get("company") or "").lower(),
-            (job.get("description_full") or "").lower(),
-        ])
-        egypt_terms = (
-            "egypt", "cairo", "alexandria", "giza", "mena",
-            "egyptian", "north africa", "misr", "qahira",
-        )
-        civil_terms = (
-            "civil", "structural", "geotechnical", "transportation",
-            "water resources", "construction", "site engineer",
-            "quantity survey", "infrastructure", "highway", "bridge",
-            "sanitation", "watsan", "wash", "shelter", "urban planning",
-            "roads", "dams", "foundations", "building", "engineer",
-            "architect", "water", "energy", "environment",
-        )
-        return any(w in blob for w in egypt_terms) and \
-               any(w in blob for w in civil_terms)
+    def stats(self) -> dict:
+        s = knowledge_stats()
+        return {
+            "cycles": self.cycles_completed,
+            "gemini_calls": self.gemini_calls,
+            "knowledge_total": s["total"],
+            "knowledge_refined": s["refined"],
+            "last_status": self.last_status,
+            "last_error": self.last_error,
+            "last_debug": self.last_debug,
+        }
 
 
 engine = Engine()
