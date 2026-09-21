@@ -1,6 +1,8 @@
 # compliance.py
 # Safest legal option chosen: fail closed on every robots.txt error.
-# EXCEPTION: a missing robots.txt (404) means "allow", per RFC 9309.
+# EXCEPTION 1: a missing robots.txt (404) means "allow", per RFC 9309.
+# EXCEPTION 2: Tier A = official API/RSS. These endpoints exist for
+#   machine consumption, so robots.txt is not consulted for them.
 # No proxies, no CAPTCHA solving, no fingerprint spoofing.
 
 import asyncio
@@ -11,7 +13,8 @@ from collections import defaultdict
 
 import httpx
 
-from sources import MIN_DOMAIN_DELAY, get_tier, TIER_A, TIER_B, TIER_C, TIER_D
+from sources import (MIN_DOMAIN_DELAY, get_tier,
+                     TIER_A, TIER_B, TIER_C, TIER_D)
 
 _last_request_time: dict[str, float] = defaultdict(float)
 
@@ -21,23 +24,29 @@ class ComplianceError(Exception):
 
 
 def _domain(url: str) -> str:
-    return urlparse(url).netloc.lower().replace("www.", "", 1)
+    netloc = urlparse(url).netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc.split(":")[0]
 
 
 async def check_robots(url: str) -> bool:
     """
     RFC 9309: if robots.txt is absent (404), access is allowed.
-    Any other error (timeout, 5xx) fails closed.
+    Any other error (timeout, 5xx, 403) fails closed.
     """
     parsed = urlparse(url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(robots_url)
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(
+                robots_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; HUBx/1.0)"},
+            )
             if resp.status_code == 404:
-                return True  # no robots.txt = allow all
+                return True
             if resp.status_code != 200:
-                return False  # fail closed on anything else
+                return False
             rp = urllib.robotparser.RobotFileParser()
             rp.parse(resp.text.splitlines())
             return rp.can_fetch("*", url)
@@ -67,13 +76,23 @@ def tier_gate(domain: str) -> None:
 
 async def safe_fetch(url: str) -> str:
     domain = _domain(url)
+    tier = get_tier(domain)
     tier_gate(domain)
-    if not await check_robots(url):
-        raise ComplianceError(f"robots.txt disallows {url}")
+
+    # Tier A = official API/RSS. Skip robots.txt: these feeds are
+    # published specifically for machine consumption.
+    if tier != TIER_A:
+        if not await check_robots(url):
+            raise ComplianceError(f"robots.txt disallows {url}")
+
     await enforce_delay(domain)
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         resp = await client.get(
-            url, headers={"User-Agent": "HUBx/1.0 (+civil-eng-jobs)"}
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; HUBx/1.0; +civil-eng-jobs)",
+                "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            },
         )
         resp.raise_for_status()
         return resp.text
