@@ -1,8 +1,10 @@
 # gemini.py
-# Gemini wrapper. Model is HARDCODED. All text is sanitized (no LaTeX).
+# Gemini wrapper with sanitizer, model hardcoded, template generation,
+# and AI-powered knowledge search.
 
 import os
 import re
+import json
 import asyncio
 import logging
 import time
@@ -13,12 +15,13 @@ from prompts import (
     KNOWLEDGE_SYSTEM_PROMPT, KNOWLEDGE_USER_TEMPLATE,
     REFINE_SYSTEM_PROMPT, REFINE_USER_TEMPLATE,
     CHECKER_SYSTEM_PROMPT, CHECKER_USER_TEMPLATE,
+    TEMPLATE_SYSTEM_PROMPT, TEMPLATE_USER_TEMPLATE,
 )
 
 logger = logging.getLogger(__name__)
 
 # ==================================================================
-# HARDCODED MODEL. Edit this line to change model. Env var is ignored.
+# HARDCODED MODEL. Edit this line to change model.
 # ==================================================================
 MODEL = "gemini-3.5-flash-lite"
 # ==================================================================
@@ -34,45 +37,23 @@ _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 MIN_CALL_GAP = 2.0
 
-
 # ---------------------------------------------------------------
 # LaTeX sanitizer
 # ---------------------------------------------------------------
 
 _LATEX_SIMPLE = [
-    (r"\\times\b", "×"),
-    (r"\\cdot\b", "·"),
-    (r"\\div\b", "÷"),
-    (r"\\pm\b", "±"),
-    (r"\\mp\b", "∓"),
-    (r"\\geq\b", "≥"),
-    (r"\\ge\b", "≥"),
-    (r"\\leq\b", "≤"),
-    (r"\\le\b", "≤"),
-    (r"\\neq\b", "≠"),
-    (r"\\ne\b", "≠"),
-    (r"\\approx\b", "≈"),
-    (r"\\sim\b", "~"),
-    (r"\\propto\b", "∝"),
-    (r"\\infty\b", "∞"),
-    (r"\\rightarrow\b", "→"),
-    (r"\\to\b", "→"),
-    (r"\\leftarrow\b", "←"),
-    (r"\\degree\b", "°"),
-    (r"\\circ\b", "°"),
-    (r"\\left\b", ""),
-    (r"\\right\b", ""),
-    (r"\\displaystyle\b", ""),
-    (r"\\quad\b", " "),
-    (r"\\qquad\b", "  "),
-    (r"\\,", " "),
-    (r"\\;", " "),
-    (r"\\!", ""),
-    (r"\\%", "%"),
-    (r"\\&", "&"),
-    (r"\\#", "#"),
-    (r"\\_", "_"),
-    (r"\\\$", "$"),
+    (r"\\times\b", "×"), (r"\\cdot\b", "·"), (r"\\div\b", "÷"),
+    (r"\\pm\b", "±"), (r"\\mp\b", "∓"), (r"\\geq\b", "≥"),
+    (r"\\ge\b", "≥"), (r"\\leq\b", "≤"), (r"\\le\b", "≤"),
+    (r"\\neq\b", "≠"), (r"\\ne\b", "≠"), (r"\\approx\b", "≈"),
+    (r"\\propto\b", "∝"), (r"\\infty\b", "∞"),
+    (r"\\rightarrow\b", "→"), (r"\\to\b", "→"),
+    (r"\\leftarrow\b", "←"), (r"\\degree\b", "°"),
+    (r"\\circ\b", "°"), (r"\\left\b", ""), (r"\\right\b", ""),
+    (r"\\displaystyle\b", ""), (r"\\quad\b", " "),
+    (r"\\qquad\b", "  "), (r"\\,", " "), (r"\\;", " "),
+    (r"\\!", ""), (r"\\%", "%"), (r"\\&", "&"),
+    (r"\\#", "#"), (r"\\_", "_"), (r"\\\$", "$"),
 ]
 
 
@@ -81,36 +62,18 @@ def sanitize_text(s):
     if not s:
         return s
     s = str(s)
-
-    # \text{...}, \mathrm{...}, \mathbf{...}, \mathit{...} -> inner
     s = re.sub(r"\\text(?:bf|it|rm|sf|tt)?\{([^{}]*)\}", r"\1", s)
     s = re.sub(r"\\math(?:bf|it|rm|sf|tt)\{([^{}]*)\}", r"\1", s)
     s = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", s)
-
-    # \frac{a}{b} -> (a)/(b)
     s = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", s)
-
-    # \sqrt{x} -> √(x)
     s = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", s)
-
-    # x^{...} -> x^(...)  ; x_{...} -> x_(...)
     s = re.sub(r"\^\{([^{}]*)\}", r"^(\1)", s)
     s = re.sub(r"_\{([^{}]*)\}", r"_\1", s)
     s = re.sub(r"\^([0-9A-Za-z])", r"^\1", s)
-
-    # Simple replacements
     for pat, rep in _LATEX_SIMPLE:
         s = re.sub(pat, rep, s)
-
-    # Remove math delimiters
-    s = s.replace("$$", " ")
-    s = s.replace("$", "")
-
-    # Any leftover \command
-    s = re.sub(r"\\[A-Za-z]+\b", "", s)
-    s = s.replace("\\", "")
-
-    # Collapse whitespace
+    s = s.replace("$$", " ").replace("$", "")
+    s = re.sub(r"\\[A-Za-z]+\b", "", s).replace("\\", "")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
@@ -147,13 +110,14 @@ def _extract_text(resp):
     return ""
 
 
-async def _call(prompt, json_mode=False):
+async def _call(prompt, json_mode=False, max_tokens=8192):
     global last_error
     if not GEMINI_API_KEY:
         last_error = "GEMINI_API_KEY not set"
         return ""
 
-    kwargs = {"temperature": 0.4 if json_mode else 0.6}
+    kwargs = {"temperature": 0.4 if json_mode else 0.7,
+              "max_output_tokens": max_tokens}
     if json_mode:
         kwargs["response_mime_type"] = "application/json"
 
@@ -186,17 +150,32 @@ async def _call(prompt, json_mode=False):
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False)
+                       json_mode=False, max_tokens=8192)
 
 
 async def refine_knowledge(topic, existing):
-    user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:4000])
+    user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:6000])
     return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False)
+                       json_mode=False, max_tokens=8192)
+
+
+async def generate_template(name, category):
+    user = TEMPLATE_USER_TEMPLATE.format(name=name, category=category)
+    return await _call(f"{TEMPLATE_SYSTEM_PROMPT}\n\n---\n\n{user}",
+                       json_mode=False, max_tokens=8192)
+
+
+async def refine_template(name, existing):
+    return await _call(
+        "Improve the following construction template. Add missing fields, "
+        "more detail in each section, more sample values, more common "
+        "mistakes. Keep the same structure. Return only the improved "
+        "template, plain text, no LaTeX.\n\n---\n\n"
+        f"Template: {name}\n\n{existing[:6000]}",
+        json_mode=False, max_tokens=8192)
 
 
 async def check_document(filename, file_type, text):
-    import json
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
     raw = await _call(f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}",
@@ -211,8 +190,6 @@ async def check_document(filename, file_type, text):
         return {}
     if not isinstance(result, dict):
         return {}
-
-    # Sanitize every string field
     result["summary"] = sanitize_text(result.get("summary", ""))
     issues = result.get("issues", []) or []
     for it in issues:
@@ -224,6 +201,30 @@ async def check_document(filename, file_type, text):
     result["issues"] = issues
     result.setdefault("score", 0.0)
     return result
+
+
+async def ai_search(question, knowledge_context):
+    """
+    Answer a user question by reading the supplied knowledge context.
+    Returns a plain-text answer or "" on failure.
+    """
+    prompt = (
+        "You are a senior Egyptian civil quality engineer. Answer the "
+        "user's question using ONLY the knowledge base excerpts below. "
+        "If the excerpts do not contain the answer, say so clearly and "
+        "suggest which topic would help.\n\n"
+        "ANSWER RULES:\n"
+        "- 300-600 words.\n"
+        "- Plain English, no LaTeX, no dollar signs.\n"
+        "- Use markdown headings and bullet lists.\n"
+        "- Cite the topic name in brackets when you quote an excerpt, "
+        "e.g. [Hot weather concreting].\n"
+        "- End with a '## Related topics' list of 3-5 topics from the "
+        "excerpts that the user should read next.\n\n"
+        f"=== KNOWLEDGE BASE EXCERPTS ===\n{knowledge_context}\n\n"
+        f"=== USER QUESTION ===\n{question}\n"
+    )
+    return await _call(prompt, json_mode=False, max_tokens=4096)
 
 
 async def ocr_image(path):
