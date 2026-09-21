@@ -1,7 +1,5 @@
 # gemini.py
-# Gemini API wrapper. Two jobs only:
-# 1. Generate / refine civil quality knowledge.
-# 2. Analyse user-uploaded documents for engineering mistakes.
+# Gemini API wrapper with model fallback and error surfacing.
 
 import os
 import asyncio
@@ -19,10 +17,27 @@ from prompts import (
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+# Fallback chain - tries each until one works.
+_PREFERRED = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+MODEL_CANDIDATES = [
+    _PREFERRED,
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+]
+# Deduplicate while preserving order.
+_seen = set()
+MODEL_CANDIDATES = [m for m in MODEL_CANDIDATES
+                    if not (m in _seen or _seen.add(m))]
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+# Public: last error observed by any call, so UI can show it.
+last_error = ""
+_working_model: str | None = None
 
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
@@ -39,64 +54,94 @@ async def _throttle():
         _last_call_time = time.monotonic()
 
 
-async def _call_text(system_prompt: str, user_prompt: str,
-                     retries: int = 3) -> str:
+def _pick_model():
+    """Return the first model that previously worked, else try all."""
+    if _working_model:
+        return [_working_model]
+    return MODEL_CANDIDATES
+
+
+async def _try_text(model_name: str, system_prompt: str,
+                    user_prompt: str) -> str:
+    model = genai.GenerativeModel(
+        model_name, system_instruction=system_prompt)
+    resp = await asyncio.to_thread(
+        model.generate_content,
+        user_prompt,
+        generation_config=genai.types.GenerationConfig(temperature=0.6),
+    )
+    return (resp.text or "").strip()
+
+
+async def _call_text(system_prompt: str, user_prompt: str) -> str:
+    global last_error, _working_model
     if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY missing; returning empty text.")
+        last_error = "GEMINI_API_KEY not set"
         return ""
 
-    model = genai.GenerativeModel(
-        GEMINI_MODEL, system_instruction=system_prompt)
-    for attempt in range(retries):
-        await _throttle()
-        try:
-            resp = await asyncio.to_thread(
-                model.generate_content,
-                user_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.6,
-                ),
-            )
-            return (resp.text or "").strip()
-        except Exception as e:
-            logger.warning("Gemini text call attempt %d failed: %s",
-                           attempt + 1, e)
-            await asyncio.sleep(2 ** attempt)
+    for model_name in _pick_model():
+        for attempt in range(2):
+            await _throttle()
+            try:
+                text = await _try_text(model_name, system_prompt, user_prompt)
+                if text:
+                    _working_model = model_name
+                    last_error = ""
+                    return text
+                last_error = f"{model_name}: empty response"
+            except Exception as e:
+                last_error = f"{model_name}: {type(e).__name__}: {e}"
+                logger.warning("Gemini call failed on %s: %s",
+                               model_name, e)
+                await asyncio.sleep(2 ** attempt)
+    logger.error("All Gemini models failed. last_error=%s", last_error)
     return ""
 
 
-async def _call_json(system_prompt: str, user_prompt: str,
-                     retries: int = 3) -> dict:
-    if not GEMINI_API_KEY:
-        return {}
+async def _try_json(model_name: str, system_prompt: str,
+                    user_prompt: str) -> dict:
+    import json
     model = genai.GenerativeModel(
-        GEMINI_MODEL, system_instruction=system_prompt)
-    last_raw = ""
-    for attempt in range(retries):
-        await _throttle()
-        try:
-            resp = await asyncio.to_thread(
-                model.generate_content,
-                user_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.4,
-                    response_mime_type="application/json",
-                ),
-            )
-            last_raw = (resp.text or "").strip()
-            if last_raw.startswith("```"):
-                last_raw = last_raw.split("\n", 1)[-1].rsplit("```", 1)[0]
-            import json
-            return json.loads(last_raw)
-        except Exception as e:
-            logger.warning("Gemini JSON call attempt %d failed: %s",
-                           attempt + 1, e)
-            await asyncio.sleep(2 ** attempt)
+        model_name, system_instruction=system_prompt)
+    resp = await asyncio.to_thread(
+        model.generate_content,
+        user_prompt,
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.4,
+            response_mime_type="application/json",
+        ),
+    )
+    raw = (resp.text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+    return json.loads(raw)
+
+
+async def _call_json(system_prompt: str, user_prompt: str) -> dict:
+    global last_error, _working_model
+    if not GEMINI_API_KEY:
+        last_error = "GEMINI_API_KEY not set"
+        return {}
+
+    for model_name in _pick_model():
+        for attempt in range(2):
+            await _throttle()
+            try:
+                result = await _try_json(model_name, system_prompt, user_prompt)
+                if isinstance(result, dict):
+                    _working_model = model_name
+                    last_error = ""
+                    return result
+            except Exception as e:
+                last_error = f"{model_name}: {type(e).__name__}: {e}"
+                logger.warning("Gemini JSON call failed on %s: %s",
+                               model_name, e)
+                await asyncio.sleep(2 ** attempt)
     return {}
 
 
 # ---------------------------------------------------------------
-# Public: knowledge generation / refinement
+# Public API
 # ---------------------------------------------------------------
 
 async def generate_knowledge(topic: str, category: str) -> str:
@@ -108,10 +153,6 @@ async def refine_knowledge(topic: str, existing: str) -> str:
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:4000])
     return await _call_text(REFINE_SYSTEM_PROMPT, user)
 
-
-# ---------------------------------------------------------------
-# Public: document checking
-# ---------------------------------------------------------------
 
 async def check_document(filename: str, file_type: str, text: str) -> dict:
     user = CHECKER_USER_TEMPLATE.format(
@@ -125,24 +166,29 @@ async def check_document(filename: str, file_type: str, text: str) -> dict:
     return result
 
 
-# ---------------------------------------------------------------
-# Public: image OCR via Gemini vision
-# ---------------------------------------------------------------
-
 async def ocr_image(path: str) -> str:
+    global last_error, _working_model
     if not GEMINI_API_KEY:
         return ""
     try:
         from PIL import Image
         img = Image.open(path)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        await _throttle()
-        resp = await asyncio.to_thread(
-            model.generate_content,
-            ["Transcribe every word of text in this image. "
-             "Preserve line breaks. Return plain text only.", img],
-        )
-        return (resp.text or "").strip()
+        for model_name in _pick_model():
+            await _throttle()
+            try:
+                model = genai.GenerativeModel(model_name)
+                resp = await asyncio.to_thread(
+                    model.generate_content,
+                    ["Transcribe every word of text in this image. "
+                     "Preserve line breaks. Return plain text only.", img],
+                )
+                text = (resp.text or "").strip()
+                if text:
+                    _working_model = model_name
+                    return text
+            except Exception as e:
+                last_error = f"OCR {model_name}: {e}"
+                continue
     except Exception as e:
-        logger.error("OCR failed: %s", e)
-        return ""
+        last_error = f"OCR load: {e}"
+    return ""
