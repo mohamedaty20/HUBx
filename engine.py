@@ -73,6 +73,7 @@ class Engine:
             raise
 
     async def _cycle(self):
+        # Alternate between generating new knowledge and refining old.
         if self.cycles_completed % REFINE_EVERY_N_CYCLES == 1:
             await self._refine_one()
         else:
@@ -90,7 +91,7 @@ class Engine:
         content = await generate_knowledge(topic, category)
 
         if self.paused:
-            logger.info("Discarding knowledge response - paused mid-call.")
+            logger.info("Discarding knowledge response — paused mid-call.")
             return
 
         if content:
@@ -122,7 +123,7 @@ class Engine:
         improved = await refine_knowledge(topic, existing)
 
         if self.paused:
-            logger.info("Discarding refinement - paused mid-call.")
+            logger.info("Discarding refinement — paused mid-call.")
             return
 
         if improved and improved != existing:
