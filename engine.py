@@ -12,7 +12,9 @@ from sources import SEED_TOPICS, LEARNING_INTERVAL_SECONDS, \
 from db import (upsert_knowledge, set_refined,
                 oldest_knowledge_for_refinement, log_learning_run,
                 knowledge_stats)
-from gemini import generate_knowledge, refine_knowledge, last_error as gemini_last_error
+
+# Import the module, not the name, so gemini.last_error is read live.
+import gemini as gemini_mod
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -88,10 +90,10 @@ class Engine:
         if self.paused:
             return
         self.gemini_calls += 1
-        content = await generate_knowledge(topic, category)
+        content = await gemini_mod.generate_knowledge(topic, category)
 
         if self.paused:
-            logger.info("Discarding knowledge response — paused mid-call.")
+            logger.info("Discarding knowledge response - paused mid-call.")
             return
 
         if content:
@@ -99,9 +101,10 @@ class Engine:
             log_learning_run(self.cycles_completed, topic, 1, 0, 1)
             self.last_debug = f"generated: {topic}"
         else:
+            err = gemini_mod.last_error or "empty response"
             log_learning_run(self.cycles_completed, topic, 0, 0, 1,
-                             error=gemini_last_error or "empty response")
-            self.last_debug = f"no content for: {topic} | {gemini_last_error}"
+                             error=err)
+            self.last_debug = f"no content for: {topic} | gemini: {err}"
 
     async def _refine_one(self):
         if self.paused:
@@ -120,10 +123,10 @@ class Engine:
         if self.paused:
             return
         self.gemini_calls += 1
-        improved = await refine_knowledge(topic, existing)
+        improved = await gemini_mod.refine_knowledge(topic, existing)
 
         if self.paused:
-            logger.info("Discarding refinement — paused mid-call.")
+            logger.info("Discarding refinement - paused mid-call.")
             return
 
         if improved and improved != existing:
@@ -131,9 +134,10 @@ class Engine:
             log_learning_run(self.cycles_completed, topic, 0, 1, 1)
             self.last_debug = f"refined: {topic} (v{version + 1})"
         else:
+            err = gemini_mod.last_error or "no change"
             log_learning_run(self.cycles_completed, topic, 0, 0, 1,
-                             error=gemini_last_error or "no change")
-            self.last_debug = f"no refinement for: {topic} | {gemini_last_error}"
+                             error=err)
+            self.last_debug = f"no refinement for: {topic} | gemini: {err}"
 
     def stats(self) -> dict:
         s = knowledge_stats()
