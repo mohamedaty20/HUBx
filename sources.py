@@ -269,3 +269,163 @@ SUGGEST_TEMPLATES_USER = (
     "title under 80 characters that includes both English and Arabic names "
     "where possible."
 )
+
+
+# ==================================================================
+# COMPLIANCE WHITELIST
+# ==================================================================
+# The block below is what compliance.py imports. It lives here so the
+# project has a single sources.py. It does NOT replace or touch any
+# of the learning/template constants above.
+# ==================================================================
+
+# Seconds between two live requests to the same domain.
+MIN_DOMAIN_DELAY = 3.0
+
+# Honest User-Agent sent with every live fetch.
+USER_AGENT = (
+    "EgyptCivilEngJobBot/1.0 "
+    "(+contact: your-email@example.com) "
+    "Python-httpx/0.28"
+)
+
+# Tier A: official API / RSS. Safe for live fetch, no robots.txt dance.
+TIER_A = [
+    "arbeitnow.com",
+    "remoteok.com",
+    "weworkremotely.com",
+]
+
+# Tier B: HTML pages you have personally verified (robots.txt allows,
+# ToS does not forbid). Leave empty until you verify a domain yourself.
+TIER_B = [
+    # "example-engineering-company.com",
+]
+
+# Tier C: ToS forbids scraping -> manual paste only.
+TIER_C = [
+    "wuzzuf.net",
+    "bayt.com",
+    "tanqeeb.com",
+    "linkedin.com",
+    "indeed.com",
+    "forasna.com",
+    "gulftalent.com",
+    "naukrigulf.com",
+    "careerjet.com.eg",
+]
+
+# Tier D: blocked (bot protection / legal block).
+TIER_D = [
+    "facebook.com",
+    "instagram.com",
+    "tiktok.com",
+    "x.com",
+    "twitter.com",
+    "threads.net",
+]
+
+# Internal lookup table built once at import.
+_TIER_MAP = {}
+for _d in TIER_A:
+    _TIER_MAP[_d] = "A"
+for _d in TIER_B:
+    _TIER_MAP[_d] = "B"
+for _d in TIER_C:
+    _TIER_MAP[_d] = "C"
+for _d in TIER_D:
+    _TIER_MAP[_d] = "D"
+
+# Domains that need a slower crawl than MIN_DOMAIN_DELAY.
+_DELAY_OVERRIDES = {
+    "linkedin.com": 30.0,
+    "indeed.com":   20.0,
+    "bayt.com":     10.0,
+    "wuzzuf.net":   10.0,
+    "tanqeeb.com":  10.0,
+}
+
+
+def _norm_domain(domain: str) -> str:
+    if not domain:
+        return ""
+    d = domain.lower().strip()
+    d = d.removeprefix("http://").removeprefix("https://")
+    d = d.removeprefix("www.")
+    d = d.split("/")[0]
+    return d
+
+
+def get_tier(domain: str) -> str:
+    """Return 'A' | 'B' | 'C' | 'D' | 'unknown'."""
+    d = _norm_domain(domain)
+    if not d:
+        return "unknown"
+    if d in _TIER_MAP:
+        return _TIER_MAP[d]
+    # try parent domains (sub.example.com -> example.com)
+    parts = d.split(".")
+    for i in range(1, len(parts)):
+        parent = ".".join(parts[i:])
+        if parent in _TIER_MAP:
+            return _TIER_MAP[parent]
+    return "unknown"
+
+
+def get_min_delay(domain: str) -> float:
+    """Seconds to wait before hitting this domain again."""
+    d = _norm_domain(domain)
+    if d in _DELAY_OVERRIDES:
+        return _DELAY_OVERRIDES[d]
+    for parent, delay in _DELAY_OVERRIDES.items():
+        if d == parent or d.endswith("." + parent):
+            return delay
+    return MIN_DOMAIN_DELAY
+
+
+def all_domains() -> list:
+    """Every whitelisted domain, any tier."""
+    return list(_TIER_MAP.keys())
+
+
+def allowed_domains() -> list:
+    """Domains safe for live fetch (tiers A and B only)."""
+    return list(TIER_A) + list(TIER_B)
+
+
+def blocked_domains() -> list:
+    """Domains that must not be fetched live (tiers C and D)."""
+    return list(TIER_C) + list(TIER_D)
+
+
+def is_allowed(domain: str, kind: str = "fetch") -> bool:
+    """
+    kind='fetch' -> only A and B pass (live network).
+    kind='parse' -> A, B, and C pass (user pasted the content).
+    """
+    tier = get_tier(domain)
+    if kind == "parse":
+        return tier in ("A", "B", "C")
+    return tier in ("A", "B")
+
+
+def tier_label(tier: str) -> str:
+    """Human-readable label for the UI."""
+    return {
+        "A": "API / RSS",
+        "B": "HTML (robots-allowed)",
+        "C": "Manual paste only",
+        "D": "Blocked",
+    }.get(tier, "Unknown")
+
+
+# Sanity check — crashes loudly at import if any of the six names
+# compliance.py needs is missing.
+assert isinstance(MIN_DOMAIN_DELAY, float)
+assert isinstance(USER_AGENT, str)
+assert callable(get_tier)
+assert callable(get_min_delay)
+assert isinstance(TIER_A, list)
+assert isinstance(TIER_B, list)
+assert isinstance(TIER_C, list)
+assert isinstance(TIER_D, list)
