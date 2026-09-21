@@ -1,5 +1,7 @@
 # engine.py
-# Self-learning loop that EXPANDS its own topic list.
+# Dual learning loop: knowledge topics + Egyptian site templates.
+# Version replacement: when a refined version is produced, the old row is
+# deleted from the database and only the new version remains.
 
 import asyncio
 import json
@@ -10,11 +12,18 @@ from typing import Optional
 from sources import (SEED_TOPICS, LEARNING_INTERVAL_SECONDS,
                      REFINE_EVERY_N_CYCLES, SUGGESTIONS_PER_CYCLE,
                      MAX_KNOWLEDGE_ITEMS,
-                     SUGGEST_TOPICS_SYSTEM, SUGGEST_TOPICS_USER)
-from db import (upsert_knowledge, set_refined,
+                     SUGGEST_TOPICS_SYSTEM, SUGGEST_TOPICS_USER,
+                     SEED_TEMPLATES, TEMPLATE_INTERVAL_SECONDS,
+                     MAX_TEMPLATES,
+                     SUGGEST_TEMPLATES_SYSTEM, SUGGEST_TEMPLATES_USER)
+from db import (upsert_knowledge, replace_knowledge_with_refined,
                 oldest_knowledge_for_refinement, log_learning_run,
                 knowledge_stats, add_pending_topic, pop_pending_topic,
-                pending_count)
+                pending_count,
+                upsert_template, replace_template_with_refined,
+                oldest_template_for_refinement, log_template_run,
+                template_stats, add_pending_template,
+                pop_pending_template, pending_template_count)
 import gemini as gemini_mod
 
 logger = logging.getLogger(__name__)
@@ -25,30 +34,29 @@ ALLOWED_CATEGORIES = {
     "quality_management", "egyptian_codes", "safety", "surveying",
 }
 
+ALLOWED_TEMPLATE_CATEGORIES = {
+    "administrative", "quality", "safety", "technical",
+    "financial", "legal", "handover",
+}
+
 
 def _safe_json(raw):
-    """Turn Gemini output into a dict, or return {} on any failure."""
     if not raw:
         return {}
     s = str(raw).strip()
     if s.startswith("```"):
         s = s.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-    # Direct parse
-    for candidate in (s,):
-        try:
-            v = json.loads(candidate)
-            if isinstance(v, str):
-                try:
-                    v = json.loads(v)
-                except Exception:
-                    pass
-            if isinstance(v, dict):
-                return v
-        except Exception:
-            pass
-
-    # Extract first {...} block
+    try:
+        v = json.loads(s)
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                pass
+        if isinstance(v, dict):
+            return v
+    except Exception:
+        pass
     m = re.search(r"\{.*\}", s, re.S)
     if m:
         try:
@@ -62,8 +70,6 @@ def _safe_json(raw):
                 return v
         except Exception:
             pass
-
-    # Fix escaped quotes
     fixed = s.replace('\\"', '"')
     m = re.search(r"\{.*\}", fixed, re.S)
     if m:
@@ -77,11 +83,10 @@ def _safe_json(raw):
 
 
 def _extract_subtopics(data):
-    """Pull a list of (topic, category) pairs from any dict shape."""
     if not isinstance(data, dict):
         return []
-    items = data.get("subtopics") or data.get("sub_topics") \
-        or data.get("topics") or data.get("items") or []
+    items = (data.get("subtopics") or data.get("sub_topics")
+             or data.get("topics") or data.get("items") or [])
     if isinstance(items, str):
         try:
             items = json.loads(items)
@@ -104,6 +109,32 @@ def _extract_subtopics(data):
     return out
 
 
+def _extract_templates(data):
+    if not isinstance(data, dict):
+        return []
+    items = (data.get("templates") or data.get("items") or [])
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except Exception:
+            items = []
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            n = (it.get("name") or it.get("title") or "").strip()
+            c = (it.get("category") or "").strip().lower()
+        elif isinstance(it, str):
+            n = it.strip()
+            c = ""
+        else:
+            continue
+        if n:
+            out.append((n, c))
+    return out
+
+
 class Engine:
     def __init__(self):
         self.running = False
@@ -114,6 +145,7 @@ class Engine:
         self.last_error = ""
         self.last_debug = "waiting for first cycle"
         self._topic_index = 0
+        self._template_index = 0
         self._task: Optional[asyncio.Task] = None
 
     async def start(self):
@@ -158,9 +190,20 @@ class Engine:
             raise
 
     async def _cycle(self):
+        # Alternate: knowledge, template, knowledge, template...
+        if self.cycles_completed % 2 == 0:
+            await self._knowledge_cycle()
+        else:
+            await self._template_cycle()
+
+    # ------------------------------------------------------------------
+    # Knowledge cycle
+    # ------------------------------------------------------------------
+
+    async def _knowledge_cycle(self):
         s = knowledge_stats()
         if s["total"] >= MAX_KNOWLEDGE_ITEMS:
-            self.last_debug = f"cap reached ({MAX_KNOWLEDGE_ITEMS})"
+            self.last_debug = f"knowledge cap reached"
             return
         if self.cycles_completed % REFINE_EVERY_N_CYCLES == 3:
             await self._refine_one()
@@ -175,7 +218,8 @@ class Engine:
             topic, category = pending
             source = "ai"
         else:
-            topic, category = SEED_TOPICS[self._topic_index % len(SEED_TOPICS)]
+            topic, category = SEED_TOPICS[
+                self._topic_index % len(SEED_TOPICS)]
             self._topic_index += 1
             source = "seed"
 
@@ -189,46 +233,30 @@ class Engine:
         if content:
             upsert_knowledge(topic, category, content, confidence=0.6)
             log_learning_run(self.cycles_completed, topic, 1, 0, 1)
-            self.last_debug = f"generated [{source}]: {topic}"
+            self.last_debug = f"[K] generated [{source}]: {topic}"
             try:
                 await self._expand_topics(topic, category)
             except Exception as e:
                 self.last_debug += f" | expand err: {e}"
         else:
             err = gemini_mod.last_error or "empty response"
-            log_learning_run(self.cycles_completed, topic, 0, 0, 1, error=err)
-            self.last_debug = f"no content for: {topic} | {err}"
+            log_learning_run(self.cycles_completed, topic, 0, 0, 1,
+                             error=err)
+            self.last_debug = f"[K] no content for: {topic} | {err}"
 
     async def _expand_topics(self, parent_topic, parent_category):
-        if self.paused:
+        if self.paused or pending_count() > 200:
             return
-        if pending_count() > 200:
-            self.last_debug += " | queue full"
-            return
-
         self.gemini_calls += 1
-        try:
-            user = SUGGEST_TOPICS_USER.format(
-                topic=parent_topic, category=parent_category,
-                n=SUGGESTIONS_PER_CYCLE)
-        except Exception as e:
-            self.last_debug += f" | prompt err: {e}"
-            return
-
+        user = SUGGEST_TOPICS_USER.format(
+            topic=parent_topic, category=parent_category,
+            n=SUGGESTIONS_PER_CYCLE)
         raw = await gemini_mod._call(
             f"{SUGGEST_TOPICS_SYSTEM}\n\n---\n\n{user}", json_mode=True)
-        if self.paused:
+        if self.paused or not raw:
             return
-        if not raw:
-            self.last_debug += " | expand: no response"
-            return
-
         data = _safe_json(raw)
         items = _extract_subtopics(data)
-        if not items:
-            self.last_debug += " | expand: 0 parsed"
-            return
-
         added = 0
         for t, c in items[:SUGGESTIONS_PER_CYCLE]:
             if c not in ALLOWED_CATEGORIES:
@@ -236,7 +264,8 @@ class Engine:
             if add_pending_topic(t, c, source="ai",
                                  parent_topic=parent_topic):
                 added += 1
-        self.last_debug += f" | +{added} queued"
+        if added:
+            self.last_debug += f" | +{added} queued"
 
     async def _refine_one(self):
         if self.paused:
@@ -257,22 +286,126 @@ class Engine:
         if self.paused:
             return
         if improved and improved != existing:
-            set_refined(kid, improved, confidence=0.8)
+            # Version replacement: old row deleted, new row inserted.
+            replace_knowledge_with_refined(kid, improved)
             log_learning_run(self.cycles_completed, topic, 0, 1, 1)
-            self.last_debug = f"refined: {topic} (v{version + 1})"
+            self.last_debug = f"[K] refined v{version + 1}: {topic}"
         else:
             err = gemini_mod.last_error or "no change"
-            log_learning_run(self.cycles_completed, topic, 0, 0, 1, error=err)
-            self.last_debug = f"no refinement for: {topic} | {err}"
+            log_learning_run(self.cycles_completed, topic, 0, 0, 1,
+                             error=err)
+            self.last_debug = f"[K] no refinement: {topic} | {err}"
+
+    # ------------------------------------------------------------------
+    # Template cycle
+    # ------------------------------------------------------------------
+
+    async def _template_cycle(self):
+        s = template_stats()
+        if s["total"] >= MAX_TEMPLATES:
+            self.last_debug = "[T] template cap reached"
+            return
+        if self.cycles_completed % REFINE_EVERY_N_CYCLES == 1:
+            await self._refine_template()
+        else:
+            await self._generate_template()
+
+    async def _generate_template(self):
+        if self.paused:
+            return
+        pending = pop_pending_template()
+        if pending:
+            name, category = pending
+            source = "ai"
+        else:
+            name, category = SEED_TEMPLATES[
+                self._template_index % len(SEED_TEMPLATES)]
+            self._template_index += 1
+            source = "seed"
+
+        if self.paused:
+            return
+        self.gemini_calls += 1
+        content = await gemini_mod.generate_template(name, category)
+        if self.paused:
+            return
+        if content:
+            upsert_template(name, category, content, confidence=0.6)
+            log_template_run(self.cycles_completed, name, 1, 0, 1)
+            self.last_debug = f"[T] generated [{source}]: {name}"
+            try:
+                await self._expand_templates(name, category)
+            except Exception as e:
+                self.last_debug += f" | expand err: {e}"
+        else:
+            err = gemini_mod.last_error or "empty response"
+            log_template_run(self.cycles_completed, name, 0, 0, 1,
+                             error=err)
+            self.last_debug = f"[T] no content: {name} | {err}"
+
+    async def _expand_templates(self, parent_name, parent_category):
+        if self.paused or pending_template_count() > 100:
+            return
+        self.gemini_calls += 1
+        user = SUGGEST_TEMPLATES_USER.format(
+            name=parent_name, category=parent_category,
+            n=SUGGESTIONS_PER_CYCLE)
+        raw = await gemini_mod._call(
+            f"{SUGGEST_TEMPLATES_SYSTEM}\n\n---\n\n{user}", json_mode=True)
+        if self.paused or not raw:
+            return
+        data = _safe_json(raw)
+        items = _extract_templates(data)
+        added = 0
+        for n, c in items[:SUGGESTIONS_PER_CYCLE]:
+            if c not in ALLOWED_TEMPLATE_CATEGORIES:
+                c = parent_category
+            if add_pending_template(n, c, source="ai",
+                                    parent_name=parent_name):
+                added += 1
+        if added:
+            self.last_debug += f" | +{added} templates queued"
+
+    async def _refine_template(self):
+        if self.paused:
+            return
+        rows = oldest_template_for_refinement(1)
+        if not rows:
+            await self._generate_template()
+            return
+        row = rows[0]
+        tid, name, category, content, refined, version = row
+        existing = refined or content
+        if not existing:
+            return
+        if self.paused:
+            return
+        self.gemini_calls += 1
+        improved = await gemini_mod.refine_template(name, existing)
+        if self.paused:
+            return
+        if improved and improved != existing:
+            replace_template_with_refined(tid, improved)
+            log_template_run(self.cycles_completed, name, 0, 1, 1)
+            self.last_debug = f"[T] refined v{version + 1}: {name}"
+        else:
+            err = gemini_mod.last_error or "no change"
+            log_template_run(self.cycles_completed, name, 0, 0, 1,
+                             error=err)
+            self.last_debug = f"[T] no refinement: {name} | {err}"
 
     def stats(self) -> dict:
-        s = knowledge_stats()
+        ks = knowledge_stats()
+        ts = template_stats()
         return {
             "cycles": self.cycles_completed,
             "gemini_calls": self.gemini_calls,
-            "knowledge_total": s["total"],
-            "knowledge_refined": s["refined"],
-            "pending_topics": s.get("pending", 0),
+            "knowledge_total": ks["total"],
+            "knowledge_refined": ks["refined"],
+            "pending_topics": ks.get("pending", 0),
+            "template_total": ts["total"],
+            "template_refined": ts["refined"],
+            "pending_templates": ts.get("pending", 0),
             "last_status": self.last_status,
             "last_error": self.last_error,
             "last_debug": self.last_debug,
