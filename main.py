@@ -8,7 +8,7 @@ from nicegui import ui, app
 
 from db import (init_db, get_all_knowledge, get_knowledge_by_id,
                 save_check_report, recent_check_reports,
-                recent_learning_runs, knowledge_stats)
+                recent_learning_runs, knowledge_stats, db_health)
 from engine import engine
 from file_reader import extract_text
 from gemini import check_document, last_error as gemini_last_error
@@ -155,36 +155,30 @@ def check_page():
 
 
 # =================================================================
-# Tab 2 — Knowledge (sidebar + reader)
+# Tab 2 — Knowledge
 # =================================================================
 
 @ui.page("/knowledge")
 def knowledge_page():
     _header()
+    ui.label("Self-Learned Civil Quality Knowledge").classes(
+        "text-2xl font-bold")
 
-    with ui.row().classes("w-full gap-4 items-center"):
-        ui.label("Self-Learned Civil Quality Knowledge").classes(
-            "text-2xl font-bold")
-        ui.space()
-        stats_label = ui.label("").classes("text-gray-600")
+    status_bar = ui.label("").classes(
+        "text-sm text-gray-600 bg-gray-100 p-2 rounded w-full mt-1")
 
-    selected = {"id": None}
-
-    with ui.row().classes("w-full gap-4 mt-4 no-wrap"):
-        # -------- sidebar --------
-        with ui.card().classes("w-72 shrink-0 h-[75vh] overflow-auto"):
+    with ui.row().classes("w-full gap-4 mt-3 no-wrap"):
+        with ui.card().classes("w-72 shrink-0 h-[70vh] overflow-auto"):
             ui.label("Categories").classes("font-bold")
             cat_container = ui.column().classes("w-full gap-1")
             ui.separator()
             ui.label("Topics").classes("font-bold mt-2")
             topic_container = ui.column().classes("w-full gap-1")
 
-        # -------- reader --------
-        with ui.card().classes("flex-1 h-[75vh] overflow-auto"):
+        with ui.card().classes("flex-1 h-[70vh] overflow-auto"):
             detail = ui.markdown("").classes("whitespace-pre-wrap")
 
     def show_item(kid: int):
-        selected["id"] = kid
         k = get_knowledge_by_id(kid)
         if not k:
             return
@@ -202,25 +196,35 @@ def knowledge_page():
     def refresh_sidebar():
         cat_container.clear()
         topic_container.clear()
-        rows = get_all_knowledge(limit=1000)
-        s = knowledge_stats()
-        stats_label.text = (
-            f"{s['total']} topics, {s['refined']} refined")
+
+        h = db_health()
+        rows = []
+        if h["ok"]:
+            rows = get_all_knowledge(limit=1000)
+            status_bar.text = (
+                f"DB: {h['connection']}  |  "
+                f"Knowledge rows: {h['knowledge']}  |  "
+                f"Runs: {h['runs']}  |  Checks: {h['checks']}"
+            )
+        else:
+            status_bar.text = (
+                f"DB ERROR: {h['error']}  |  connection: {h['connection']}"
+            )
 
         cats = Counter(r[2] for r in rows if r[2])
         with cat_container:
+            ui.button("show all",
+                      on_click=lambda: filter_by(None)
+                      ).props("flat dense align=left color=primary"
+                              ).classes("w-full justify-start")
             for cat, n in cats.most_common():
                 ui.button(f"{cat} ({n})",
                           on_click=lambda c=cat: filter_by(c)
                           ).props("flat dense align=left").classes(
                               "w-full justify-start")
-            ui.button("show all",
-                      on_click=lambda: filter_by(None)
-                      ).props("flat dense align=left color=primary"
-                              ).classes("w-full justify-start")
 
         with topic_container:
-            for r in rows[:200]:
+            for r in rows[:300]:
                 kid = r[0]
                 topic = r[1]
                 ui.button(
@@ -233,7 +237,7 @@ def knowledge_page():
         topic_container.clear()
         rows = get_all_knowledge(category=cat, limit=1000)
         with topic_container:
-            for r in rows[:200]:
+            for r in rows[:300]:
                 kid = r[0]
                 topic = r[1]
                 ui.button(
@@ -265,6 +269,7 @@ def dashboard_page():
 
     debug_label = ui.label("").classes("text-gray-600 mt-2")
     gemini_err_label = ui.label("").classes("text-orange-500 mt-1")
+    db_label = ui.label("").classes("text-sm text-blue-700 mt-1")
 
     async def do_start():
         await engine.start()
@@ -272,9 +277,22 @@ def dashboard_page():
     async def do_pause():
         await engine.pause()
 
+    async def do_one_cycle():
+        ui.notify("Running one cycle…")
+        try:
+            await engine._cycle()
+            engine.cycles_completed += 1
+            ui.notify("Cycle complete. Check the debug line.",
+                      color="green")
+        except Exception as e:
+            ui.notify(f"Cycle failed: {e}", color="red")
+        refresh()
+
     with ui.row().classes("gap-2 mt-4"):
         ui.button("Start learning", on_click=do_start).props("color=green")
         ui.button("Pause", on_click=do_pause).props("color=orange")
+        ui.button("Run one cycle now", on_click=do_one_cycle).props(
+            "color=blue")
 
     def refresh():
         s = engine.stats()
@@ -289,6 +307,11 @@ def dashboard_page():
         debug_label.text = s["last_debug"]
         gemini_err_label.text = (
             f"Gemini: {gemini_last_error}" if gemini_last_error else "")
+        h = db_health()
+        db_label.text = (
+            f"DB: {h['connection']}"
+            + (f"  |  ERROR: {h['error']}" if not h["ok"] else "")
+        )
 
     ui.timer(2.0, refresh)
 
