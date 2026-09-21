@@ -1,6 +1,5 @@
 # db.py
-# Finds Turso credentials by VALUE (not by exact key name), so the app
-# works no matter what you named the env vars in Render.
+# Turso with automatic local-SQLite fallback. Sanitizes legacy rows on boot.
 
 import os
 import json
@@ -21,7 +20,6 @@ def _clean(v):
 
 
 def _find_url():
-    """Any env var whose value starts with libsql://"""
     for k, v in os.environ.items():
         v = _clean(v)
         if v.startswith("libsql://"):
@@ -30,7 +28,6 @@ def _find_url():
 
 
 def _find_token():
-    """Any env var whose value looks like a Turso JWT (starts with eyJ, >100 chars)."""
     for k, v in os.environ.items():
         v = _clean(v)
         if v.startswith("eyJ") and len(v) > 100:
@@ -48,9 +45,9 @@ _db_error = ""
 
 def _try_turso():
     if not _TURSO_URL_RAW.startswith("libsql://"):
-        raise ValueError("no libsql:// URL found in any env var")
+        raise ValueError("no libsql:// URL found")
     if not _TURSO_TOKEN_RAW:
-        raise ValueError("no Turso token found in any env var")
+        raise ValueError("no Turso token found")
     conn = libsql.connect(_TURSO_URL_RAW, auth_token=_TURSO_TOKEN_RAW)
     conn.execute("SELECT 1").fetchone()
     return conn
@@ -64,7 +61,6 @@ def get_conn():
     print("=== HUBx DB init ===")
     print(f"URL env var name  = {_URL_KEY!r} (len={len(_TURSO_URL_RAW)})")
     print(f"TOKEN env var name= {_TOKEN_KEY!r} (len={len(_TURSO_TOKEN_RAW)})")
-    print(f"ALL ENV KEYS = {sorted(os.environ.keys())}")
 
     try:
         _conn = _try_turso()
@@ -76,7 +72,6 @@ def get_conn():
     except Exception as e:
         _db_error = f"{type(e).__name__}: {e}"
         print(f"Turso failed: {_db_error}")
-        print("Falling back to local SQLite.")
 
     _conn = libsql.connect("hubx.db")
     _db_mode = "local"
@@ -132,6 +127,30 @@ def init_db():
     );
     """)
     conn.commit()
+    sanitize_existing()
+
+
+def sanitize_existing():
+    """Clean LaTeX garbage from any rows written before the sanitizer."""
+    try:
+        from gemini import sanitize_text
+    except Exception:
+        return
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, content, refined_content FROM knowledge").fetchall()
+        for r in rows:
+            kid = r[0]
+            c = sanitize_text(r[1] or "")
+            rc = sanitize_text(r[2] or "")
+            if c != (r[1] or "") or rc != (r[2] or ""):
+                conn.execute(
+                    "UPDATE knowledge SET content=?, refined_content=? "
+                    "WHERE id=?", (c, rc, kid))
+        conn.commit()
+    except Exception as e:
+        logger.warning("sanitize_existing failed: %s", e)
 
 
 def upsert_knowledge(topic, category, content, confidence=0.5):
@@ -203,6 +222,45 @@ def knowledge_stats():
         "SELECT COUNT(*) FROM knowledge WHERE refined_content != ''"
     ).fetchone()[0]
     return {"total": total, "refined": refined}
+
+
+def category_counts():
+    conn = get_conn()
+    return conn.execute("""
+        SELECT category, COUNT(*) FROM knowledge
+        WHERE category IS NOT NULL AND category != ''
+        GROUP BY category ORDER BY COUNT(*) DESC
+    """).fetchall()
+
+
+def confidence_bins():
+    """Return a list of (bin_label, count) for the confidence histogram."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT confidence FROM knowledge WHERE confidence IS NOT NULL"
+    ).fetchall()
+    bins = {f"{i/10:.1f}": 0 for i in range(0, 11)}
+    for r in rows:
+        c = float(r[0] or 0.0)
+        key = f"{min(int(c*10), 10)/10:.1f}"
+        bins[key] = bins.get(key, 0) + 1
+    return sorted(bins.items())
+
+
+def version_counts():
+    conn = get_conn()
+    return conn.execute("""
+        SELECT version, COUNT(*) FROM knowledge
+        GROUP BY version ORDER BY version
+    """).fetchall()
+
+
+def runs_per_cycle(limit=40):
+    conn = get_conn()
+    return conn.execute("""
+        SELECT cycle, items_added, items_refined
+        FROM learning_runs ORDER BY id DESC LIMIT ?
+    """, (limit,)).fetchall()[::-1]
 
 
 def log_learning_run(cycle, topic, added, refined, calls, error=""):
