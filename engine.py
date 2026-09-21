@@ -1,7 +1,5 @@
 # engine.py
 # 70-second loop with pause/start, cancellation, counters.
-# Pause is REAL: when paused, no Gemini call is initiated, and any
-# in-flight call's response is discarded, not stored.
 
 import asyncio
 import datetime
@@ -33,7 +31,7 @@ class Engine:
         self.gemini_calls = 0
         self.last_status = "idle"
         self.last_error = ""
-        self.last_debug = ""  # human-readable per-cycle summary
+        self.last_debug = ""
         self._task: Optional[asyncio.Task] = None
 
     async def start(self):
@@ -79,16 +77,7 @@ class Engine:
             raise
 
     async def _cycle(self):
-        strategy = get_active_strategy()
-        if not strategy:
-            save_strategy(
-                queries=["civil engineer Egypt", "structural engineer Cairo"],
-                sources=[d for d, t in SOURCES.items() if t in ("A", "B")],
-                reasoning="bootstrap default",
-                confidence=0.5,
-            )
-            strategy = get_active_strategy()
-
+        strategy = self._ensure_fresh_strategy()
         strategy_id = strategy["id"]
         run_id = start_run(strategy_id)
         fetched = kept = errors = 0
@@ -111,16 +100,11 @@ class Engine:
                     for job in all_jobs[:MAX_JOBS_PER_CYCLE]:
                         if self.paused:
                             break
-
-                        # Normalize posted_date to ISO YYYY-MM-DD; discard unknown.
                         iso_date = self._normalize_date(job.get("posted_date"))
                         if not iso_date:
                             continue
-
-                        # Reject anything older than MAX_AGE_DAYS.
                         if not self._within_window(iso_date, MAX_AGE_DAYS):
                             continue
-
                         if not self._is_egypt_civil(job):
                             continue
 
@@ -136,7 +120,7 @@ class Engine:
                     )
                 except ComplianceError as e:
                     errors += 1
-                    debug_lines.append(f"{domain}: compliance error - {e}")
+                    debug_lines.append(f"{domain}: compliance - {e}")
                     log_failure(strategy_id, "", domain, "compliance", str(e))
                 except Exception as e:
                     errors += 1
@@ -150,6 +134,34 @@ class Engine:
 
         finally:
             finish_run(run_id, fetched, kept, errors)
+
+    # ------------------------------------------------------------------
+    # Auto-rebuild the strategy when the DB one is stale
+    # ------------------------------------------------------------------
+
+    def _ensure_fresh_strategy(self) -> dict:
+        """
+        Load the active strategy. If none of its sources exist in
+        LIVE_FETCH_URLS, it's stale (built before sources.py was updated)
+        so we save a fresh bootstrap and return that instead.
+        """
+        strategy = get_active_strategy()
+        live_keys = set(LIVE_FETCH_URLS.keys())
+
+        if strategy is None or not (set(strategy.get("sources", [])) & live_keys):
+            bootstrap_sources = [d for d, t in SOURCES.items() if t in ("A", "B")]
+            save_strategy(
+                queries=["civil engineer Egypt", "structural engineer Cairo",
+                         "WASH engineer Egypt", "infrastructure Egypt"],
+                sources=bootstrap_sources,
+                reasoning="auto-bootstrap: previous strategy had no live sources",
+                confidence=0.5,
+            )
+            strategy = get_active_strategy()
+            self.last_debug = (
+                f"rebuilt strategy → sources: {bootstrap_sources}"
+            )
+        return strategy
 
     async def _refine(self, strategy_id: int, strategy: dict):
         if self.paused:
@@ -167,15 +179,19 @@ class Engine:
         if not result:
             return
 
+        # Safety: never let Gemini introduce domains that aren't live-configurable.
+        proposed = result.get("sources", strategy.get("sources", []))
+        safe_sources = [d for d in proposed if d in LIVE_FETCH_URLS] or \
+                       strategy.get("sources", [])
         save_strategy(
             queries=result.get("queries", strategy.get("queries", [])),
-            sources=result.get("sources", strategy.get("sources", [])),
+            sources=safe_sources,
             reasoning=result.get("reasoning", ""),
             confidence=float(result.get("confidence", 0.5)),
         )
 
     # ------------------------------------------------------------------
-    # Parsing + filtering helpers (plain Python, no AI)
+    # Parsing helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -183,13 +199,24 @@ class Engine:
         jobs = []
         feed = feedparser.parse(text)
         for entry in feed.entries[:100]:
+            # Prefer struct_time from feedparser — more reliable than the string
+            iso = ""
+            for key in ("published_parsed", "updated_parsed"):
+                t = entry.get(key)
+                if t:
+                    try:
+                        iso = datetime.date(*t[:3]).isoformat()
+                        break
+                    except Exception:
+                        continue
+
             jobs.append({
                 "title": entry.get("title", ""),
-                "company": entry.get("author", ""),
-                "location": entry.get("location", "")
-                            or Engine._location_from_tags(entry),
-                "posted_date": entry.get("published", "")
-                               or entry.get("updated", ""),
+                "company": entry.get("author", "") or
+                            Engine._source_name(entry),
+                "location": entry.get("location", "") or
+                            Engine._location_from_tags(entry),
+                "posted_date": iso,
                 "url": entry.get("link", ""),
                 "description_full": entry.get("summary", ""),
                 "recruiter_name": "",
@@ -199,8 +226,14 @@ class Engine:
         return jobs
 
     @staticmethod
+    def _source_name(entry) -> str:
+        src = entry.get("source") or {}
+        if isinstance(src, dict):
+            return src.get("title", "")
+        return ""
+
+    @staticmethod
     def _location_from_tags(entry) -> str:
-        """Pull a location hint from feed tags if the entry doesn't have one."""
         tags = entry.get("tags", []) or []
         for t in tags:
             term = (t.get("term") or "").strip()
@@ -211,12 +244,11 @@ class Engine:
 
     @staticmethod
     def _normalize_date(raw: str) -> str:
-        """Convert any feed date string to ISO YYYY-MM-DD. Empty on failure."""
         if not raw:
             return ""
         raw = raw.strip()
-        # feedparser usually gives us a struct_time we can't see here,
-        # so try common string formats.
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            return raw[:10]
         for fmt in (
             "%a, %d %b %Y %H:%M:%S %z",
             "%a, %d %b %Y %H:%M:%S %Z",
@@ -242,25 +274,23 @@ class Engine:
 
     @staticmethod
     def _is_egypt_civil(job: dict) -> bool:
-        loc = (job.get("location") or "").lower()
-        title = (job.get("title") or "").lower()
-        desc = (job.get("description_full") or "").lower()
-        blob = f"{loc} {title} {desc}"
-
-        egypt_terms = ("egypt", "cairo", "alexandria", "giza", "mena",
-                       "egyptian", "north africa")
+        blob = " ".join([
+            (job.get("location") or "").lower(),
+            (job.get("title") or "").lower(),
+            (job.get("description_full") or "").lower(),
+        ])
+        egypt_terms = ("egypt", "cairo", "alexandria", "giza",
+                       "mena", "egyptian", "north africa")
         civil_terms = (
             "civil", "structural", "geotechnical", "transportation",
             "water resources", "construction", "site engineer",
             "quantity survey", "infrastructure", "highway", "bridge",
-            "sanitation", "watsan", "wash", "shelter", "urban planning",
-            "roads", "dams", "foundations", "architect", "building",
-            "engineer",  # loose match: UN posts often say "Engineer"
+            "sanitation", "watsan", "wash", "shelter",
+            "roads", "dams", "foundations", "building",
+            "engineer",  # UN posts use just "Engineer"
         )
-
-        has_egypt = any(w in blob for w in egypt_terms)
-        has_civil = any(w in blob for w in civil_terms)
-        return has_egypt and has_civil
+        return any(w in blob for w in egypt_terms) and \
+               any(w in blob for w in civil_terms)
 
 
 engine = Engine()
