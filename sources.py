@@ -18,11 +18,11 @@ TOs_FORBIDDEN = {
     "tanqeeb.com",
     "forasna.com",
     "gulfTalent.com",
-    "unjobs.org",  # explicitly forbids automated access
+    "unjobs.org",       # explicitly forbids automated access
 }
 
 SOURCES = {
-    # Tier A - official RSS feeds that actually produce Egypt jobs
+    # Tier A - official RSS feeds
     "reliefweb.int": TIER_A,
     "weworkremotely.com": TIER_A,
 
@@ -34,20 +34,27 @@ SOURCES = {
     "tanqeeb.com": TIER_C,
     "forasna.com": TIER_C,
     "gulfTalent.com": TIER_C,
-    "unjobs.org": TIER_C,  # ToS forbids scraping - manual only
+    "unjobs.org": TIER_C,
 
     # Tier D - blocked
     "facebook.com": TIER_D,
     "twitter.com": TIER_D,
 }
 
-# ReliefWeb publishes filtered RSS feeds by country/category.
-# The Egypt job feed uses their advanced-search parameter.
+# ReliefWeb filtered RSS feeds.
+# PC182 = Egypt on ReliefWeb's country taxonomy.
+# Try several URL shapes; the engine will use whichever responds.
 LIVE_FETCH_URLS = {
-    # ReliefWeb jobs filtered to Egypt (country id PC182 is Egypt on ReliefWeb)
     "reliefweb.int": "https://reliefweb.int/jobs/rss.xml?advanced-search=%28PC182%29",
-    # WeWorkRemotely as a fallback (low yield for civil eng, but legal)
     "weworkremotely.com": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+}
+
+# Alternate URLs to try if the primary one fails.
+FALLBACK_URLS = {
+    "reliefweb.int": [
+        "https://reliefweb.int/jobs/rss.xml?advanced-search=%28C182%29",
+        "https://reliefweb.int/jobs/rss.xml",
+    ],
 }
 
 MANUAL_PASTE_DOMAINS = [d for d, t in SOURCES.items() if t == TIER_C]
