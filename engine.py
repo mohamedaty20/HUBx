@@ -6,6 +6,7 @@
 import asyncio
 import datetime
 import logging
+import re
 from typing import Optional
 
 import feedparser
@@ -22,7 +23,8 @@ logging.basicConfig(level=logging.INFO)
 CYCLE_INTERVAL = 70
 REFINE_EVERY_N = 5
 MAX_JOBS_PER_CYCLE = 50
-MAX_AGE_DAYS = 7
+MAX_AGE_DAYS = 14          # widened from 7 - feed publication lags are real
+MAX_TITLES_IN_DEBUG = 3
 
 
 class Engine:
@@ -99,35 +101,30 @@ class Engine:
                     fetched += 1
                     all_jobs = self._parse_feed_or_html(text, domain)
                     kept_before = kept
-                    first_reject = ""
+                    rejected_titles = []
 
                     for job in all_jobs[:MAX_JOBS_PER_CYCLE]:
                         if self.paused:
                             break
                         iso_date = self._normalize_date(job.get("posted_date"))
-                        if not iso_date:
-                            if not first_reject:
-                                first_reject = (
-                                    f"no date: "
-                                    f"{(job.get('title') or '')[:40]}"
-                                )
-                            continue
-                        if not self._within_window(iso_date, MAX_AGE_DAYS):
-                            if not first_reject:
-                                first_reject = (
-                                    f"old ({iso_date}): "
-                                    f"{(job.get('title') or '')[:40]}"
+                        if iso_date and not self._within_window(
+                                iso_date, MAX_AGE_DAYS):
+                            if len(rejected_titles) < MAX_TITLES_IN_DEBUG:
+                                rejected_titles.append(
+                                    f"old({iso_date}) "
+                                    f"{(job.get('title') or '')[:30]}"
                                 )
                             continue
                         if not self._is_egypt_civil(job):
-                            if not first_reject:
-                                first_reject = (
-                                    f"filter: "
-                                    f"{(job.get('title') or '')[:40]}"
+                            if len(rejected_titles) < MAX_TITLES_IN_DEBUG:
+                                rejected_titles.append(
+                                    f"filter "
+                                    f"{(job.get('title') or '')[:30]}"
                                 )
                             continue
 
-                        job["posted_date"] = iso_date
+                        job["posted_date"] = iso_date or \
+                            datetime.date.today().isoformat()
                         job["source_domain"] = domain
                         job["source_tier"] = get_tier(domain)
                         insert_job(job)
@@ -137,12 +134,11 @@ class Engine:
                         f"{domain}: {len(all_jobs)} entries, "
                         f"{kept - kept_before} kept"
                     )
-                    if first_reject:
-                        line += f" [1st reject: {first_reject}]"
+                    if rejected_titles:
+                        line += f" [rejects: {'; '.join(rejected_titles)}]"
                     debug_lines.append(line)
 
                 except ComplianceError as e:
-                    # Try fallback URLs for this domain
                     fallbacks = FALLBACK_URLS.get(domain, [])
                     recovered = False
                     for fb in fallbacks:
@@ -155,14 +151,13 @@ class Engine:
                             for job in all_jobs[:MAX_JOBS_PER_CYCLE]:
                                 iso_date = self._normalize_date(
                                     job.get("posted_date"))
-                                if not iso_date:
-                                    continue
-                                if not self._within_window(
+                                if iso_date and not self._within_window(
                                         iso_date, MAX_AGE_DAYS):
                                     continue
                                 if not self._is_egypt_civil(job):
                                     continue
-                                job["posted_date"] = iso_date
+                                job["posted_date"] = iso_date or \
+                                    datetime.date.today().isoformat()
                                 job["source_domain"] = domain
                                 job["source_tier"] = get_tier(domain)
                                 insert_job(job)
@@ -189,7 +184,8 @@ class Engine:
 
             self.last_debug = " | ".join(debug_lines) or "no sources configured"
 
-            if (self.cycles_completed + 1) % REFINE_EVERY_N == 0 and not self.paused:
+            if (self.cycles_completed + 1) % REFINE_EVERY_N == 0 \
+                    and not self.paused:
                 await self._refine(strategy_id, strategy)
 
         finally:
@@ -200,19 +196,17 @@ class Engine:
     # ------------------------------------------------------------------
 
     def _ensure_fresh_strategy(self) -> dict:
-        """
-        Load the active strategy. If none of its sources exist in
-        LIVE_FETCH_URLS, it's stale (built before sources.py was updated)
-        so we save a fresh bootstrap and return that instead.
-        """
         strategy = get_active_strategy()
         live_keys = set(LIVE_FETCH_URLS.keys())
 
-        if strategy is None or not (set(strategy.get("sources", [])) & live_keys):
-            bootstrap_sources = [d for d, t in SOURCES.items() if t in ("A", "B")]
+        if strategy is None or not (
+                set(strategy.get("sources", [])) & live_keys):
+            bootstrap_sources = [d for d, t in SOURCES.items()
+                                 if t in ("A", "B")]
             save_strategy(
                 queries=["civil engineer Egypt", "structural engineer Cairo",
-                         "WASH engineer Egypt", "infrastructure Egypt"],
+                         "WASH engineer Egypt", "infrastructure Egypt",
+                         "construction engineer Egypt"],
                 sources=bootstrap_sources,
                 reasoning="auto-bootstrap: previous strategy had no live sources",
                 confidence=0.5,
@@ -239,7 +233,6 @@ class Engine:
         if not result:
             return
 
-        # Safety: never let Gemini introduce domains that aren't live-configurable.
         proposed = result.get("sources", strategy.get("sources", []))
         safe_sources = [d for d in proposed if d in LIVE_FETCH_URLS] or \
                        strategy.get("sources", [])
@@ -255,11 +248,19 @@ class Engine:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _strip_html(text: str) -> str:
+        """Remove tags and CDATA markers from feed text."""
+        if not text:
+            return ""
+        text = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", text, flags=re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
     def _parse_feed_or_html(text: str, domain: str) -> list[dict]:
         jobs = []
         feed = feedparser.parse(text)
         for entry in feed.entries[:100]:
-            # Prefer struct_time from feedparser - more reliable than the string
             iso = ""
             for key in ("published_parsed", "updated_parsed"):
                 t = entry.get(key)
@@ -270,20 +271,46 @@ class Engine:
                     except Exception:
                         continue
 
+            title = Engine._strip_html(entry.get("title", ""))
+            summary = Engine._strip_html(entry.get("summary", "")
+                                         or entry.get("description", ""))
+            # UNJobLink puts location / company in custom tags
+            location = (
+                Engine._strip_html(entry.get("location", ""))
+                or Engine._location_from_tags(entry)
+                or Engine._field(entry, "location")
+            )
+            company = (
+                Engine._strip_html(entry.get("author", ""))
+                or Engine._source_name(entry)
+                or Engine._field(entry, "company")
+            )
+            category = Engine._field(entry, "category")
+
             jobs.append({
-                "title": entry.get("title", ""),
-                "company": entry.get("author", "") or
-                            Engine._source_name(entry),
-                "location": entry.get("location", "") or
-                            Engine._location_from_tags(entry),
+                "title": title,
+                "company": company,
+                "location": location,
                 "posted_date": iso,
                 "url": entry.get("link", ""),
-                "description_full": entry.get("summary", ""),
+                "description_full": f"{summary} {category}".strip(),
                 "recruiter_name": "",
                 "recruiter_title": "",
                 "recruiter_contact": "",
             })
         return jobs
+
+    @staticmethod
+    def _field(entry, name: str) -> str:
+        """Read a non-standard feed field (UNJobLink custom tags)."""
+        val = entry.get(name)
+        if isinstance(val, str):
+            return Engine._strip_html(val)
+        if isinstance(val, list) and val:
+            first = val[0]
+            if isinstance(first, str):
+                return Engine._strip_html(first)
+        return ""
 
     @staticmethod
     def _source_name(entry) -> str:
@@ -337,11 +364,12 @@ class Engine:
         blob = " ".join([
             (job.get("location") or "").lower(),
             (job.get("title") or "").lower(),
+            (job.get("company") or "").lower(),
             (job.get("description_full") or "").lower(),
         ])
         egypt_terms = (
             "egypt", "cairo", "alexandria", "giza", "mena",
-            "egyptian", "north africa", "mısır", "misr", "qahira",
+            "egyptian", "north africa", "misr", "qahira",
         )
         civil_terms = (
             "civil", "structural", "geotechnical", "transportation",
