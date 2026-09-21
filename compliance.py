@@ -1,5 +1,6 @@
 # compliance.py
 # Safest legal option chosen: fail closed on every robots.txt error.
+# EXCEPTION: a missing robots.txt (404) means "allow", per RFC 9309.
 # No proxies, no CAPTCHA solving, no fingerprint spoofing.
 
 import asyncio
@@ -24,13 +25,19 @@ def _domain(url: str) -> str:
 
 
 async def check_robots(url: str) -> bool:
+    """
+    RFC 9309: if robots.txt is absent (404), access is allowed.
+    Any other error (timeout, 5xx) fails closed.
+    """
     parsed = urlparse(url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(robots_url)
+            if resp.status_code == 404:
+                return True  # no robots.txt = allow all
             if resp.status_code != 200:
-                return False
+                return False  # fail closed on anything else
             rp = urllib.robotparser.RobotFileParser()
             rp.parse(resp.text.splitlines())
             return rp.can_fetch("*", url)
