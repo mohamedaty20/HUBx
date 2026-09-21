@@ -1,68 +1,143 @@
 # sources.py
-# Seed topics for the self-learning loop. The engine cycles through these
-# and asks Gemini to generate or refine knowledge on each one.
-# Categories follow Egyptian civil quality engineering practice.
+# Seed topics + categories. The engine will EXPAND this list dynamically
+# by asking Gemini for sub-topics, so this is only the starting point.
+
+LEARNING_INTERVAL_SECONDS = 20
+REFINE_EVERY_N_CYCLES = 4        # 1 refine per 4 generates -> more growth
+EXPAND_EVERY_N = 1               # ask for new sub-topics every cycle
+SUGGESTIONS_PER_CYCLE = 3        # how many new topics to ask Gemini for
+MAX_KNOWLEDGE_ITEMS = 2000       # hard cap
 
 SEED_TOPICS = [
-    # Concrete
+    # ---- concrete ----
     ("Concrete mix design and water/cement ratio limits", "concrete"),
     ("Concrete curing duration and methods per ECP 203", "concrete"),
-    ("Concrete cube testing frequency and acceptance criteria", "concrete"),
+    ("Concrete cube testing frequency and acceptance", "concrete"),
     ("Slump test procedure and acceptance limits", "concrete"),
     ("Hot weather concreting precautions in Egypt", "concrete"),
+    ("Cold weather concreting precautions", "concrete"),
     ("Formwork stripping times and safety", "concrete"),
     ("Reinforcement cover requirements per exposure class", "concrete"),
     ("Concrete surface defects: causes and repair", "concrete"),
+    ("Self-compacting concrete quality checks", "concrete"),
+    ("Ready-mix concrete delivery and acceptance", "concrete"),
+    ("Concrete pumping quality control", "concrete"),
+    ("Concrete admixtures: types and dosage limits", "concrete"),
+    ("Concrete permeability and durability tests", "concrete"),
+    ("Chloride and sulfate attack on concrete", "concrete"),
+    ("Shrinkage cracks: control and repair", "concrete"),
+    ("Thermal cracking in mass concrete", "concrete"),
+    ("Concrete repair materials and methods", "concrete"),
 
-    # Steel
+    # ---- steel ----
     ("Reinforcement bar inspection before pouring", "steel"),
-    ("Lap length and anchorage requirements per ECP 205", "steel"),
+    ("Lap length and anchorage per ECP 205", "steel"),
     ("Welding quality control for steel structures", "steel"),
     ("Steel corrosion protection and galvanizing", "steel"),
+    ("Bolted connections torque and inspection", "steel"),
+    ("Post-tensioning quality control", "steel"),
+    ("Rebar bending and cutting tolerances", "steel"),
+    ("Structural steel fabrication tolerances", "steel"),
+    ("Fireproofing of steel structures", "steel"),
 
-    # Soil and foundations
+    # ---- soil ----
     ("Soil compaction testing: proctor and field density", "soil"),
     ("Plate load test procedure and interpretation", "soil"),
     ("Pile integrity testing methods", "soil"),
     ("Foundation excavation inspection checklist", "soil"),
+    ("Soil bearing capacity determination", "soil"),
+    ("Ground improvement techniques", "soil"),
+    ("Settlement monitoring and limits", "soil"),
+    ("Retaining wall backfill requirements", "soil"),
+    ("Slope stability assessment", "soil"),
+    ("Dewatering systems and quality control", "soil"),
 
-    # Water and infrastructure
+    # ---- water ----
     ("Water pipeline pressure testing procedure", "water"),
     ("Sanitary sewer installation quality checks", "water"),
     ("Waterproofing of underground structures", "water"),
     ("Pump station commissioning checklist", "water"),
+    ("Water tank leakage testing", "water"),
+    ("Pipeline bedding and backfill requirements", "water"),
+    ("Manhole construction standards", "water"),
+    ("Wastewater treatment plant quality control", "water"),
+    ("Irrigation canal lining quality", "water"),
 
-    # Quality management
+    # ---- roads ----
+    ("Asphalt paving temperature and compaction checks", "roads"),
+    ("Subbase and base course acceptance criteria", "roads"),
+    ("Road marking and signage quality standards", "roads"),
+    ("Asphalt mix design verification", "roads"),
+    ("Concrete pavement jointing", "roads"),
+    ("Road drainage quality control", "roads"),
+    ("Geotextile installation inspection", "roads"),
+    ("Interlocking tile laying quality", "roads"),
+
+    # ---- quality_management ----
     ("ITP (Inspection and Test Plan) development", "quality_management"),
-    ("Non-conformance report (NCR) handling", "quality_management"),
+    ("Non-conformance report handling", "quality_management"),
     ("Material submittal and approval workflow", "quality_management"),
     ("Site quality audit checklist", "quality_management"),
     ("Document control and revision management", "quality_management"),
     ("Method statement review criteria", "quality_management"),
+    ("Snag list management and closeout", "quality_management"),
+    ("Handover documentation checklist", "quality_management"),
+    ("Subcontractor quality evaluation", "quality_management"),
+    ("KPI tracking for site quality", "quality_management"),
+    ("Mock-up approval process", "quality_management"),
+    ("Sample and prototype testing", "quality_management"),
+    ("RFI (Request for Information) handling", "quality_management"),
+    ("Warranty and defect liability periods", "quality_management"),
 
-    # Roads and asphalt
-    ("Asphalt paving temperature and compaction checks", "roads"),
-    ("Subbase and base course acceptance criteria", "roads"),
-    ("Road marking and signage quality standards", "roads"),
-
-    # Egyptian codes
+    # ---- egyptian_codes ----
     ("Egyptian Code ECP 203: concrete design and quality", "egyptian_codes"),
     ("Egyptian Code ECP 204: steel construction quality", "egyptian_codes"),
     ("Egyptian Code ECP 202: soil mechanics and foundations", "egyptian_codes"),
     ("Egyptian Standard Specifications for materials", "egyptian_codes"),
+    ("HBRC guidelines and approvals", "egyptian_codes"),
+    ("Egyptian fire code requirements", "egyptian_codes"),
+    ("Egyptian building code seismic provisions", "egyptian_codes"),
+    ("Egyptian electrical code for buildings", "egyptian_codes"),
+
+    # ---- safety ----
+    ("Excavation shoring and safety", "safety"),
+    ("Scaffolding inspection checklist", "safety"),
+    ("Lifting operations and crane inspection", "safety"),
+    ("Confined space entry procedures", "safety"),
+    ("Fall protection requirements", "safety"),
+    ("Hot work permit procedures", "safety"),
+    ("Site PPE requirements", "safety"),
+    ("Emergency response planning", "safety"),
+
+    # ---- surveying ----
+    ("Setting out accuracy checks", "surveying"),
+    ("As-built surveying requirements", "surveying"),
+    ("Total station calibration and use", "surveying"),
+    ("Level and verticality tolerances", "surveying"),
+    ("Dimensional control for structures", "surveying"),
 ]
 
-# Egyptian quality authorities and references the AI should cite.
-EGYPT_REFERENCES = [
-    "Egyptian Code for Design and Construction of Concrete Structures (ECP 203)",
-    "Egyptian Code for Steel Construction (ECP 205)",
-    "Egyptian Code for Soil Mechanics and Foundations (ECP 202)",
-    "Egyptian Standard Specifications (ESS)",
-    "Housing and Building National Research Center (HBRC)",
-    "Egyptian Organization for Standardization and Quality (EOS)",
-    "Ministry of Housing, Utilities and Urban Communities",
-]
+# Prompt for asking Gemini to invent new sub-topics.
+SUGGEST_TOPICS_SYSTEM = """
+You are a curriculum designer for Egyptian civil quality engineering.
+Given a topic the student just finished, propose NEW related sub-topics
+that are not the same as the parent. Focus on specifics that an Egyptian
+site engineer would actually need on site.
 
-LEARNING_INTERVAL_SECONDS = 20
-REFINE_EVERY_N_CYCLES = 2          # refine existing knowledge every other cycle
-MAX_KNOWLEDGE_ITEMS = 500          # cap to protect free-tier memory
+Return ONLY valid JSON with this shape:
+{"subtopics": [{"topic": "...", "category": "..."}]}
+
+Categories must be one of:
+concrete, steel, soil, water, roads, quality_management,
+egyptian_codes, safety, surveying
+
+Propose exactly {n} sub-topics. No LaTeX. No dollar signs.
+"""
+
+SUGGEST_TOPICS_USER = """
+Parent topic: {topic}
+Parent category: {category}
+
+Propose {n} new sub-topics in the same or closely related category.
+Each sub-topic must be a specific, checkable engineering topic.
+"""
