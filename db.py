@@ -1,5 +1,5 @@
 # db.py
-# Turso with local-SQLite fallback. Adds pending_topics queue for growth.
+# Turso with local fallback. Version replacement + templates + search.
 
 import os
 import json
@@ -75,7 +75,8 @@ def get_conn():
 def db_health():
     return {
         "mode": _db_mode,
-        "connection": _TURSO_URL_RAW[:40] if _db_mode == "turso" else "hubx.db",
+        "connection": _TURSO_URL_RAW[:40] if _db_mode == "turso"
+                      else "hubx.db",
         "error": _db_error,
         "ok": _db_mode == "turso",
     }
@@ -95,6 +96,17 @@ def init_db():
         created_at TEXT,
         updated_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        category TEXT,
+        content TEXT,
+        refined_content TEXT,
+        version INTEGER DEFAULT 1,
+        confidence REAL DEFAULT 0.5,
+        created_at TEXT,
+        updated_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS pending_topics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         topic TEXT UNIQUE,
@@ -103,10 +115,28 @@ def init_db():
         parent_topic TEXT,
         created_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS pending_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        category TEXT,
+        source TEXT,
+        parent_name TEXT,
+        created_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS learning_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         cycle INTEGER,
         topic_processed TEXT,
+        items_added INTEGER DEFAULT 0,
+        items_refined INTEGER DEFAULT 0,
+        gemini_calls INTEGER DEFAULT 0,
+        error TEXT,
+        created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS template_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle INTEGER,
+        template_processed TEXT,
         items_added INTEGER DEFAULT 0,
         items_refined INTEGER DEFAULT 0,
         gemini_calls INTEGER DEFAULT 0,
@@ -121,6 +151,7 @@ def init_db():
         issues_json TEXT,
         score REAL,
         summary TEXT,
+        compliance TEXT,
         created_at TEXT
     );
     """)
@@ -151,13 +182,27 @@ def upsert_knowledge(topic, category, content, confidence=0.5):
     return cur.lastrowid
 
 
-def set_refined(knowledge_id, refined, confidence=0.7):
+def replace_knowledge_with_refined(knowledge_id, refined):
+    """
+    Replace the knowledge row completely with the refined content.
+    The old version is deleted from the database and only the new
+    version remains. Version is incremented so the user sees v2, v3...
+    """
     conn = get_conn()
+    row = conn.execute(
+        "SELECT topic, category, version FROM knowledge WHERE id = ?",
+        (knowledge_id,)).fetchone()
+    if not row:
+        return
+    topic, category, version = row
+    now = datetime.datetime.utcnow().isoformat()
+    # Delete the old row entirely, then insert the new version.
+    conn.execute("DELETE FROM knowledge WHERE id = ?", (knowledge_id,))
     conn.execute("""
-        UPDATE knowledge SET refined_content=?, confidence=?, updated_at=?
-        WHERE id=?
-    """, (refined, confidence,
-          datetime.datetime.utcnow().isoformat(), knowledge_id))
+        INSERT INTO knowledge (topic, category, content, refined_content,
+            version, confidence, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (topic, category, refined, refined, version + 1, 0.85, now, now))
     conn.commit()
 
 
@@ -189,6 +234,18 @@ def get_knowledge_by_id(knowledge_id):
     conn = get_conn()
     return conn.execute(
         "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone()
+
+
+def search_knowledge(query, limit=8):
+    """Simple LIKE search across topic and content."""
+    conn = get_conn()
+    like = f"%{query}%"
+    return conn.execute("""
+        SELECT id, topic, category, content, refined_content, version
+        FROM knowledge
+        WHERE topic LIKE ? OR content LIKE ? OR refined_content LIKE ?
+        ORDER BY updated_at DESC LIMIT ?
+    """, (like, like, like, limit)).fetchall()
 
 
 def knowledge_stats():
@@ -240,17 +297,106 @@ def runs_per_cycle(limit=40):
     """, (limit,)).fetchall()[::-1]
 
 
+# ---------------- templates ----------------
+
+def upsert_template(name, category, content, confidence=0.5):
+    conn = get_conn()
+    now = datetime.datetime.utcnow().isoformat()
+    row = conn.execute(
+        "SELECT id, version FROM templates WHERE name = ?", (name,)
+    ).fetchone()
+    if row:
+        conn.execute("""
+            UPDATE templates SET content=?, confidence=?,
+                version=version+1, updated_at=? WHERE id=?
+        """, (content, confidence, now, row[0]))
+        conn.commit()
+        return row[0]
+    cur = conn.execute("""
+        INSERT INTO templates (name, category, content, refined_content,
+            version, confidence, created_at, updated_at)
+        VALUES (?,?,?,?,1,?,?,?)
+    """, (name, category, content, "", confidence, now, now))
+    conn.commit()
+    return cur.lastrowid
+
+
+def replace_template_with_refined(template_id, refined):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT name, category, version FROM templates WHERE id = ?",
+        (template_id,)).fetchone()
+    if not row:
+        return
+    name, category, version = row
+    now = datetime.datetime.utcnow().isoformat()
+    conn.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+    conn.execute("""
+        INSERT INTO templates (name, category, content, refined_content,
+            version, confidence, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (name, category, refined, refined, version + 1, 0.85, now, now))
+    conn.commit()
+
+
+def oldest_template_for_refinement(limit=1):
+    conn = get_conn()
+    return conn.execute("""
+        SELECT id, name, category, content, refined_content, version
+        FROM templates ORDER BY updated_at ASC LIMIT ?
+    """, (limit,)).fetchall()
+
+
+def get_all_templates(category=None, limit=200):
+    conn = get_conn()
+    if category:
+        return conn.execute("""
+            SELECT id, name, category, content, refined_content, version,
+                   confidence, updated_at
+            FROM templates WHERE category=?
+            ORDER BY updated_at DESC LIMIT ?
+        """, (category, limit)).fetchall()
+    return conn.execute("""
+        SELECT id, name, category, content, refined_content, version,
+               confidence, updated_at
+        FROM templates ORDER BY updated_at DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+
+def get_template_by_id(template_id):
+    conn = get_conn()
+    return conn.execute(
+        "SELECT * FROM templates WHERE id=?", (template_id,)).fetchone()
+
+
+def template_category_counts():
+    conn = get_conn()
+    return conn.execute("""
+        SELECT category, COUNT(*) FROM templates
+        WHERE category IS NOT NULL AND category != ''
+        GROUP BY category ORDER BY COUNT(*) DESC
+    """).fetchall()
+
+
+def template_stats():
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) FROM templates").fetchone()[0]
+    refined = conn.execute(
+        "SELECT COUNT(*) FROM templates WHERE refined_content != ''"
+    ).fetchone()[0]
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
+    return {"total": total, "refined": refined, "pending": pending}
+
+
 # ---------------- pending_topics ----------------
 
 def add_pending_topic(topic, category, source="ai", parent_topic=""):
-    """Insert a topic into the pending queue. Ignores duplicates and
-    topics already in the knowledge table."""
     conn = get_conn()
     topic = (topic or "").strip()
     category = (category or "").strip() or "general"
     if not topic or len(topic) < 6:
         return False
-    # Skip if already known
     ex = conn.execute(
         "SELECT 1 FROM knowledge WHERE topic = ?", (topic,)).fetchone()
     if ex:
@@ -269,7 +415,6 @@ def add_pending_topic(topic, category, source="ai", parent_topic=""):
 
 
 def pop_pending_topic():
-    """Return and remove the oldest pending topic. Returns None if empty."""
     conn = get_conn()
     row = conn.execute("""
         SELECT id, topic, category FROM pending_topics
@@ -284,18 +429,55 @@ def pop_pending_topic():
 
 def pending_count():
     conn = get_conn()
-    return conn.execute("SELECT COUNT(*) FROM pending_topics").fetchone()[0]
+    return conn.execute(
+        "SELECT COUNT(*) FROM pending_topics").fetchone()[0]
 
 
-def recent_pending(limit=30):
+# ---------------- pending_templates ----------------
+
+def add_pending_template(name, category, source="ai", parent_name=""):
     conn = get_conn()
-    return conn.execute("""
-        SELECT topic, category, source, parent_topic, created_at
-        FROM pending_topics ORDER BY id DESC LIMIT ?
-    """, (limit,)).fetchall()
+    name = (name or "").strip()
+    category = (category or "").strip() or "administrative"
+    if not name or len(name) < 6:
+        return False
+    ex = conn.execute(
+        "SELECT 1 FROM templates WHERE name = ?", (name,)).fetchone()
+    if ex:
+        return False
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO pending_templates
+            (name, category, source, parent_name, created_at)
+            VALUES (?,?,?,?,?)
+        """, (name, category, source, parent_name,
+              datetime.datetime.utcnow().isoformat()))
+        conn.commit()
+        return True
+    except Exception:
+        return False
 
 
-# ---------------- learning_runs ----------------
+def pop_pending_template():
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT id, name, category FROM pending_templates
+        ORDER BY id ASC LIMIT 1
+    """).fetchone()
+    if not row:
+        return None
+    conn.execute("DELETE FROM pending_templates WHERE id = ?", (row[0],))
+    conn.commit()
+    return (row[1], row[2])
+
+
+def pending_template_count():
+    conn = get_conn()
+    return conn.execute(
+        "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
+
+
+# ---------------- runs ----------------
 
 def log_learning_run(cycle, topic, added, refined, calls, error=""):
     conn = get_conn()
@@ -317,17 +499,37 @@ def recent_learning_runs(limit=20):
     """, (limit,)).fetchall()
 
 
+def log_template_run(cycle, name, added, refined, calls, error=""):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO template_runs (cycle, template_processed, items_added,
+            items_refined, gemini_calls, error, created_at)
+        VALUES (?,?,?,?,?,?,?)
+    """, (cycle, name, added, refined, calls, error[:500],
+          datetime.datetime.utcnow().isoformat()))
+    conn.commit()
+
+
+def recent_template_runs(limit=20):
+    conn = get_conn()
+    return conn.execute("""
+        SELECT cycle, template_processed, items_added, items_refined,
+               gemini_calls, error, created_at
+        FROM template_runs ORDER BY id DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+
 # ---------------- check_reports ----------------
 
 def save_check_report(filename, file_type, original_text, issues,
-                      score, summary):
+                      score, summary, compliance=""):
     conn = get_conn()
     cur = conn.execute("""
         INSERT INTO check_reports (filename, file_type, original_text,
-            issues_json, score, summary, created_at)
-        VALUES (?,?,?,?,?,?,?)
+            issues_json, score, summary, compliance, created_at)
+        VALUES (?,?,?,?,?,?,?,?)
     """, (filename, file_type, original_text, json.dumps(issues), score,
-          summary, datetime.datetime.utcnow().isoformat()))
+          summary, compliance, datetime.datetime.utcnow().isoformat()))
     conn.commit()
     return cur.lastrowid
 
