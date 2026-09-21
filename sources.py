@@ -19,11 +19,13 @@ TOs_FORBIDDEN = {
     "forasna.com",
     "gulfTalent.com",
     "unjobs.org",       # explicitly forbids automated access
+    "reliefweb.int",    # RSS blocked by robots.txt; API needs appname
 }
 
 SOURCES = {
-    # Tier A - official RSS feeds
-    "reliefweb.int": TIER_A,
+    # Tier A - official RSS feeds that actually work
+    "unjoblink.org": TIER_A,
+    "untalent.org": TIER_A,
     "weworkremotely.com": TIER_A,
 
     # Tier C - manual paste only
@@ -41,19 +43,20 @@ SOURCES = {
     "twitter.com": TIER_D,
 }
 
-# ReliefWeb filtered RSS feeds.
-# PC182 = Egypt on ReliefWeb's country taxonomy.
-# Try several URL shapes; the engine will use whichever responds.
+# UNJobLink WordPress RSS feed (works, no auth needed).
+# UN Talent open API (fair use free with attribution).
 LIVE_FETCH_URLS = {
-    "reliefweb.int": "https://reliefweb.int/jobs/rss.xml?advanced-search=%28PC182%29",
+    "unjoblink.org": "https://unjoblink.org/?feed=job_feed",
+    "untalent.org": "https://untalent.org/api/jobs?format=rss",
     "weworkremotely.com": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
 }
 
-# Alternate URLs to try if the primary one fails.
 FALLBACK_URLS = {
-    "reliefweb.int": [
-        "https://reliefweb.int/jobs/rss.xml?advanced-search=%28C182%29",
-        "https://reliefweb.int/jobs/rss.xml",
+    "unjoblink.org": [
+        "https://unjoblink.org/feed/",
+    ],
+    "untalent.org": [
+        "https://untalent.org/jobs/rss",
     ],
 }
 
