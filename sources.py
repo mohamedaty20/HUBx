@@ -18,13 +18,13 @@ TOs_FORBIDDEN = {
     "tanqeeb.com",
     "forasna.com",
     "gulfTalent.com",
+    "unjobs.org",  # explicitly forbids automated access
 }
 
 SOURCES = {
-    # Tier A - official API / RSS feeds that work
-    "reliefweb.int": TIER_A,      # UN OCHA - RSS of humanitarian jobs, Egypt + infra common
-    "unjobs.org": TIER_A,         # UN jobs aggregator, RSS
-    "weworkremotely.com": TIER_A, # RSS (remote dev, low yield but valid)
+    # Tier A - official RSS feeds that actually produce Egypt jobs
+    "reliefweb.int": TIER_A,
+    "weworkremotely.com": TIER_A,
 
     # Tier C - manual paste only
     "wuzzuf.net": TIER_C,
@@ -34,15 +34,19 @@ SOURCES = {
     "tanqeeb.com": TIER_C,
     "forasna.com": TIER_C,
     "gulfTalent.com": TIER_C,
+    "unjobs.org": TIER_C,  # ToS forbids scraping - manual only
 
     # Tier D - blocked
     "facebook.com": TIER_D,
     "twitter.com": TIER_D,
 }
 
+# ReliefWeb publishes filtered RSS feeds by country/category.
+# The Egypt job feed uses their advanced-search parameter.
 LIVE_FETCH_URLS = {
-    "reliefweb.int": "https://reliefweb.int/jobs/rss.xml",
-    "unjobs.org": "https://unjobs.org/rss.xml",
+    # ReliefWeb jobs filtered to Egypt (country id PC182 is Egypt on ReliefWeb)
+    "reliefweb.int": "https://reliefweb.int/jobs/rss.xml?advanced-search=%28PC182%29",
+    # WeWorkRemotely as a fallback (low yield for civil eng, but legal)
     "weworkremotely.com": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
 }
 
