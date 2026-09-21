@@ -1,9 +1,5 @@
 # file_reader.py
 # Extract plain text from uploaded files.
-# - PDF: PyMuPDF (works for text-layer PDFs, no OCR)
-# - XLSX: openpyxl
-# - TXT: plain read
-# - Images (png/jpg): Gemini vision OCR (fallback: return "")
 
 import os
 import logging
@@ -11,7 +7,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def read_txt(path: str) -> str:
+def read_txt(path):
     for enc in ("utf-8", "utf-16", "latin-1"):
         try:
             with open(path, "r", encoding=enc) as f:
@@ -21,13 +17,11 @@ def read_txt(path: str) -> str:
     return ""
 
 
-def read_pdf(path: str) -> str:
+def read_pdf(path):
     try:
-        import fitz  # PyMuPDF
+        import fitz
         doc = fitz.open(path)
-        parts = []
-        for page in doc:
-            parts.append(page.get_text("text"))
+        parts = [page.get_text("text") for page in doc]
         doc.close()
         return "\n".join(parts)
     except Exception as e:
@@ -35,7 +29,7 @@ def read_pdf(path: str) -> str:
         return ""
 
 
-def read_xlsx(path: str) -> str:
+def read_xlsx(path):
     try:
         from openpyxl import load_workbook
         wb = load_workbook(path, data_only=True, read_only=True)
@@ -54,26 +48,26 @@ def read_xlsx(path: str) -> str:
         return ""
 
 
-async def read_image(path: str) -> str:
+async def read_image(path):
     from gemini import ocr_image
     return await ocr_image(path)
 
 
-async def extract_text(path: str, filename: str) -> tuple[str, str]:
-    """
-    Returns (text, file_type). file_type is a short label.
-    Chooses extractor based on extension.
-    """
+async def extract_text(path, filename):
     ext = os.path.splitext(filename)[1].lower()
     if ext == ".pdf":
         return read_pdf(path), "pdf"
     if ext == ".txt":
         return read_txt(path), "txt"
-    if ext in (".xlsx", ".xlsm", ".xls"):
-        if ext == ".xls":
-            # openpyxl doesn't read legacy .xls; return empty with note.
-            return "", "xls-unsupported"
+    if ext in (".xlsx", ".xlsm"):
         return read_xlsx(path), "xlsx"
     if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
         return await read_image(path), "image"
+    if ext == ".docx":
+        try:
+            from docx import Document
+            d = Document(path)
+            return "\n".join(p.text for p in d.paragraphs), "docx"
+        except Exception:
+            return "", "docx"
     return "", "unknown"
