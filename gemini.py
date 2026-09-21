@@ -1,13 +1,20 @@
 # gemini.py
-# Gemini called ONLY for (a) strategy refinement, (b) result scoring.
-# JSON-only output with retry on malformed JSON.
+# Gemini API wrapper. Two jobs only:
+# 1. Generate / refine civil quality knowledge.
+# 2. Analyse user-uploaded documents for engineering mistakes.
 
 import os
-import json
 import asyncio
 import logging
+import time
 
 import google.generativeai as genai
+
+from prompts import (
+    KNOWLEDGE_SYSTEM_PROMPT, KNOWLEDGE_USER_TEMPLATE,
+    REFINE_SYSTEM_PROMPT, REFINE_USER_TEMPLATE,
+    CHECKER_SYSTEM_PROMPT, CHECKER_USER_TEMPLATE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,105 +24,125 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-
-STRATEGY_REFINEMENT_PROMPT = """
-You are a search-strategy refiner for a civil-engineering job board in Egypt.
-
-Today's date: {today}
-
-Current strategy:
-{current_strategy}
-
-Recent failures (last {n_failures}):
-{failures}
-
-Allowed domains and tiers:
-{allowed_domains}
-
-Rules you MUST follow:
-- Require at least ONE change vs the current strategy.
-- Retire any query that returned zero relevant results twice.
-- Never suggest scraping sites whose ToS forbids it.
-- Focus on Egypt + civil engineering (structural, geotechnical,
-  transportation, water resources, construction management).
-- Return ONLY valid JSON, no markdown.
-
-Output JSON schema:
-{{
-  "queries": ["query1", "query2"],
-  "sources": ["domain1", "domain2"],
-  "reasoning": "one paragraph explaining changes",
-  "confidence": 0.0
-}}
-"""
-
-RESULT_SCORING_PROMPT = """
-Score this job posting for relevance and quality.
-
-Job title: {title}
-Company: {company}
-Location: {location}
-Description: {description}
-
-Return ONLY valid JSON:
-{{
-  "relevance_score": 0.0,
-  "quality_score": 0.0,
-  "reason": "short explanation"
-}}
-"""
+_rate_lock = asyncio.Lock()
+_last_call_time = 0.0
+MIN_CALL_GAP = 2.0
 
 
-async def _call_gemini_json(prompt: str, max_retries: int = 3) -> dict:
+async def _throttle():
+    global _last_call_time
+    async with _rate_lock:
+        now = time.monotonic()
+        wait = MIN_CALL_GAP - (now - _last_call_time)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_call_time = time.monotonic()
+
+
+async def _call_text(system_prompt: str, user_prompt: str,
+                     retries: int = 3) -> str:
     if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set - returning empty result.")
-        return {}
+        logger.warning("GEMINI_API_KEY missing; returning empty text.")
+        return ""
 
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    last_raw = ""
-    for attempt in range(max_retries):
+    model = genai.GenerativeModel(
+        GEMINI_MODEL, system_instruction=system_prompt)
+    for attempt in range(retries):
+        await _throttle()
         try:
             resp = await asyncio.to_thread(
                 model.generate_content,
-                prompt,
+                user_prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.7 if attempt == 0 else 1.0,
+                    temperature=0.6,
+                ),
+            )
+            return (resp.text or "").strip()
+        except Exception as e:
+            logger.warning("Gemini text call attempt %d failed: %s",
+                           attempt + 1, e)
+            await asyncio.sleep(2 ** attempt)
+    return ""
+
+
+async def _call_json(system_prompt: str, user_prompt: str,
+                     retries: int = 3) -> dict:
+    if not GEMINI_API_KEY:
+        return {}
+    model = genai.GenerativeModel(
+        GEMINI_MODEL, system_instruction=system_prompt)
+    last_raw = ""
+    for attempt in range(retries):
+        await _throttle()
+        try:
+            resp = await asyncio.to_thread(
+                model.generate_content,
+                user_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.4,
                     response_mime_type="application/json",
                 ),
             )
             last_raw = (resp.text or "").strip()
             if last_raw.startswith("```"):
                 last_raw = last_raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+            import json
             return json.loads(last_raw)
-        except json.JSONDecodeError:
-            logger.warning("Malformed JSON attempt %d: %.200s",
-                           attempt + 1, last_raw)
-            await asyncio.sleep(1.0 * (attempt + 1))
         except Exception as e:
-            logger.error("Gemini call failed: %s", e)
-            await asyncio.sleep(2.0)
+            logger.warning("Gemini JSON call attempt %d failed: %s",
+                           attempt + 1, e)
+            await asyncio.sleep(2 ** attempt)
     return {}
 
 
-async def refine_strategy(today: str, current_strategy: dict,
-                          failures: list, allowed_domains: dict) -> dict:
-    prompt = STRATEGY_REFINEMENT_PROMPT.format(
-        today=today,
-        current_strategy=json.dumps(current_strategy, indent=2),
-        n_failures=len(failures),
-        failures=json.dumps(
-            [{"query": f[0], "domain": f[1], "type": f[2], "msg": f[3]}
-             for f in failures], indent=2),
-        allowed_domains=json.dumps(allowed_domains, indent=2),
-    )
-    return await _call_gemini_json(prompt)
+# ---------------------------------------------------------------
+# Public: knowledge generation / refinement
+# ---------------------------------------------------------------
+
+async def generate_knowledge(topic: str, category: str) -> str:
+    user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
+    return await _call_text(KNOWLEDGE_SYSTEM_PROMPT, user)
 
 
-async def score_result(job: dict) -> dict:
-    prompt = RESULT_SCORING_PROMPT.format(
-        title=job.get("title", ""),
-        company=job.get("company", ""),
-        location=job.get("location", ""),
-        description=(job.get("description_full") or "")[:2000],
-    )
-    return await _call_gemini_json(prompt)
+async def refine_knowledge(topic: str, existing: str) -> str:
+    user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:4000])
+    return await _call_text(REFINE_SYSTEM_PROMPT, user)
+
+
+# ---------------------------------------------------------------
+# Public: document checking
+# ---------------------------------------------------------------
+
+async def check_document(filename: str, file_type: str, text: str) -> dict:
+    user = CHECKER_USER_TEMPLATE.format(
+        filename=filename, file_type=file_type, text=text[:12000])
+    result = await _call_json(CHECKER_SYSTEM_PROMPT, user)
+    if not isinstance(result, dict):
+        return {}
+    result.setdefault("score", 0.0)
+    result.setdefault("summary", "")
+    result.setdefault("issues", [])
+    return result
+
+
+# ---------------------------------------------------------------
+# Public: image OCR via Gemini vision
+# ---------------------------------------------------------------
+
+async def ocr_image(path: str) -> str:
+    if not GEMINI_API_KEY:
+        return ""
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        await _throttle()
+        resp = await asyncio.to_thread(
+            model.generate_content,
+            ["Transcribe every word of text in this image. "
+             "Preserve line breaks. Return plain text only.", img],
+        )
+        return (resp.text or "").strip()
+    except Exception as e:
+        logger.error("OCR failed: %s", e)
+        return ""
