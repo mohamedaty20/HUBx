@@ -31,14 +31,11 @@ def _domain(url: str) -> str:
 
 
 async def check_robots(url: str) -> bool:
-    """
-    RFC 9309: if robots.txt is absent (404), access is allowed.
-    Any other error (timeout, 5xx, 403) fails closed.
-    """
     parsed = urlparse(url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+                timeout=10.0, follow_redirects=True) as client:
             resp = await client.get(
                 robots_url,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; HUBx/1.0)"},
@@ -79,19 +76,20 @@ async def safe_fetch(url: str) -> str:
     tier = get_tier(domain)
     tier_gate(domain)
 
-    # Tier A = official API/RSS. Skip robots.txt: these feeds are
-    # published specifically for machine consumption.
     if tier != TIER_A:
         if not await check_robots(url):
             raise ComplianceError(f"robots.txt disallows {url}")
 
     await enforce_delay(domain)
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+            timeout=20.0, follow_redirects=True) as client:
         resp = await client.get(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; HUBx/1.0; +civil-eng-jobs)",
-                "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                "User-Agent": "Mozilla/5.0 (compatible; HUBx/1.0; "
+                              "+civil-eng-jobs)",
+                "Accept": "application/rss+xml, application/xml, "
+                          "text/xml, */*",
             },
         )
         resp.raise_for_status()
