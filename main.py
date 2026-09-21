@@ -28,10 +28,6 @@ PORT = int(os.getenv("PORT", "8080"))
 
 init_db()
 
-# ==================================================================
-# Global CSS - JetBrains Mono + premium SaaS design + responsive
-# ==================================================================
-
 ui.add_head_html("""
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -84,16 +80,10 @@ body, .q-page, .nicegui-content {
 }
 .hubx-card {
     background: var(--hubx-surface) !important;
-    border: 1px solid var(--hubx-border);
-    border-radius: var(--hubx-radius);
+    border: 1px solid var(--hubx-border) !important;
+    border-radius: var(--hubx-radius) !important;
     box-shadow: var(--hubx-shadow);
     padding: 20px;
-}
-.hubx-card-flat {
-    background: var(--hubx-surface) !important;
-    border: 1px solid var(--hubx-border);
-    border-radius: var(--hubx-radius);
-    padding: 16px;
 }
 .hubx-title { font-size: 1.6rem; font-weight: 800; letter-spacing: -0.3px;
               margin: 0 0 4px 0; }
@@ -120,7 +110,6 @@ body, .q-page, .nicegui-content {
 .hubx-btn-ghost:hover { border-color: var(--hubx-primary) !important;
                         color: var(--hubx-primary) !important; }
 
-/* Tight, readable knowledge body */
 .hubx-body h1 { font-size: 1.55rem; font-weight: 800; margin: 0.2em 0 0.5em 0;
                 line-height: 1.25; letter-spacing: -0.3px; }
 .hubx-body h2 { font-size: 1.2rem; font-weight: 700; margin: 0.9em 0 0.35em 0;
@@ -151,7 +140,6 @@ body, .q-page, .nicegui-content {
     color: var(--hubx-text-dim);
 }
 
-/* Sidebar buttons */
 .hubx-side-btn {
     font-size: 0.88rem !important; font-weight: 500 !important;
     text-align: left !important; justify-content: flex-start !important;
@@ -175,12 +163,6 @@ body, .q-page, .nicegui-content {
     padding: 2px 8px; border-radius: 10px; font-size: 0.72rem;
     font-weight: 700;
 }
-.hubx-badge-high { background: rgba(239,74,94,0.18); color: #ff8c9a; }
-.hubx-badge-medium { background: rgba(246,166,35,0.18); color: #ffc270; }
-.hubx-badge-low { background: rgba(34,211,166,0.18); color: #6ff0cb; }
-.hubx-badge-v { background: rgba(79,140,255,0.18); color: #9ec2ff; }
-
-/* Stat pill */
 .hubx-stat {
     background: var(--hubx-surface-2); border: 1px solid var(--hubx-border);
     border-radius: var(--hubx-radius-sm); padding: 10px 14px;
@@ -190,7 +172,6 @@ body, .q-page, .nicegui-content {
                    letter-spacing: 0.6px; text-transform: uppercase; }
 .hubx-stat-value { font-size: 1.2rem; font-weight: 800; color: #fff; }
 
-/* Responsive */
 @media (max-width: 768px) {
     .hubx-header { padding: 10px 12px; }
     .hubx-nav a { padding: 6px 8px; font-size: 0.8rem; }
@@ -201,12 +182,8 @@ body, .q-page, .nicegui-content {
     .hubx-hide-mobile { display: none !important; }
 }
 </style>
-""")
+""", shared=True)
 
-
-# ==================================================================
-# Layout helpers
-# ==================================================================
 
 async def _keepalive():
     while True:
@@ -253,20 +230,16 @@ def _db_banner():
                 "background:rgba(34,211,166,0.10);"
                 "border:1px solid rgba(34,211,166,0.30);"):
             ui.icon("cloud_done").style("color:#22d3a6")
-            ui.label(f"Connected to Turso - data persists").style(
+            ui.label("Connected to Turso - data persists").style(
                 "color:#6ff0cb;font-size:0.85rem")
 
 
-def _stat(label, value_id=None):
+def _stat(label):
     with ui.column().classes("hubx-stat items-start gap-0"):
         ui.label(label).classes("hubx-stat-label")
         lbl = ui.label("0").classes("hubx-stat-value")
         return lbl
 
-
-# ==================================================================
-# Check Document page
-# ==================================================================
 
 @ui.page("/")
 def check_page():
@@ -282,7 +255,6 @@ def check_page():
         state = {"result": {}, "filename": "", "original_text": "",
                  "file_type": "", "extracted": False}
 
-        # --- upload card ---
         with ui.card().classes("hubx-card w-full"):
             ui.label("1. Upload file").classes(
                 "font-bold text-base mb-2")
@@ -325,7 +297,6 @@ def check_page():
                       max_file_size=20_000_000,
                       multiple=False).classes("w-full")
 
-        # --- analyze card ---
         with ui.card().classes("hubx-card w-full"):
             ui.label("2. Analyze against Egyptian codes").classes(
                 "font-bold text-base mb-2")
@@ -353,7 +324,7 @@ def check_page():
                     ui.notify("Analysis failed.", color="red")
                     return
                 state["result"] = result
-                render_result(state)
+                render_result()
                 try:
                     save_check_report(
                         state["filename"], state["file_type"],
@@ -368,9 +339,7 @@ def check_page():
 
             analyze_btn.on("click", do_analyze)
 
-        # --- result card ---
-        result_card = ui.card().classes("hubx-card w-full")
-        with result_card:
+        with ui.card().classes("hubx-card w-full"):
             ui.label("3. Result").classes("font-bold text-base mb-2")
             score_label = ui.label("").style(
                 "font-size:1.4rem;font-weight:800")
@@ -391,7 +360,7 @@ def check_page():
                 rows=[],
             ).classes("w-full mt-3")
 
-        def render_result(state):
+        def render_result():
             result = state["result"]
             score = float(result.get("score", 0.0))
             score_label.text = f"Score: {score:.2f} / 1.00"
@@ -400,33 +369,32 @@ def check_page():
             summary_box.content = result.get("summary", "")
             issues_table.rows = result.get("issues", []) or []
 
+        def dl_txt():
+            if not state["result"]:
+                ui.notify("Analyze first", color="orange"); return
+            ui.download(build_txt(state["filename"], state["result"]),
+                        filename="hubx_report.txt")
+
+        def dl_pdf():
+            if not state["result"]:
+                ui.notify("Analyze first", color="orange"); return
+            ui.download(build_pdf(state["filename"], state["result"]),
+                        filename="hubx_report.pdf")
+
+        def dl_xlsx():
+            if not state["result"]:
+                ui.notify("Analyze first", color="orange"); return
+            ui.download(build_xlsx(state["filename"], state["result"]),
+                        filename="hubx_report.xlsx")
+
         with ui.row().classes("gap-2 mt-3 flex-wrap"):
-            ui.button("Download TXT", on_click=lambda: (
-                ui.download(build_txt(state["filename"],
-                                      state["result"]),
-                            filename="hubx_report.txt")
-                if state["result"] else
-                ui.notify("Analyze first", color="orange"))
-            ).classes("hubx-btn hubx-btn-ghost")
-            ui.button("Download PDF", on_click=lambda: (
-                ui.download(build_pdf(state["filename"],
-                                      state["result"]),
-                            filename="hubx_report.pdf")
-                if state["result"] else
-                ui.notify("Analyze first", color="orange"))
-            ).classes("hubx-btn hubx-btn-danger")
-            ui.button("Download XLSX", on_click=lambda: (
-                ui.download(build_xlsx(state["filename"],
-                                       state["result"]),
-                            filename="hubx_report.xlsx")
-                if state["result"] else
-                ui.notify("Analyze first", color="orange"))
-            ).classes("hubx-btn hubx-btn-primary")
+            ui.button("Download TXT", on_click=dl_txt).classes(
+                "hubx-btn hubx-btn-ghost")
+            ui.button("Download PDF", on_click=dl_pdf).classes(
+                "hubx-btn hubx-btn-danger")
+            ui.button("Download XLSX", on_click=dl_xlsx).classes(
+                "hubx-btn hubx-btn-primary")
 
-
-# ==================================================================
-# Knowledge page - with AI search
-# ==================================================================
 
 @ui.page("/knowledge")
 def knowledge_page():
@@ -439,7 +407,6 @@ def knowledge_page():
                  "browse by category, download any topic."
                  ).classes("hubx-subtitle")
 
-        # --- search card ---
         with ui.card().classes("hubx-card w-full"):
             ui.label("AI Search").classes("font-bold text-base mb-2")
             with ui.row().classes("w-full gap-2 items-center no-wrap"):
@@ -460,7 +427,6 @@ def knowledge_page():
                     return
                 search_status.text = "Searching knowledge base…"
                 search_answer.content = ""
-                # Pull matching excerpts
                 rows = search_knowledge(q.split()[0], limit=8)
                 if not rows:
                     rows = get_all_knowledge(limit=8)
@@ -480,10 +446,8 @@ def knowledge_page():
             ask_btn.on("click", do_search)
             q_input.on("keydown.enter", do_search)
 
-        # --- browse card ---
         selected = {"cat": None}
         with ui.row().classes("w-full gap-3 no-wrap hubx-stack-mobile"):
-            # Sidebar
             with ui.card().classes("hubx-card w-72 shrink-0 h-[75vh] "
                                    "overflow-auto"):
                 ui.label("Categories").classes("font-bold text-base")
@@ -494,7 +458,6 @@ def knowledge_page():
                     "text-xs").style("color:var(--hubx-text-dim)")
                 topic_container = ui.column().classes("w-full gap-0.5")
 
-            # Reader
             with ui.card().classes("hubx-card flex-1 h-[75vh] "
                                    "overflow-auto"):
                 reader_toolbar = ui.row().classes(
@@ -540,10 +503,9 @@ def knowledge_page():
                         "color:var(--hubx-text-dim);padding:8px")
                 for r in rows[:300]:
                     kid, topic, ver = r[0], r[1], r[5]
-                    cls = "hubx-side-btn"
-                    btn = ui.button(f"{topic[:48]}  ·  v{ver}"
-                                    ).classes(cls)
-                    btn.on("click", lambda k=kid: show_item(k))
+                    b = ui.button(f"{topic[:48]}  ·  v{ver}").classes(
+                        "hubx-side-btn")
+                    b.on("click", lambda k=kid: show_item(k))
 
         def render_categories():
             cat_container.clear()
@@ -575,10 +537,6 @@ def knowledge_page():
         ui.timer(8.0, refresh_all)
 
 
-# ==================================================================
-# Templates page
-# ==================================================================
-
 @ui.page("/templates")
 def templates_page():
     _header()
@@ -593,9 +551,9 @@ def templates_page():
 
         tstats = template_stats()
         with ui.row().classes("gap-3 mb-2 flex-wrap"):
-            _stat("Templates", str(tstats["total"]))
-            _stat("Refined", str(tstats["refined"]))
-            _stat("Queue", str(tstats["pending"]))
+            _stat("Templates").text = str(tstats["total"])
+            _stat("Refined").text = str(tstats["refined"])
+            _stat("Queue").text = str(tstats["pending"])
 
         selected = {"cat": None}
         with ui.row().classes("w-full gap-3 no-wrap hubx-stack-mobile"):
@@ -688,10 +646,6 @@ def templates_page():
         ui.timer(8.0, refresh)
 
 
-# ==================================================================
-# Charts page
-# ==================================================================
-
 @ui.page("/charts")
 def charts_page():
     _header()
@@ -703,7 +657,6 @@ def charts_page():
 
         import matplotlib
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
 
         with ui.row().classes("w-full gap-3 flex-wrap"):
             c1 = ui.matplotlib(figsize=(6, 4)).classes(
@@ -715,7 +668,7 @@ def charts_page():
             c4 = ui.matplotlib(figsize=(10, 4)).classes(
                 "hubx-card w-full h-80")
 
-        def style_ax(ax, title):
+        def style_ax(ax):
             ax.set_facecolor("#0b1020")
             ax.figure.patch.set_facecolor("#131a2f")
             ax.title.set_color("#e8ecf7")
@@ -740,7 +693,7 @@ def charts_page():
             counts = [r[1] for r in data]
             ax.barh(cats[::-1], counts[::-1], color="#4f8cff")
             ax.set_title("Knowledge by category")
-            style_ax(ax, "Knowledge by category")
+            style_ax(ax)
             fig.tight_layout()
 
         def draw_conf(fig):
@@ -756,7 +709,7 @@ def charts_page():
                 return
             ax.bar(labels, vals, color="#22d3a6")
             ax.set_title("Confidence distribution")
-            style_ax(ax, "Confidence distribution")
+            style_ax(ax)
             ax.tick_params(axis="x", labelrotation=45)
             fig.tight_layout()
 
@@ -773,7 +726,7 @@ def charts_page():
             vals = [r[1] for r in data]
             ax.bar(labels, vals, color="#f6a623")
             ax.set_title("Version distribution")
-            style_ax(ax, "Version distribution")
+            style_ax(ax)
             fig.tight_layout()
 
         def draw_runs(fig):
@@ -793,7 +746,7 @@ def charts_page():
             ax.plot(cycles, refined, marker="s", color="#ef4a5e",
                     label="refined")
             ax.set_title("Learning activity")
-            style_ax(ax, "Learning activity")
+            style_ax(ax)
             leg = ax.legend(facecolor="#131a2f", edgecolor="#2a3559")
             for t in leg.get_texts():
                 t.set_color("#e8ecf7")
@@ -811,10 +764,6 @@ def charts_page():
         refresh()
         ui.timer(8.0, refresh)
 
-
-# ==================================================================
-# Dashboard
-# ==================================================================
 
 @ui.page("/dashboard")
 def dashboard_page():
