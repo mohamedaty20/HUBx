@@ -1,62 +1,68 @@
 # sources.py
-# Whitelist with per-domain tier. Developer-controlled.
-# A = official API/RSS, B = HTML allowed after robots.txt,
-# C = manual paste only (ToS forbids scraping), D = blocked.
+# Seed topics for the self-learning loop. The engine cycles through these
+# and asks Gemini to generate or refine knowledge on each one.
+# Categories follow Egyptian civil quality engineering practice.
 
-MIN_DOMAIN_DELAY = 3.0
+SEED_TOPICS = [
+    # Concrete
+    ("Concrete mix design and water/cement ratio limits", "concrete"),
+    ("Concrete curing duration and methods per ECP 203", "concrete"),
+    ("Concrete cube testing frequency and acceptance criteria", "concrete"),
+    ("Slump test procedure and acceptance limits", "concrete"),
+    ("Hot weather concreting precautions in Egypt", "concrete"),
+    ("Formwork stripping times and safety", "concrete"),
+    ("Reinforcement cover requirements per exposure class", "concrete"),
+    ("Concrete surface defects: causes and repair", "concrete"),
 
-TIER_A = "A"
-TIER_B = "B"
-TIER_C = "C"
-TIER_D = "D"
+    # Steel
+    ("Reinforcement bar inspection before pouring", "steel"),
+    ("Lap length and anchorage requirements per ECP 205", "steel"),
+    ("Welding quality control for steel structures", "steel"),
+    ("Steel corrosion protection and galvanizing", "steel"),
 
-TOs_FORBIDDEN = {
-    "wuzzuf.net", "bayt.com", "linkedin.com", "indeed.com",
-    "tanqeeb.com", "forasna.com", "gulfTalent.com",
-    "unjobs.org", "reliefweb.int",
-}
+    # Soil and foundations
+    ("Soil compaction testing: proctor and field density", "soil"),
+    ("Plate load test procedure and interpretation", "soil"),
+    ("Pile integrity testing methods", "soil"),
+    ("Foundation excavation inspection checklist", "soil"),
 
-SOURCES = {
-    "unjoblink.org": TIER_A,
-    "weworkremotely.com": TIER_A,
+    # Water and infrastructure
+    ("Water pipeline pressure testing procedure", "water"),
+    ("Sanitary sewer installation quality checks", "water"),
+    ("Waterproofing of underground structures", "water"),
+    ("Pump station commissioning checklist", "water"),
 
-    "wuzzuf.net": TIER_C,
-    "bayt.com": TIER_C,
-    "linkedin.com": TIER_C,
-    "indeed.com": TIER_C,
-    "tanqeeb.com": TIER_C,
-    "forasna.com": TIER_C,
-    "gulfTalent.com": TIER_C,
-    "unjobs.org": TIER_C,
-    "naqrajobs.com": TIER_C,
+    # Quality management
+    ("ITP (Inspection and Test Plan) development", "quality_management"),
+    ("Non-conformance report (NCR) handling", "quality_management"),
+    ("Material submittal and approval workflow", "quality_management"),
+    ("Site quality audit checklist", "quality_management"),
+    ("Document control and revision management", "quality_management"),
+    ("Method statement review criteria", "quality_management"),
 
-    "facebook.com": TIER_D,
-    "twitter.com": TIER_D,
-}
+    # Roads and asphalt
+    ("Asphalt paving temperature and compaction checks", "roads"),
+    ("Subbase and base course acceptance criteria", "roads"),
+    ("Road marking and signage quality standards", "roads"),
 
-LIVE_FETCH_URLS = {
-    "unjoblink.org": "https://unjoblink.org/?feed=job_feed",
-    "weworkremotely.com": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
-}
+    # Egyptian codes
+    ("Egyptian Code ECP 203: concrete design and quality", "egyptian_codes"),
+    ("Egyptian Code ECP 204: steel construction quality", "egyptian_codes"),
+    ("Egyptian Code ECP 202: soil mechanics and foundations", "egyptian_codes"),
+    ("Egyptian Standard Specifications for materials", "egyptian_codes"),
+]
 
-FALLBACK_URLS = {
-    "unjoblink.org": [
-        "https://unjoblink.org/?feed=job_feed&iwj_location=cairo",
-        "https://unjoblink.org/?feed=job_feed&iwj_location=egypt",
-    ],
-}
+# Egyptian quality authorities and references the AI should cite.
+EGYPT_REFERENCES = [
+    "Egyptian Code for Design and Construction of Concrete Structures (ECP 203)",
+    "Egyptian Code for Steel Construction (ECP 205)",
+    "Egyptian Code for Soil Mechanics and Foundations (ECP 202)",
+    "Egyptian Standard Specifications (ESS)",
+    "Housing and Building National Research Center (HBRC)",
+    "Egyptian Organization for Standardization and Quality (EOS)",
+    "Ministry of Housing, Utilities and Urban Communities",
+]
 
-MANUAL_PASTE_DOMAINS = [d for d, t in SOURCES.items() if t == TIER_C]
-BLOCKED_DOMAINS = {d for d, t in SOURCES.items() if t == TIER_D}
-
-
-def get_tier(domain: str) -> str:
-    return SOURCES.get(domain.lower().strip(), TIER_D)
-
-
-def is_live_fetchable(domain: str) -> bool:
-    return get_tier(domain) in (TIER_A, TIER_B)
-
-
-def is_manual_paste(domain: str) -> bool:
-    return get_tier(domain) == TIER_C
+LEARNING_INTERVAL_SECONDS = 20
+REFINE_EVERY_N_CYCLES = 2          # refine existing knowledge every other cycle
+MAX_KNOWLEDGE_ITEMS = 500          # cap to protect free-tier memory
