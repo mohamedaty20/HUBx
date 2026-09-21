@@ -1,11 +1,18 @@
 # main.py
-# NiceGUI app v3 - premium design, responsive, templates, AI search,
-# per-topic downloads, analyze button.
+# NiceGUI app v4
+# Changes vs v3:
+#   1) Focus selector in header (Knowledge / Templates / Both) -> drives engine
+#   2) EN / ع language toggle -> every label, RTL layout, Arabic font
+#   3) Paper-format A4 preview + PDF for templates (positioned fields)
+#   4) Arabic-safe PDF export (WeasyPrint + Cairo font)
 
 import os
+import io
 import asyncio
 import tempfile
+import csv
 from collections import Counter
+from datetime import datetime
 
 from nicegui import ui, app
 
@@ -26,12 +33,178 @@ from report_builder import (build_txt, build_pdf, build_xlsx,
 
 PORT = int(os.getenv("PORT", "8080"))
 
+# ============================================================
+# STATE + I18N  (inlined so this file is self-contained)
+# ============================================================
+class _State:
+    focus = "both"          # "knowledge" | "templates" | "both"
+    lang  = "en"            # "en" | "ar"
+    @property
+    def run_knowledge(self): return self.focus in ("knowledge", "both")
+    @property
+    def run_templates(self): return self.focus in ("templates", "both")
+
+STATE = _State()
+
+STRINGS = {
+    "en": {
+        "brand": "HUBx",
+        "nav_check": "Check",
+        "nav_knowledge": "Knowledge",
+        "nav_templates": "Templates",
+        "nav_charts": "Charts",
+        "nav_dashboard": "Dashboard",
+        "focus_label": "AI Focus",
+        "focus_knowledge": "Knowledge",
+        "focus_templates": "Templates",
+        "focus_both": "Both",
+        "check_title": "Engineering Document Review",
+        "check_sub": ("Upload a PDF, TXT, XLSX, PNG or JPG. Press Analyze "
+                      "to run the AI compliance check against Egyptian codes."),
+        "step1": "1. Upload file",
+        "no_file": "No file uploaded",
+        "step2": "2. Analyze against Egyptian codes",
+        "analyze_now": "Analyze now",
+        "step3": "3. Result",
+        "dl_txt": "Download TXT",
+        "dl_pdf": "Download PDF",
+        "dl_xlsx": "Download XLSX",
+        "knowledge_title": "Knowledge Base",
+        "knowledge_sub": ("Self-learned civil quality notes. Search with AI, "
+                          "browse by category, download any topic."),
+        "ai_search": "AI Search",
+        "ask": "Ask",
+        "ask_ph": "e.g. What are the concrete curing requirements in hot weather?",
+        "categories": "Categories",
+        "topics": "Topics",
+        "all_topics": "All topics",
+        "templates_title": "Egyptian Site Paper Templates",
+        "templates_sub": ("Ready-to-use construction documents for Egyptian "
+                          "companies. Generated and refined automatically. "
+                          "Download as PDF, DOCX or TXT."),
+        "templates_word": "Templates",
+        "refined_word": "Refined",
+        "queue_word": "Queue",
+        "all_categories": "All categories",
+        "preview_paper": "Paper view",
+        "btn_pdf": "PDF",
+        "btn_docx": "DOCX",
+        "btn_txt": "TXT",
+        "charts_title": "Live Charts",
+        "charts_sub": "Built from the self-learning loop. Auto-updates.",
+        "dash_title": "Learning Dashboard",
+        "start": "Start learning",
+        "pause": "Pause",
+        "one_cycle": "Run one cycle now",
+        "cycles": "Cycles",
+        "gemini_calls": "Gemini Calls",
+        "knowledge_stat": "Knowledge",
+        "refined_stat": "Refined",
+        "templates_stat": "Templates",
+        "queue_stat": "Queue",
+        "recent_runs": "Recent learning runs",
+        "recent_tpl_runs": "Recent template runs",
+        "paper_preview": "Paper preview",
+        "close": "Close",
+        "download_pdf": "Download PDF",
+        "project_name": "Project Name",
+        "engineer": "Engineer",
+        "supervisor": "Supervisor",
+        "company": "Company",
+        "location": "Location",
+        "date": "Date",
+        "category": "Category",
+        "version": "Version",
+        "confidence": "Confidence",
+        "description": "Description",
+    },
+    "ar": {
+        "brand": "HUBx",
+        "nav_check": "الفحص",
+        "nav_knowledge": "المعرفة",
+        "nav_templates": "القوالب",
+        "nav_charts": "الرسوم",
+        "nav_dashboard": "لوحة التحكم",
+        "focus_label": "تركيز الذكاء",
+        "focus_knowledge": "المعرفة",
+        "focus_templates": "القوالب",
+        "focus_both": "الاثنان",
+        "check_title": "مراجعة المستندات الهندسية",
+        "check_sub": ("ارفع ملف PDF أو TXT أو XLSX أو صورة. اضغط تحليل "
+                      "لتشغيل الفحص الآلي مقابل الكود المصري."),
+        "step1": "١. رفع الملف",
+        "no_file": "لم يتم رفع ملف",
+        "step2": "٢. التحليل حسب الكود المصري",
+        "analyze_now": "تحليل الآن",
+        "step3": "٣. النتيجة",
+        "dl_txt": "تحميل TXT",
+        "dl_pdf": "تحميل PDF",
+        "dl_xlsx": "تحميل XLSX",
+        "knowledge_title": "قاعدة المعرفة",
+        "knowledge_sub": ("ملاحظات الجودة المدنية المُتعلَّمة ذاتياً. ابحث "
+                          "بالذكاء الاصطناعي، تصفح حسب الفئة، حمّل أي موضوع."),
+        "ai_search": "بحث بالذكاء الاصطناعي",
+        "ask": "اسأل",
+        "ask_ph": "مثال: ما متطلبات معالجة الخرسانة في الجو الحار؟",
+        "categories": "الفئات",
+        "topics": "المواضيع",
+        "all_topics": "كل المواضيع",
+        "templates_title": "قوالب الأوراق للمواقع المصرية",
+        "templates_sub": ("مستندات جاهزة للشركات المصرية. تُولَّد وتُحسَّن "
+                          "تلقائياً. حمّلها PDF أو DOCX أو TXT."),
+        "templates_word": "القوالب",
+        "refined_word": "مُحسَّن",
+        "queue_word": "بالانتظار",
+        "all_categories": "كل الفئات",
+        "preview_paper": "عرض الورقة",
+        "btn_pdf": "PDF",
+        "btn_docx": "DOCX",
+        "btn_txt": "TXT",
+        "charts_title": "الرسوم الحية",
+        "charts_sub": "مبنية من حلقة التعلم الذاتي. تتحدث تلقائياً.",
+        "dash_title": "لوحة التعلم",
+        "start": "ابدأ التعلم",
+        "pause": "إيقاف",
+        "one_cycle": "دورة واحدة الآن",
+        "cycles": "الدورات",
+        "gemini_calls": "استدعاءات Gemini",
+        "knowledge_stat": "المعرفة",
+        "refined_stat": "مُحسَّن",
+        "templates_stat": "القوالب",
+        "queue_stat": "بالانتظار",
+        "recent_runs": "آخر دورات التعلم",
+        "recent_tpl_runs": "آخر دورات القوالب",
+        "paper_preview": "معاينة الورقة",
+        "close": "إغلاق",
+        "download_pdf": "تحميل PDF",
+        "project_name": "اسم المشروع",
+        "engineer": "المهندس",
+        "supervisor": "المشرف",
+        "company": "الشركة",
+        "location": "الموقع",
+        "date": "التاريخ",
+        "category": "الفئة",
+        "version": "الإصدار",
+        "confidence": "الثقة",
+        "description": "الوصف",
+    },
+}
+
+def t(key: str) -> str:
+    return STRINGS.get(STATE.lang, STRINGS["en"]).get(key, key)
+
+def is_rtl() -> bool:
+    return STATE.lang == "ar"
+
 init_db()
 
+# ============================================================
+# CSS  (extended with Cairo font, RTL, paper CSS)
+# ============================================================
 ui.add_head_html("""
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root {
     --hubx-bg: #0b1020;
@@ -49,7 +222,10 @@ ui.add_head_html("""
     --hubx-radius-sm: 8px;
     --hubx-shadow: 0 6px 24px rgba(0,0,0,0.35);
 }
-* { font-family: 'JetBrains Mono', monospace !important; }
+* { font-family: 'JetBrains Mono', 'Cairo', monospace !important; }
+body.lang-ar, body.lang-ar * { font-family: 'Cairo', 'JetBrains Mono', sans-serif !important; }
+body.lang-ar { direction: rtl; }
+body.lang-ar .hubx-nav a { direction: rtl; }
 body, .q-page, .nicegui-content {
     background: var(--hubx-bg) !important;
     color: var(--hubx-text) !important;
@@ -77,6 +253,15 @@ body, .q-page, .nicegui-content {
 .hubx-nav a:hover {
     color: var(--hubx-text) !important;
     background: rgba(79,140,255,0.12);
+}
+.hubx-lang-btn {
+    min-width: 40px !important; min-height: 32px !important;
+    padding: 4px 10px !important; font-weight: 700 !important;
+    font-size: 0.82rem !important;
+}
+.hubx-lang-btn.active {
+    background: var(--hubx-primary) !important;
+    color: white !important;
 }
 .hubx-card {
     background: var(--hubx-surface) !important;
@@ -139,6 +324,15 @@ body, .q-page, .nicegui-content {
     padding-left: 12px; margin: 0.5em 0;
     color: var(--hubx-text-dim);
 }
+body.lang-ar .hubx-body p, body.lang-ar .hubx-body li,
+body.lang-ar .hubx-body h1, body.lang-ar .hubx-body h2,
+body.lang-ar .hubx-body h3 {
+    text-align: right !important;
+}
+body.lang-ar .hubx-body blockquote {
+    border-left: none; border-right: 3px solid var(--hubx-primary);
+    padding-left: 0; padding-right: 12px;
+}
 
 .hubx-side-btn {
     font-size: 0.88rem !important; font-weight: 500 !important;
@@ -147,6 +341,9 @@ body, .q-page, .nicegui-content {
     border-radius: var(--hubx-radius-sm) !important;
     color: var(--hubx-text) !important; width: 100% !important;
     min-height: 36px !important;
+}
+body.lang-ar .hubx-side-btn {
+    text-align: right !important; justify-content: flex-end !important;
 }
 .hubx-side-btn:hover { background: rgba(79,140,255,0.12) !important; }
 .hubx-side-btn.selected {
@@ -172,6 +369,61 @@ body, .q-page, .nicegui-content {
                    letter-spacing: 0.6px; text-transform: uppercase; }
 .hubx-stat-value { font-size: 1.2rem; font-weight: 800; color: #fff; }
 
+/* ---------- PAPER (A4) ---------- */
+.hubx-paper-wrap {
+    background: #e9edf5;
+    padding: 18px;
+    border-radius: var(--hubx-radius);
+    display: flex; justify-content: center;
+}
+.hubx-paper {
+    background: #ffffff; color: #111111;
+    width: 210mm; min-height: 297mm;
+    padding: 20mm 18mm 22mm 18mm;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+    font-family: 'Cairo', 'JetBrains Mono', sans-serif !important;
+    font-size: 12pt; line-height: 1.55;
+    direction: ltr;
+}
+.hubx-paper.rtl { direction: rtl; text-align: right; }
+.hubx-paper * { font-family: 'Cairo', 'JetBrains Mono', sans-serif !important; }
+.hubx-paper .cover { text-align: center; padding-top: 30mm; }
+.hubx-paper .cover .org { font-size: 14pt; font-weight: 700;
+                          letter-spacing: .5px; }
+.hubx-paper .cover .faculty { font-size: 12pt; margin-top: 4mm;
+                              color: #333; }
+.hubx-paper .cover .rule { height: 2px; background: #111;
+                           margin: 8mm auto; width: 60%; }
+.hubx-paper .cover .ptitle { font-size: 22pt; font-weight: 800;
+                             margin: 10mm 0; }
+.hubx-paper .cover .subtitle { font-size: 13pt; color: #444;
+                               margin-bottom: 12mm; }
+.hubx-paper .meta { width: 100%; margin-top: 18mm;
+                    border-collapse: collapse; }
+.hubx-paper .meta td { padding: 3mm 2mm; font-size: 12pt;
+                       vertical-align: top; }
+.hubx-paper .meta .lbl { width: 35%; font-weight: 700; color: #222; }
+.hubx-paper .meta .val { width: 65%; border-bottom: 1px dotted #999; }
+.hubx-paper .section { margin-top: 10mm; }
+.hubx-paper .section h2 { font-size: 14pt; border-bottom: 1.5px solid #111;
+                          padding-bottom: 2mm; margin-bottom: 4mm;
+                          color: #111; }
+.hubx-paper .section .body { text-align: justify; }
+.hubx-paper .body p, .hubx-paper .body li {
+    font-size: 12pt !important; color: #111 !important;
+    line-height: 1.55 !important;
+}
+.hubx-paper .body h1, .hubx-paper .body h2, .hubx-paper .body h3 {
+    color: #111 !important;
+}
+.hubx-paper .body table { border-collapse: collapse; width: 100%; }
+.hubx-paper .body th, .hubx-paper .body td {
+    border: 1px solid #333; padding: 4px 6px; color: #111;
+}
+.hubx-paper .footer { margin-top: 14mm; text-align: center;
+                      font-size: 9pt; color: #666;
+                      border-top: 1px solid #ccc; padding-top: 4mm; }
+
 @media (max-width: 768px) {
     .hubx-header { padding: 10px 12px; }
     .hubx-nav a { padding: 6px 8px; font-size: 0.8rem; }
@@ -180,6 +432,7 @@ body, .q-page, .nicegui-content {
     .hubx-body p, .hubx-body li { font-size: 0.85rem; }
     .hubx-stack-mobile { flex-direction: column !important; }
     .hubx-hide-mobile { display: none !important; }
+    .hubx-paper { width: 100%; padding: 12px; min-height: auto; }
 }
 </style>
 """, shared=True)
@@ -201,16 +454,63 @@ async def _keepalive():
 app.on_startup(lambda: asyncio.create_task(_keepalive()))
 
 
+# ============================================================
+# LANGUAGE + FOCUS HELPERS
+# ============================================================
+def _apply_body_class():
+    """Set body class based on current lang so CSS rules kick in."""
+    cls = "lang-ar" if is_rtl() else "lang-en"
+    ui.run_javascript(
+        f"document.body.classList.remove('lang-ar','lang-en');"
+        f"document.body.classList.add('{cls}');"
+    )
+
+def set_lang(code: str):
+    STATE.lang = code
+    app.storage.user["lang"] = code
+    ui.navigate.reload()
+
+def set_focus(mode: str):
+    STATE.focus = mode
+    app.storage.user["focus"] = mode
+    ui.notify(f"{t('focus_label')}: {mode}", color="primary")
+
+def _lang_toggle():
+    with ui.row().classes("gap-1 items-center"):
+        cls_en = "hubx-lang-btn" + (" active" if STATE.lang == "en" else "")
+        cls_ar = "hubx-lang-btn" + (" active" if STATE.lang == "ar" else "")
+        ui.button("EN", on_click=lambda: set_lang("en")).classes(cls_en)
+        ui.button("ع",  on_click=lambda: set_lang("ar")).classes(cls_ar)
+
+def _focus_selector():
+    with ui.row().classes("gap-2 items-center"):
+        ui.label(t("focus_label")).style(
+            "color:var(--hubx-text-dim);font-size:0.82rem")
+        ui.toggle(
+            {"knowledge": t("focus_knowledge"),
+             "templates": t("focus_templates"),
+             "both":      t("focus_both")},
+            value=STATE.focus,
+            on_change=lambda e: set_focus(e.value),
+        ).props("dense")
+
+
+# ============================================================
+# HEADER
+# ============================================================
 def _header():
     with ui.row().classes("hubx-header items-center justify-between "
                           "w-full no-wrap"):
-        ui.label("HUBx").classes("hubx-brand")
-        with ui.row().classes("hubx-nav items-center gap-1"):
-            ui.link("Check", "/")
-            ui.link("Knowledge", "/knowledge")
-            ui.link("Templates", "/templates")
-            ui.link("Charts", "/charts")
-            ui.link("Dashboard", "/dashboard")
+        with ui.row().classes("items-center gap-3 no-wrap"):
+            ui.label(t("brand")).classes("hubx-brand")
+            _focus_selector()
+        with ui.row().classes("hubx-nav items-center gap-1 no-wrap"):
+            ui.link(t("nav_check"), "/")
+            ui.link(t("nav_knowledge"), "/knowledge")
+            ui.link(t("nav_templates"), "/templates")
+            ui.link(t("nav_charts"), "/charts")
+            ui.link(t("nav_dashboard"), "/dashboard")
+        _lang_toggle()
 
 
 def _db_banner():
@@ -241,49 +541,262 @@ def _stat(label):
         return lbl
 
 
+# ============================================================
+# PAPER FORMAT (A4)  -> preview + PDF
+# ============================================================
+def _paper_html(title: str, category: str, version, body_md: str,
+                meta: dict | None = None) -> str:
+    """Render an A4 paper with cover, positioned meta fields, and body."""
+    meta = meta or {}
+    rtl = is_rtl()
+    rtl_cls = " rtl" if rtl else ""
+    today = datetime.utcnow().date().isoformat()
+
+    # minimal markdown -> html (headings, bold, lists, paragraphs, tables)
+    body_html = _md_to_html(body_md or "")
+
+    fields = [
+        (t("project_name"), meta.get("project_name") or title),
+        (t("engineer"),     meta.get("engineer") or ""),
+        (t("supervisor"),   meta.get("supervisor") or ""),
+        (t("company"),      meta.get("company") or ""),
+        (t("location"),     meta.get("location") or ""),
+        (t("category"),     category or ""),
+        (t("version"),      f"v{version}" if version is not None else ""),
+        (t("date"),         meta.get("date") or today),
+    ]
+    rows = "".join(
+        f'<tr><td class="lbl">{k}</td><td class="val">{v or "&nbsp;"}</td></tr>'
+        for k, v in fields
+    )
+
+    return f"""<!doctype html>
+<html lang="{'ar' if rtl else 'en'}" dir="{'rtl' if rtl else 'ltr'}">
+<head><meta charset="utf-8"></head>
+<body>
+<div class="hubx-paper{rtl_cls}">
+  <div class="cover">
+    <div class="org">{meta.get('company') or 'Egyptian Engineering Co.'}</div>
+    <div class="faculty">{meta.get('location') or 'Egypt'}</div>
+    <div class="rule"></div>
+    <div class="ptitle">{title or ''}</div>
+    <div class="subtitle">{category or 'Civil Engineering Document'}</div>
+  </div>
+
+  <table class="meta">{rows}</table>
+
+  <div class="section">
+    <h2>{t('description')}</h2>
+    <div class="body">{body_html}</div>
+  </div>
+
+  <div class="footer">HUBx · {today}</div>
+</div>
+</body></html>"""
+
+
+def _md_to_html(md: str) -> str:
+    """Very small markdown -> html for the paper body.
+    Handles #..###, **bold**, *italic*, -/1. lists, tables, paragraphs, hr.
+    Avoids a hard dependency on the markdown library."""
+    import html as _html
+    import re
+    lines = md.replace("\r\n", "\n").split("\n")
+    out = []
+    in_ul = in_ol = False
+    in_table = False
+    table_buf = []
+
+    def close_lists():
+        nonlocal in_ul, in_ol
+        if in_ul: out.append("</ul>"); in_ul = False
+        if in_ol: out.append("</ol>"); in_ol = False
+
+    def flush_table():
+        nonlocal in_table, table_buf
+        if not table_buf:
+            in_table = False
+            return
+        rows = [r for r in table_buf if r.strip()]
+        table_buf = []
+        if len(rows) >= 1:
+            out.append("<table>")
+            for i, r in enumerate(rows):
+                cells = [c.strip() for c in r.strip().strip("|").split("|")]
+                tag = "th" if i == 0 else "td"
+                out.append("<tr>" + "".join(
+                    f"<{tag}>{_inline(c)}</{tag}>" for c in cells) + "</tr>")
+                if i == 0 and len(rows) > 1 and set(rows[1].replace("|", "")
+                                                   .replace(" ", "").strip()) <= set("-:") | {""}:
+                    pass
+            out.append("</table>")
+        in_table = False
+
+    def _inline(s: str) -> str:
+        s = _html.escape(s)
+        s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"\*(.+?)\*", r"<em>\1</em>", s)
+        s = re.sub(r"`(.+?)`", r"<code>\1</code>", s)
+        return s
+
+    for raw in lines:
+        line = raw.rstrip()
+        if line.startswith("|") and line.endswith("|"):
+            in_table = True
+            table_buf.append(line)
+            continue
+        if in_table:
+            flush_table()
+
+        if not line.strip():
+            close_lists()
+            continue
+        if line.startswith("### "):
+            close_lists(); out.append(f"<h3>{_inline(line[4:])}</h3>")
+        elif line.startswith("## "):
+            close_lists(); out.append(f"<h2>{_inline(line[3:])}</h2>")
+        elif line.startswith("# "):
+            close_lists(); out.append(f"<h1>{_inline(line[2:])}</h1>")
+        elif line.strip() in ("---", "***", "___"):
+            close_lists(); out.append("<hr>")
+        elif line.lstrip().startswith(("- ", "* ")):
+            if in_ol: out.append("</ol>"); in_ol = False
+            if not in_ul: out.append("<ul>"); in_ul = True
+            out.append(f"<li>{_inline(line.lstrip()[2:])}</li>")
+        elif re.match(r"^\s*\d+\.\s", line):
+            if in_ul: out.append("</ul>"); in_ul = False
+            if not in_ol: out.append("<ol>"); in_ol = True
+            out.append(f"<li>{_inline(re.sub(r'^\s*\d+\.\s', '', line))}</li>")
+        else:
+            close_lists()
+            out.append(f"<p>{_inline(line)}</p>")
+
+    close_lists()
+    if in_table: flush_table()
+    return "\n".join(out)
+
+
+def _paper_pdf_bytes(html_str: str, rtl: bool) -> bytes:
+    """Arabic-safe PDF via WeasyPrint. Falls back to a stub if not installed."""
+    full = f"""<!doctype html><html><head><meta charset="utf-8">
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+      @page {{ size: A4; margin: 0; }}
+      body {{ margin:0; background:#fff; color:#111;
+             font-family:'Cairo','JetBrains Mono',sans-serif; }}
+      .hubx-paper {{ width:210mm; min-height:297mm; padding:20mm 18mm 22mm 18mm;
+                     box-sizing:border-box; }}
+      .hubx-paper.rtl {{ direction: rtl; text-align:right; }}
+      .hubx-paper .cover {{ text-align:center; padding-top:30mm; }}
+      .hubx-paper .cover .org {{ font-size:14pt; font-weight:700; }}
+      .hubx-paper .cover .faculty {{ font-size:12pt; margin-top:4mm; color:#333; }}
+      .hubx-paper .cover .rule {{ height:2px; background:#111;
+                                  margin:8mm auto; width:60%; }}
+      .hubx-paper .cover .ptitle {{ font-size:22pt; font-weight:800;
+                                    margin:10mm 0; }}
+      .hubx-paper .cover .subtitle {{ font-size:13pt; color:#444;
+                                      margin-bottom:12mm; }}
+      .hubx-paper .meta {{ width:100%; margin-top:18mm; border-collapse:collapse; }}
+      .hubx-paper .meta td {{ padding:3mm 2mm; font-size:12pt; vertical-align:top; }}
+      .hubx-paper .meta .lbl {{ width:35%; font-weight:700; color:#222; }}
+      .hubx-paper .meta .val {{ width:65%; border-bottom:1px dotted #999; }}
+      .hubx-paper .section {{ margin-top:10mm; }}
+      .hubx-paper .section h2 {{ font-size:14pt; border-bottom:1.5px solid #111;
+                                 padding-bottom:2mm; margin-bottom:4mm; color:#111; }}
+      .hubx-paper .body {{ text-align:justify; }}
+      .hubx-paper .body table {{ border-collapse:collapse; width:100%; }}
+      .hubx-paper .body th, .hubx-paper .body td {{
+          border:1px solid #333; padding:4px 6px; color:#111; }}
+      .hubx-paper .footer {{ margin-top:14mm; text-align:center; font-size:9pt;
+                             color:#666; border-top:1px solid #ccc;
+                             padding-top:4mm; }}
+    </style></head><body>{html_str}</body></html>"""
+    try:
+        from weasyprint import HTML
+        return HTML(string=full).write_pdf()
+    except Exception as e:
+        print(f"[paper_pdf] WeasyPrint failed: {e}")
+        # fallback: return an empty placeholder PDF is worse than HTML -> raise
+        raise
+
+
+def _open_paper_dialog(title: str, category: str, version, body_md: str,
+                       meta: dict | None = None):
+    html = _paper_html(title, category, version, body_md, meta)
+    with ui.dialog() as d, ui.card().classes("hubx-card").style(
+            "max-width:96vw; max-height:96vh; overflow:auto;"):
+        ui.label(t("paper_preview")).classes("text-lg font-bold")
+        # render the paper inline (scrollable)
+        ui.html(html).classes("w-full")
+        with ui.row().classes("justify-end w-full gap-2 mt-2"):
+            def _dl():
+                try:
+                    pdf = _paper_pdf_bytes(html, is_rtl())
+                    tmp = tempfile.NamedTemporaryFile(
+                        delete=False, suffix=".pdf").name
+                    with open(tmp, "wb") as f:
+                        f.write(pdf)
+                    ui.download(tmp, filename=f"hubx_paper_{title[:30]}.pdf")
+                    ui.timer(15.0, lambda: _safe_unlink(tmp), once=True)
+                except Exception as e:
+                    ui.notify(f"PDF failed: {e}", color="negative")
+            ui.button(t("download_pdf"), on_click=_dl).classes(
+                "hubx-btn hubx-btn-danger")
+            ui.button(t("close"), on_click=d.close).classes(
+                "hubx-btn hubx-btn-ghost")
+    d.open()
+
+
+def _safe_unlink(p):
+    try:
+        os.unlink(p)
+    except Exception:
+        pass
+
+
+# ============================================================
+# /  CHECK PAGE
+# ============================================================
 @ui.page("/")
 def check_page():
+    STATE.lang = app.storage.user.get("lang", STATE.lang)
+    STATE.focus = app.storage.user.get("focus", STATE.focus)
+    _apply_body_class()
+
     _header()
     _db_banner()
 
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4"):
-        ui.label("Engineering Document Review").classes("hubx-title")
-        ui.label("Upload a PDF, TXT, XLSX, PNG or JPG. Press Analyze "
-                 "to run the AI compliance check against Egyptian codes."
-                 ).classes("hubx-subtitle")
+        ui.label(t("check_title")).classes("hubx-title")
+        ui.label(t("check_sub")).classes("hubx-subtitle")
 
         state = {"result": {}, "filename": "", "original_text": "",
                  "file_type": "", "extracted": False}
 
         with ui.card().classes("hubx-card w-full"):
-            ui.label("1. Upload file").classes(
-                "font-bold text-base mb-2")
-            upload_status = ui.label("No file uploaded").classes(
+            ui.label(t("step1")).classes("font-bold text-base mb-2")
+            upload_status = ui.label(t("no_file")).classes(
                 "text-sm").style("color:var(--hubx-text-dim)")
 
             async def handle_upload(e):
                 data = await e.content.read()
                 filename = e.name or "upload"
                 ext = os.path.splitext(filename)[1].lower()
-                tmp = tempfile.NamedTemporaryFile(delete=False,
-                                                  suffix=ext)
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
                 tmp.write(data)
                 tmp.close()
-
                 upload_status.text = f"Reading {filename}…"
                 text, ftype = await extract_text(tmp.name, filename)
                 try:
                     os.unlink(tmp.name)
                 except Exception:
                     pass
-
                 if not text.strip():
                     upload_status.text = (
                         f"Could not extract text from {filename} "
                         f"(type={ftype})")
                     state["extracted"] = False
                     return
-
                 state["filename"] = filename
                 state["original_text"] = text
                 state["file_type"] = ftype
@@ -298,13 +811,11 @@ def check_page():
                       multiple=False).classes("w-full")
 
         with ui.card().classes("hubx-card w-full"):
-            ui.label("2. Analyze against Egyptian codes").classes(
-                "font-bold text-base mb-2")
+            ui.label(t("step2")).classes("font-bold text-base mb-2")
             err_label = ui.label("").style("color:#ef4a5e")
-            analyze_btn = ui.button("Analyze now").classes(
+            analyze_btn = ui.button(t("analyze_now")).classes(
                 "hubx-btn hubx-btn-accent")
-            progress = ui.linear_progress(value=0,
-                                          show_value=False).classes(
+            progress = ui.linear_progress(value=0, show_value=False).classes(
                 "w-full mt-2").style("opacity:0")
 
             async def do_analyze():
@@ -319,8 +830,7 @@ def check_page():
                     state["original_text"])
                 progress.style("opacity:0")
                 if not result:
-                    err_label.text = (
-                        f"Gemini error: {gemini_mod.last_error}")
+                    err_label.text = f"Gemini error: {gemini_mod.last_error}"
                     ui.notify("Analysis failed.", color="red")
                     return
                 state["result"] = result
@@ -334,13 +844,13 @@ def check_page():
                         result.get("summary", ""))
                 except Exception as ex:
                     ui.notify(f"Save failed: {ex}", color="orange")
-                ui.notify(f"Found {len(result.get('issues', []))} "
-                          f"issue(s).", color="green")
+                ui.notify(f"Found {len(result.get('issues', []))} issue(s).",
+                          color="green")
 
             analyze_btn.on("click", do_analyze)
 
         with ui.card().classes("hubx-card w-full"):
-            ui.label("3. Result").classes("font-bold text-base mb-2")
+            ui.label(t("step3")).classes("font-bold text-base mb-2")
             score_label = ui.label("").style(
                 "font-size:1.4rem;font-weight:800")
             summary_box = ui.markdown("").classes("hubx-body mt-2")
@@ -388,34 +898,34 @@ def check_page():
                         filename="hubx_report.xlsx")
 
         with ui.row().classes("gap-2 mt-3 flex-wrap"):
-            ui.button("Download TXT", on_click=dl_txt).classes(
+            ui.button(t("dl_txt"), on_click=dl_txt).classes(
                 "hubx-btn hubx-btn-ghost")
-            ui.button("Download PDF", on_click=dl_pdf).classes(
+            ui.button(t("dl_pdf"), on_click=dl_pdf).classes(
                 "hubx-btn hubx-btn-danger")
-            ui.button("Download XLSX", on_click=dl_xlsx).classes(
+            ui.button(t("dl_xlsx"), on_click=dl_xlsx).classes(
                 "hubx-btn hubx-btn-primary")
 
 
+# ============================================================
+# /knowledge
+# ============================================================
 @ui.page("/knowledge")
 def knowledge_page():
+    STATE.lang = app.storage.user.get("lang", STATE.lang)
+    STATE.focus = app.storage.user.get("focus", STATE.focus)
+    _apply_body_class()
     _header()
     _db_banner()
 
     with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-3"):
-        ui.label("Knowledge Base").classes("hubx-title")
-        ui.label("Self-learned civil quality notes. Search with AI, "
-                 "browse by category, download any topic."
-                 ).classes("hubx-subtitle")
+        ui.label(t("knowledge_title")).classes("hubx-title")
+        ui.label(t("knowledge_sub")).classes("hubx-subtitle")
 
         with ui.card().classes("hubx-card w-full"):
-            ui.label("AI Search").classes("font-bold text-base mb-2")
+            ui.label(t("ai_search")).classes("font-bold text-base mb-2")
             with ui.row().classes("w-full gap-2 items-center no-wrap"):
-                q_input = ui.input(
-                    placeholder="e.g. What are the concrete curing "
-                                "requirements in hot weather?"
-                ).classes("flex-1")
-                ask_btn = ui.button("Ask").classes(
-                    "hubx-btn hubx-btn-primary")
+                q_input = ui.input(placeholder=t("ask_ph")).classes("flex-1")
+                ask_btn = ui.button(t("ask")).classes("hubx-btn hubx-btn-primary")
             search_answer = ui.markdown("").classes("hubx-body mt-3")
             search_status = ui.label("").style(
                 "color:var(--hubx-text-dim);font-size:0.85rem")
@@ -437,8 +947,7 @@ def knowledge_page():
                 context = "\n\n".join(context_parts)[:14000]
                 answer = await ai_search(q, context)
                 if not answer:
-                    search_status.text = (
-                        f"AI error: {gemini_mod.last_error}")
+                    search_status.text = f"AI error: {gemini_mod.last_error}"
                     return
                 search_status.text = ""
                 search_answer.content = answer
@@ -450,10 +959,10 @@ def knowledge_page():
         with ui.row().classes("w-full gap-3 no-wrap hubx-stack-mobile"):
             with ui.card().classes("hubx-card w-72 shrink-0 h-[75vh] "
                                    "overflow-auto"):
-                ui.label("Categories").classes("font-bold text-base")
+                ui.label(t("categories")).classes("font-bold text-base")
                 cat_container = ui.column().classes("w-full gap-1 mt-2")
                 ui.separator().style("border-color:var(--hubx-border)")
-                ui.label("Topics").classes("font-bold text-base mt-2")
+                ui.label(t("topics")).classes("font-bold text-base mt-2")
                 topic_label = ui.label("").classes(
                     "text-xs").style("color:var(--hubx-text-dim)")
                 topic_container = ui.column().classes("w-full gap-0.5")
@@ -461,7 +970,7 @@ def knowledge_page():
             with ui.card().classes("hubx-card flex-1 h-[75vh] "
                                    "overflow-auto"):
                 reader_toolbar = ui.row().classes(
-                    "w-full gap-2 mb-2 items-center")
+                    "w-full gap-2 mb-2 items-center flex-wrap")
                 detail = ui.markdown("").classes(
                     "hubx-body whitespace-pre-wrap w-full")
 
@@ -471,35 +980,38 @@ def knowledge_page():
                 return
             body = k[4] or k[3] or "(empty)"
             detail.content = (f"# {k[1]}\n\n"
-                              f"**Category:** {k[2]}  ·  "
-                              f"**Version:** v{k[5]}  ·  "
-                              f"**Confidence:** {round(k[6] or 0, 2)}\n\n"
+                              f"**{t('category')}:** {k[2]}  ·  "
+                              f"**{t('version')}:** v{k[5]}  ·  "
+                              f"**{t('confidence')}:** {round(k[6] or 0, 2)}\n\n"
                               f"---\n\n{body}")
             reader_toolbar.clear()
             with reader_toolbar:
-                ui.button("PDF", on_click=lambda: ui.download(
+                ui.button(t("btn_pdf"), on_click=lambda: ui.download(
                     topic_pdf(k[1], k[2], k[5], body),
                     filename=f"hubx_{k[1][:30]}.pdf")
                 ).classes("hubx-btn hubx-btn-danger")
-                ui.button("DOCX", on_click=lambda: ui.download(
+                ui.button(t("btn_docx"), on_click=lambda: ui.download(
                     topic_docx(k[1], k[2], k[5], body),
                     filename=f"hubx_{k[1][:30]}.docx")
                 ).classes("hubx-btn hubx-btn-primary")
-                ui.button("TXT", on_click=lambda: ui.download(
+                ui.button(t("btn_txt"), on_click=lambda: ui.download(
                     topic_txt(k[1], k[2], k[5], body),
                     filename=f"hubx_{k[1][:30]}.txt")
                 ).classes("hubx-btn hubx-btn-ghost")
+                ui.button(t("preview_paper"),
+                          on_click=lambda: _open_paper_dialog(
+                              k[1], k[2], k[5], body, {})
+                ).classes("hubx-btn hubx-btn-accent")
 
         def render_topics():
             topic_container.clear()
             cat = selected["cat"]
             rows = get_all_knowledge(category=cat, limit=1000)
-            topic_label.text = (f"{len(rows)} topics"
-                                if cat else f"{len(rows)} topics total")
+            topic_label.text = (f"{len(rows)} {t('topics')}"
+                                if cat else f"{len(rows)} {t('all_topics')}")
             with topic_container:
                 if not rows:
-                    ui.label("(empty)").classes(
-                        "italic text-xs").style(
+                    ui.label("(empty)").classes("italic text-xs").style(
                         "color:var(--hubx-text-dim);padding:8px")
                 for r in rows[:300]:
                     kid, topic, ver = r[0], r[1], r[5]
@@ -511,7 +1023,7 @@ def knowledge_page():
             cat_container.clear()
             counts = category_counts()
             with cat_container:
-                b = ui.button("All topics").classes(
+                b = ui.button(t("all_topics")).classes(
                     "hubx-side-btn" +
                     (" selected" if selected["cat"] is None else ""))
                 b.on("click", lambda: select_category(None))
@@ -537,32 +1049,36 @@ def knowledge_page():
         ui.timer(8.0, refresh_all)
 
 
+# ============================================================
+# /templates  (now with PAPER view)
+# ============================================================
 @ui.page("/templates")
 def templates_page():
+    STATE.lang = app.storage.user.get("lang", STATE.lang)
+    STATE.focus = app.storage.user.get("focus", STATE.focus)
+    _apply_body_class()
     _header()
     _db_banner()
 
     with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-3"):
-        ui.label("Egyptian Site Paper Templates").classes("hubx-title")
-        ui.label("Ready-to-use construction documents for Egyptian "
-                 "companies. Generated and refined automatically. "
-                 "Download any template as PDF."
-                 ).classes("hubx-subtitle")
+        ui.label(t("templates_title")).classes("hubx-title")
+        ui.label(t("templates_sub")).classes("hubx-subtitle")
 
         tstats = template_stats()
         with ui.row().classes("gap-3 mb-2 flex-wrap"):
-            _stat("Templates").text = str(tstats["total"])
-            _stat("Refined").text = str(tstats["refined"])
-            _stat("Queue").text = str(tstats["pending"])
+            _stat(t("templates_word")).text = str(tstats["total"])
+            _stat(t("refined_word")).text = str(tstats["refined"])
+            _stat(t("queue_word")).text = str(tstats["pending"])
 
         selected = {"cat": None}
         with ui.row().classes("w-full gap-3 no-wrap hubx-stack-mobile"):
             with ui.card().classes("hubx-card w-72 shrink-0 h-[75vh] "
                                    "overflow-auto"):
-                ui.label("Categories").classes("font-bold text-base")
+                ui.label(t("categories")).classes("font-bold text-base")
                 cat_container = ui.column().classes("w-full gap-1 mt-2")
                 ui.separator().style("border-color:var(--hubx-border)")
-                ui.label("Templates").classes("font-bold text-base mt-2")
+                ui.label(t("templates_word")).classes(
+                    "font-bold text-base mt-2")
                 topic_label = ui.label("").classes(
                     "text-xs").style("color:var(--hubx-text-dim)")
                 t_container = ui.column().classes("w-full gap-0.5")
@@ -570,57 +1086,61 @@ def templates_page():
             with ui.card().classes("hubx-card flex-1 h-[75vh] "
                                    "overflow-auto"):
                 toolbar = ui.row().classes(
-                    "w-full gap-2 mb-2 items-center")
+                    "w-full gap-2 mb-2 items-center flex-wrap")
                 detail = ui.markdown("").classes(
                     "hubx-body whitespace-pre-wrap w-full")
 
         def show_template(tid):
-            t = get_template_by_id(tid)
-            if not t:
+            tmpl = get_template_by_id(tid)
+            if not tmpl:
                 return
-            body = t[4] or t[3] or "(empty)"
-            detail.content = (f"# {t[1]}\n\n"
-                              f"**Category:** {t[2]}  ·  "
-                              f"**Version:** v{t[5]}  ·  "
-                              f"**Confidence:** {round(t[6] or 0, 2)}\n\n"
+            body = tmpl[4] or tmpl[3] or "(empty)"
+            detail.content = (f"# {tmpl[1]}\n\n"
+                              f"**{t('category')}:** {tmpl[2]}  ·  "
+                              f"**{t('version')}:** v{tmpl[5]}  ·  "
+                              f"**{t('confidence')}:** {round(tmpl[6] or 0, 2)}\n\n"
                               f"---\n\n{body}")
             toolbar.clear()
             with toolbar:
-                ui.button("PDF", on_click=lambda: ui.download(
-                    topic_pdf(t[1], t[2], t[5], body),
-                    filename=f"hubx_tpl_{t[1][:30]}.pdf")
+                ui.button(t("btn_pdf"), on_click=lambda: ui.download(
+                    topic_pdf(tmpl[1], tmpl[2], tmpl[5], body),
+                    filename=f"hubx_tpl_{tmpl[1][:30]}.pdf")
                 ).classes("hubx-btn hubx-btn-danger")
-                ui.button("DOCX", on_click=lambda: ui.download(
-                    topic_docx(t[1], t[2], t[5], body),
-                    filename=f"hubx_tpl_{t[1][:30]}.docx")
+                ui.button(t("btn_docx"), on_click=lambda: ui.download(
+                    topic_docx(tmpl[1], tmpl[2], tmpl[5], body),
+                    filename=f"hubx_tpl_{tmpl[1][:30]}.docx")
                 ).classes("hubx-btn hubx-btn-primary")
-                ui.button("TXT", on_click=lambda: ui.download(
-                    topic_txt(t[1], t[2], t[5], body),
-                    filename=f"hubx_tpl_{t[1][:30]}.txt")
+                ui.button(t("btn_txt"), on_click=lambda: ui.download(
+                    topic_txt(tmpl[1], tmpl[2], tmpl[5], body),
+                    filename=f"hubx_tpl_{tmpl[1][:30]}.txt")
                 ).classes("hubx-btn hubx-btn-ghost")
+                # NEW: paper-format preview
+                ui.button(t("preview_paper"),
+                          on_click=lambda: _open_paper_dialog(
+                              tmpl[1], tmpl[2], tmpl[5], body, {})
+                ).classes("hubx-btn hubx-btn-accent")
 
         def render_templates():
             t_container.clear()
             cat = selected["cat"]
             rows = get_all_templates(category=cat, limit=500)
-            topic_label.text = (f"{len(rows)} templates"
-                                if cat else f"{len(rows)} total")
+            topic_label.text = (f"{len(rows)} {t('templates_word')}"
+                                if cat else f"{len(rows)} {t('templates_word')}")
             with t_container:
                 if not rows:
-                    ui.label("(empty)").classes(
-                        "italic text-xs").style(
+                    ui.label("(empty)").classes("italic text-xs").style(
                         "color:var(--hubx-text-dim);padding:8px")
                 for r in rows[:300]:
                     tid, name, ver = r[0], r[1], r[5]
                     b = ui.button(f"{name[:44]}  ·  v{ver}").classes(
                         "hubx-side-btn")
-                    b.on("click", lambda t=tid: show_template(t))
+                    b.on("click", lambda t_=tid: show_template(t_))
 
         def render_cats():
             cat_container.clear()
             counts = template_category_counts()
             with cat_container:
-                b = ui.button("All categories").classes(
+                b = ui.button(t("all_categories")).classes(
                     "hubx-side-btn" +
                     (" selected" if selected["cat"] is None else ""))
                 b.on("click", lambda: sel(None))
@@ -646,14 +1166,20 @@ def templates_page():
         ui.timer(8.0, refresh)
 
 
+# ============================================================
+# /charts
+# ============================================================
 @ui.page("/charts")
 def charts_page():
+    STATE.lang = app.storage.user.get("lang", STATE.lang)
+    STATE.focus = app.storage.user.get("focus", STATE.focus)
+    _apply_body_class()
     _header()
     _db_banner()
+
     with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-3"):
-        ui.label("Live Charts").classes("hubx-title")
-        ui.label("Built from the self-learning loop. Auto-updates."
-                 ).classes("hubx-subtitle")
+        ui.label(t("charts_title")).classes("hubx-title")
+        ui.label(t("charts_sub")).classes("hubx-subtitle")
 
         import matplotlib
         matplotlib.use("Agg")
@@ -741,15 +1267,14 @@ def charts_page():
             cycles = [r[0] for r in data]
             added = [r[1] for r in data]
             refined = [r[2] for r in data]
-            ax.plot(cycles, added, marker="o", color="#4f8cff",
-                    label="added")
+            ax.plot(cycles, added, marker="o", color="#4f8cff", label="added")
             ax.plot(cycles, refined, marker="s", color="#ef4a5e",
                     label="refined")
             ax.set_title("Learning activity")
             style_ax(ax)
             leg = ax.legend(facecolor="#131a2f", edgecolor="#2a3559")
-            for t in leg.get_texts():
-                t.set_color("#e8ecf7")
+            for t_ in leg.get_texts():
+                t_.set_color("#e8ecf7")
             fig.tight_layout()
 
         def refresh():
@@ -765,23 +1290,28 @@ def charts_page():
         ui.timer(8.0, refresh)
 
 
+# ============================================================
+# /dashboard
+# ============================================================
 @ui.page("/dashboard")
 def dashboard_page():
+    STATE.lang = app.storage.user.get("lang", STATE.lang)
+    STATE.focus = app.storage.user.get("focus", STATE.focus)
+    _apply_body_class()
     _header()
     _db_banner()
 
     with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-3"):
-        ui.label("Learning Dashboard").classes("hubx-title")
+        ui.label(t("dash_title")).classes("hubx-title")
 
         with ui.row().classes("gap-3 items-center flex-wrap"):
-            status_badge = ui.badge("idle", color="grey").classes(
-                "text-sm")
-            cycles_label = _stat("Cycles")
-            gemini_label = _stat("Gemini Calls")
-            kb_label = _stat("Knowledge")
-            refined_label = _stat("Refined")
-            tpl_label = _stat("Templates")
-            queue_label = _stat("Queue")
+            status_badge = ui.badge("idle", color="grey").classes("text-sm")
+            cycles_label = _stat(t("cycles"))
+            gemini_label = _stat(t("gemini_calls"))
+            kb_label = _stat(t("knowledge_stat"))
+            refined_label = _stat(t("refined_stat"))
+            tpl_label = _stat(t("templates_stat"))
+            queue_label = _stat(t("queue_stat"))
 
         debug_label = ui.label("").classes("text-sm").style(
             "color:var(--hubx-text-dim)")
@@ -807,12 +1337,12 @@ def dashboard_page():
             refresh()
 
         with ui.row().classes("gap-2 mt-2"):
-            ui.button("Start learning", on_click=do_start).classes(
+            ui.button(t("start"), on_click=do_start).classes(
                 "hubx-btn hubx-btn-accent")
-            ui.button("Pause", on_click=do_pause).classes(
+            ui.button(t("pause"), on_click=do_pause).classes(
                 "hubx-btn hubx-btn-warn")
-            ui.button("Run one cycle now", on_click=do_one_cycle
-                      ).classes("hubx-btn hubx-btn-primary")
+            ui.button(t("one_cycle"), on_click=do_one_cycle).classes(
+                "hubx-btn hubx-btn-primary")
 
         def refresh():
             try:
@@ -839,18 +1369,16 @@ def dashboard_page():
         ui.timer(2.0, refresh)
         refresh()
 
-        ui.label("Recent learning runs").classes(
-            "text-lg font-bold mt-4")
+        ui.label(t("recent_runs")).classes("text-lg font-bold mt-4")
         runs_table = ui.table(columns=[
-            {"name": "cycle", "label": "Cycle", "field": "cycle"},
+            {"name": "cycle", "label": t("cycles"), "field": "cycle"},
             {"name": "topic", "label": "Topic", "field": "topic",
              "align": "left"},
             {"name": "added", "label": "+", "field": "added"},
             {"name": "refined", "label": "~", "field": "refined"},
             {"name": "calls", "label": "Calls", "field": "calls"},
             {"name": "error", "label": "Error", "field": "error"},
-            {"name": "created_at", "label": "When",
-             "field": "created_at"},
+            {"name": "created_at", "label": "When", "field": "created_at"},
         ], rows=[]).classes("w-full")
 
         def refresh_runs():
@@ -867,17 +1395,15 @@ def dashboard_page():
         ui.timer(5.0, refresh_runs)
         refresh_runs()
 
-        ui.label("Recent template runs").classes(
-            "text-lg font-bold mt-4")
+        ui.label(t("recent_tpl_runs")).classes("text-lg font-bold mt-4")
         tpl_table = ui.table(columns=[
-            {"name": "cycle", "label": "Cycle", "field": "cycle"},
-            {"name": "name", "label": "Template", "field": "name",
+            {"name": "cycle", "label": t("cycles"), "field": "cycle"},
+            {"name": "name", "label": t("templates_word"), "field": "name",
              "align": "left"},
             {"name": "added", "label": "+", "field": "added"},
             {"name": "refined", "label": "~", "field": "refined"},
             {"name": "error", "label": "Error", "field": "error"},
-            {"name": "created_at", "label": "When",
-             "field": "created_at"},
+            {"name": "created_at", "label": "When", "field": "created_at"},
         ], rows=[]).classes("w-full")
 
         def refresh_tpl_runs():
@@ -895,4 +1421,5 @@ def dashboard_page():
         refresh_tpl_runs()
 
 
-ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx")
+ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx",
+       storage_secret=os.getenv("STORAGE_SECRET", "hubx-dev-secret"))
