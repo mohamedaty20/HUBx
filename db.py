@@ -1,7 +1,6 @@
 # db.py
-# Turso with automatic local-SQLite fallback so the app never brick-walls.
-# If TURSO_DATABASE_URL is valid we use Turso (persistent).
-# If not, we use a local file (works, but data is lost on Render redeploy).
+# Finds Turso credentials by VALUE (not by exact key name), so the app
+# works no matter what you named the env vars in Render.
 
 import os
 import json
@@ -21,8 +20,26 @@ def _clean(v):
     return v
 
 
-_TURSO_URL_RAW = _clean(os.getenv("TURSO_DATABASE_URL", ""))
-_TURSO_TOKEN_RAW = _clean(os.getenv("TURSO_AUTH_TOKEN", ""))
+def _find_url():
+    """Any env var whose value starts with libsql://"""
+    for k, v in os.environ.items():
+        v = _clean(v)
+        if v.startswith("libsql://"):
+            return k, v
+    return None, ""
+
+
+def _find_token():
+    """Any env var whose value looks like a Turso JWT (starts with eyJ, >100 chars)."""
+    for k, v in os.environ.items():
+        v = _clean(v)
+        if v.startswith("eyJ") and len(v) > 100:
+            return k, v
+    return None, ""
+
+
+_URL_KEY, _TURSO_URL_RAW = _find_url()
+_TOKEN_KEY, _TURSO_TOKEN_RAW = _find_token()
 
 _conn = None
 _db_mode = "not connected"
@@ -30,13 +47,11 @@ _db_error = ""
 
 
 def _try_turso():
-    """Return a connection or raise. Also validates the token works."""
     if not _TURSO_URL_RAW.startswith("libsql://"):
-        raise ValueError("TURSO_DATABASE_URL missing or not libsql://")
+        raise ValueError("no libsql:// URL found in any env var")
     if not _TURSO_TOKEN_RAW:
-        raise ValueError("TURSO_AUTH_TOKEN missing")
+        raise ValueError("no Turso token found in any env var")
     conn = libsql.connect(_TURSO_URL_RAW, auth_token=_TURSO_TOKEN_RAW)
-    # Force a real round-trip so a bad token fails here, not later.
     conn.execute("SELECT 1").fetchone()
     return conn
 
@@ -46,12 +61,11 @@ def get_conn():
     if _conn is not None:
         return _conn
 
-    print(f"=== HUBx DB init ===")
-    print(f"TURSO url len={len(_TURSO_URL_RAW)} "
-          f"starts_libsql={_TURSO_URL_RAW.startswith('libsql://')}")
-    print(f"TURSO token len={len(_TURSO_TOKEN_RAW)}")
+    print("=== HUBx DB init ===")
+    print(f"URL env var name  = {_URL_KEY!r} (len={len(_TURSO_URL_RAW)})")
+    print(f"TOKEN env var name= {_TOKEN_KEY!r} (len={len(_TURSO_TOKEN_RAW)})")
+    print(f"ALL ENV KEYS = {sorted(os.environ.keys())}")
 
-    # 1) Try Turso
     try:
         _conn = _try_turso()
         _db_mode = "turso"
@@ -62,12 +76,11 @@ def get_conn():
     except Exception as e:
         _db_error = f"{type(e).__name__}: {e}"
         print(f"Turso failed: {_db_error}")
-        print("Falling back to local SQLite (data lost on redeploy).")
+        print("Falling back to local SQLite.")
 
-    # 2) Fallback to local file
     _conn = libsql.connect("hubx.db")
     _db_mode = "local"
-    print(f"DB MODE = local SQLite (hubx.db in container)")
+    print("DB MODE = local SQLite")
     print("====================")
     return _conn
 
@@ -78,6 +91,8 @@ def db_health():
         "connection": _TURSO_URL_RAW[:40] if _db_mode == "turso" else "hubx.db",
         "error": _db_error,
         "ok": _db_mode == "turso",
+        "url_key": _URL_KEY or "",
+        "token_key": _TOKEN_KEY or "",
     }
 
 
