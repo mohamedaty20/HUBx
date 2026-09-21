@@ -1,6 +1,6 @@
 # gemini.py
-# Uses GEMINI_MODEL exactly as you set it. No overriding.
-# Fallbacks only run if your model truly fails, and they include modern names.
+# Model name is HARDCODED. Env var is ignored (it kept getting misconfigured).
+# To change the model, edit the MODEL constant below.
 
 import os
 import asyncio
@@ -17,32 +17,18 @@ from prompts import (
 
 logger = logging.getLogger(__name__)
 
+# ==================================================================
+# HARDCODED MODEL. Edit this line if you want a different model.
+# ==================================================================
+MODEL = "gemini-3.5-flash-lite"
+# ==================================================================
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-
-
-def _strip(v):
-    """Only strip whitespace and surrounding quotes. Nothing else."""
-    v = (v or "").strip()
-    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-        v = v[1:-1].strip()
-    return v
-
-
-# Use YOUR model first, exactly as set. Only add fallbacks that are known-alive.
-_user_model = _strip(os.getenv("GEMINI_MODEL", ""))
-MODEL_CANDIDATES = []
-if _user_model:
-    MODEL_CANDIDATES.append(_user_model)
-for m in ("gemini-3.5-flash-lite", "gemini-3.6-flash",
-          "gemini-3.5-flash", "gemini-3.0-flash-lite"):
-    if m and m not in MODEL_CANDIDATES:
-        MODEL_CANDIDATES.append(m)
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 last_error = ""
-_working_model = None
 
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
@@ -76,45 +62,41 @@ def _extract_text(resp):
     return ""
 
 
-async def _try_once(model_name, prompt, json_mode):
-    kwargs = {"temperature": 0.4 if json_mode else 0.6}
-    if json_mode:
-        kwargs["response_mime_type"] = "application/json"
-    model = genai.GenerativeModel(model_name)
-    resp = await asyncio.to_thread(
-        model.generate_content,
-        prompt,
-        generation_config=genai.types.GenerationConfig(**kwargs),
-    )
-    return _extract_text(resp)
-
-
 async def _call(prompt, json_mode=False):
-    global last_error, _working_model
+    global last_error
     if not GEMINI_API_KEY:
         last_error = "GEMINI_API_KEY not set"
         return ""
 
-    models_to_try = [_working_model] if _working_model else MODEL_CANDIDATES
+    kwargs = {"temperature": 0.4 if json_mode else 0.6}
+    if json_mode:
+        kwargs["response_mime_type"] = "application/json"
 
-    for model_name in models_to_try:
-        for attempt in range(2):
-            await _throttle()
-            try:
-                text = await _try_once(model_name, prompt, json_mode)
-                if text:
-                    _working_model = model_name
-                    last_error = ""
-                    return text
-                last_error = f"{model_name}: empty response"
-            except Exception as e:
-                last_error = f"{model_name}: {type(e).__name__}: {e}"
-                logger.warning("Gemini call failed on %s: %s",
-                               model_name, e)
-                await asyncio.sleep(2 ** attempt)
-    logger.error("All models failed. last_error=%s", last_error)
+    model = genai.GenerativeModel(MODEL)
+    for attempt in range(3):
+        await _throttle()
+        try:
+            resp = await asyncio.to_thread(
+                model.generate_content,
+                prompt,
+                generation_config=genai.types.GenerationConfig(**kwargs),
+            )
+            text = _extract_text(resp)
+            if text:
+                last_error = ""
+                return text
+            last_error = f"{MODEL}: empty response"
+        except Exception as e:
+            last_error = f"{MODEL}: {type(e).__name__}: {e}"
+            logger.warning("Gemini call failed (attempt %d): %s",
+                           attempt + 1, e)
+            await asyncio.sleep(2 ** attempt)
     return ""
 
+
+# ---------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------
 
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
@@ -151,29 +133,20 @@ async def check_document(filename, file_type, text):
 
 
 async def ocr_image(path):
-    global last_error, _working_model
+    global last_error
     if not GEMINI_API_KEY:
         return ""
     try:
         from PIL import Image
         img = Image.open(path)
-        models = [_working_model] if _working_model else MODEL_CANDIDATES
-        for model_name in models:
-            await _throttle()
-            try:
-                model = genai.GenerativeModel(model_name)
-                resp = await asyncio.to_thread(
-                    model.generate_content,
-                    ["Transcribe every word of text in this image. "
-                     "Preserve line breaks. Return plain text only.", img],
-                )
-                t = _extract_text(resp)
-                if t:
-                    _working_model = model_name
-                    return t
-            except Exception as e:
-                last_error = f"OCR {model_name}: {e}"
-                continue
+        await _throttle()
+        model = genai.GenerativeModel(MODEL)
+        resp = await asyncio.to_thread(
+            model.generate_content,
+            ["Transcribe every word of text in this image. "
+             "Preserve line breaks. Return plain text only.", img],
+        )
+        return _extract_text(resp)
     except Exception as e:
-        last_error = f"OCR load: {e}"
-    return ""
+        last_error = f"OCR: {e}"
+        return ""
