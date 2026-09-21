@@ -1,99 +1,169 @@
 # compliance.py
-# Safest legal option chosen: fail closed on every robots.txt error.
-# EXCEPTION 1: a missing robots.txt (404) means "allow", per RFC 9309.
-# EXCEPTION 2: Tier A = official API/RSS. These endpoints exist for
-#   machine consumption, so robots.txt is not consulted for them.
+"""
+Compliance gate + errors for the fetching layer.
+
+Exports:
+    ComplianceError    base exception
+    Blocked            raised when a URL must not be fetched (alias name)
+    ComplianceGate     the gate class used by engine.py
+
+Backwards compatibility: both `Blocked` and `ComplianceError` refer to the
+same underlying exception class so older imports keep working.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import time
-import urllib.robotparser
+import urllib.robotparser as urobot
 from urllib.parse import urlparse
-from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
 
-import httpx
+# Import the whitelist from sources.py. We import defensively so this
+# file works even if sources.py is missing pieces.
+try:
+    from sources import (
+        MIN_DOMAIN_DELAY,
+        USER_AGENT,
+        TIER_A,
+        TIER_B,
+        TIER_C,
+        TIER_D,
+        get_tier,
+        get_min_delay,
+        allowed_domains,
+    )
+except Exception:  # pragma: no cover - ultra-defensive fallback
+    MIN_DOMAIN_DELAY = 3.0
+    USER_AGENT = "EgyptCivilEngJobBot/1.0"
+    TIER_A, TIER_B, TIER_C, TIER_D = [], [], [], []
+    def get_tier(domain):  # type: ignore
+        return "unknown"
+    def get_min_delay(domain):  # type: ignore
+        return MIN_DOMAIN_DELAY
+    def allowed_domains():  # type: ignore
+        return []
 
-from sources import (MIN_DOMAIN_DELAY, get_tier,
-                     TIER_A, TIER_B, TIER_C, TIER_D)
 
-_last_request_time: dict[str, float] = defaultdict(float)
-
-# Real browser User-Agent. Cloudflare blocks custom UAs on some sites.
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
-
+# ------------------------------------------------------------------
+# Errors
+# ------------------------------------------------------------------
 class ComplianceError(Exception):
-    pass
+    """Raised when a URL fails the compliance check."""
 
 
-def _domain(url: str) -> str:
-    netloc = urlparse(url).netloc.lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
-    return netloc.split(":")[0]
+class Blocked(ComplianceError):
+    """A URL is not allowed to be fetched live.
+
+    This is a subclass of ComplianceError so `except ComplianceError`
+    also catches Blocked.
+    """
 
 
-async def check_robots(url: str) -> bool:
-    parsed = urlparse(url)
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    try:
-        async with httpx.AsyncClient(
-                timeout=10.0, follow_redirects=True) as client:
-            resp = await client.get(
-                robots_url, headers={"User-Agent": BROWSER_UA})
-            if resp.status_code == 404:
-                return True
-            if resp.status_code != 200:
+# ------------------------------------------------------------------
+# Gate
+# ------------------------------------------------------------------
+@dataclass
+class _SourceInfo:
+    domain: str
+    tier: str
+    min_delay: float = MIN_DOMAIN_DELAY
+    allowed_paths: list = field(default_factory=lambda: ["/"])
+    note: str = ""
+
+
+class ComplianceGate:
+    """
+    Checks a URL against the whitelist in sources.py:
+      * unknown domain  -> Blocked
+      * tier D          -> Blocked
+      * tier C + fetch  -> Blocked (manual paste only)
+      * robots.txt says no for live fetch -> Blocked
+      * otherwise       -> allowed, with rate limiting per domain
+
+    Usage:
+        gate = ComplianceGate()
+        await gate.check(url, kind="fetch")   # raises Blocked on failure
+        await gate.check(url, kind="parse")   # user pasted content; no network
+    """
+
+    def __init__(self) -> None:
+        self._robots: dict[str, Optional[urobot.RobotFileParser]] = {}
+        self._last_hit: dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    # ---------- public API ----------
+    def allowed_domains(self) -> list:
+        return allowed_domains()
+
+    def tier_of(self, domain: str) -> str:
+        return get_tier(domain)
+
+    async def check(self, url: str, kind: str = "fetch") -> _SourceInfo:
+        """
+        kind='fetch' -> live request; full gate applies
+        kind='parse' -> user pasted content; only tier D and unknown blocked
+        """
+        if not url:
+            raise Blocked("empty url")
+
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        domain = (parsed.netloc or "").lower().removeprefix("www.")
+        path = parsed.path or "/"
+
+        if not domain:
+            raise Blocked(f"could not parse domain from {url!r}")
+
+        tier = get_tier(domain)
+        if tier == "unknown":
+            raise Blocked(f"{domain} is not on the whitelist")
+        if tier == "D":
+            raise Blocked(f"{domain} is on the blocklist (tier D)")
+        if tier == "C" and kind == "fetch":
+            raise Blocked(
+                f"{domain} forbids scraping; use kind='parse' with pasted text"
+            )
+
+        # For parse mode we don't touch the network at all.
+        if kind == "parse":
+            return _SourceInfo(domain=domain, tier=tier,
+                               min_delay=get_min_delay(domain))
+
+        # Live fetch: check robots.txt (fail closed).
+        robots_ok = await self._robots_ok(domain, path)
+        if not robots_ok:
+            raise Blocked(f"robots.txt disallows {path} on {domain}")
+
+        # Rate limit per domain.
+        delay = get_min_delay(domain)
+        async with self._lock:
+            last = self._last_hit.get(domain, 0.0)
+            wait = delay - (time.monotonic() - last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_hit[domain] = time.monotonic()
+
+        return _SourceInfo(domain=domain, tier=tier, min_delay=delay)
+
+    # ---------- robots.txt ----------
+    async def _robots_ok(self, domain: str, path: str) -> bool:
+        if domain not in self._robots:
+            rp = urobot.RobotFileParser()
+            rp.set_url(f"https://{domain}/robots.txt")
+            try:
+                await asyncio.to_thread(rp.read)
+            except Exception:
+                # Fail closed: if robots.txt is unreachable, refuse.
+                self._robots[domain] = None
                 return False
-            rp = urllib.robotparser.RobotFileParser()
-            rp.parse(resp.text.splitlines())
-            return rp.can_fetch("*", url)
-    except Exception:
-        return False
+            self._robots[domain] = rp
 
-
-async def enforce_delay(domain: str) -> None:
-    now = time.monotonic()
-    elapsed = now - _last_request_time[domain]
-    if elapsed < MIN_DOMAIN_DELAY:
-        await asyncio.sleep(MIN_DOMAIN_DELAY - elapsed)
-    _last_request_time[domain] = time.monotonic()
-
-
-def tier_gate(domain: str) -> None:
-    tier = get_tier(domain)
-    if tier == TIER_D:
-        raise ComplianceError(f"Domain {domain} is blocked (Tier D).")
-    if tier == TIER_C:
-        raise ComplianceError(
-            f"Domain {domain} is manual-paste only (Tier C).")
-    if tier not in (TIER_A, TIER_B):
-        raise ComplianceError(f"Unknown tier for {domain}.")
-
-
-async def safe_fetch(url: str) -> str:
-    domain = _domain(url)
-    tier = get_tier(domain)
-    tier_gate(domain)
-
-    if tier != TIER_A:
-        if not await check_robots(url):
-            raise ComplianceError(f"robots.txt disallows {url}")
-
-    await enforce_delay(domain)
-    async with httpx.AsyncClient(
-            timeout=20.0, follow_redirects=True) as client:
-        resp = await client.get(
-            url,
-            headers={
-                "User-Agent": BROWSER_UA,
-                "Accept": "application/rss+xml, application/xml, "
-                          "text/xml, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        resp.raise_for_status()
-        return resp.text
+        rp = self._robots[domain]
+        if rp is None:
+            return False
+        try:
+            return bool(rp.can_fetch(USER_AGENT,
+                                     f"https://{domain}{path}"))
+        except Exception:
+            return False
