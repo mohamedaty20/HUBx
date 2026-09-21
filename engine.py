@@ -1,7 +1,5 @@
 # engine.py
 # Self-learning loop that EXPANDS its own topic list.
-# Every cycle generates a topic, then asks Gemini for 3 new sub-topics
-# that get queued for future cycles.
 
 import asyncio
 import json
@@ -22,70 +20,88 @@ import gemini as gemini_mod
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+ALLOWED_CATEGORIES = {
+    "concrete", "steel", "soil", "water", "roads",
+    "quality_management", "egyptian_codes", "safety", "surveying",
+}
 
-def _robust_json(raw):
-    """
-    Try everything to turn Gemini's reply into a dict.
-    Returns {} if nothing works.
-    """
+
+def _safe_json(raw):
+    """Turn Gemini output into a dict, or return {} on any failure."""
     if not raw:
         return {}
-    s = raw.strip()
-
-    # Strip code fences
+    s = str(raw).strip()
     if s.startswith("```"):
         s = s.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
-    # Attempt 1: direct parse
-    try:
-        v = json.loads(s)
-    except Exception:
-        v = None
-
-    # Attempt 2: if it's a JSON string containing JSON, unwrap it
-    if isinstance(v, str):
+    # Direct parse
+    for candidate in (s,):
         try:
-            v = json.loads(v)
+            v = json.loads(candidate)
+            if isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except Exception:
+                    pass
+            if isinstance(v, dict):
+                return v
         except Exception:
             pass
 
-    # Attempt 3: extract the first {...} block
-    if not isinstance(v, dict):
-        m = re.search(r"\{.*\}", s, re.S)
-        if m:
-            try:
-                v = json.loads(m.group(0))
-            except Exception:
-                pass
-
-    # Attempt 4: fix common Gemini mistakes
-    if not isinstance(v, dict):
-        fixed = s.replace('\\"', '"').replace("\\'", "'")
-        m = re.search(r"\{.*\}", fixed, re.S)
-        if m:
-            try:
-                v = json.loads(m.group(0))
-            except Exception:
-                pass
-
-    if not isinstance(v, dict):
-        return {}
-
-    # Unwrap nested "subtopics" that came back as a JSON string
-    if "subtopics" in v and isinstance(v["subtopics"], str):
+    # Extract first {...} block
+    m = re.search(r"\{.*\}", s, re.S)
+    if m:
         try:
-            v["subtopics"] = json.loads(v["subtopics"])
+            v = json.loads(m.group(0))
+            if isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except Exception:
+                    pass
+            if isinstance(v, dict):
+                return v
         except Exception:
-            v["subtopics"] = []
+            pass
 
-    # Handle case where key has literal escaped quotes around it
-    if "subtopics" not in v:
-        for k in list(v.keys()):
-            if k.strip('"').strip("'") == "subtopics":
-                v["subtopics"] = v.pop(k)
-                break
+    # Fix escaped quotes
+    fixed = s.replace('\\"', '"')
+    m = re.search(r"\{.*\}", fixed, re.S)
+    if m:
+        try:
+            v = json.loads(m.group(0))
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+    return {}
 
-    return v
+
+def _extract_subtopics(data):
+    """Pull a list of (topic, category) pairs from any dict shape."""
+    if not isinstance(data, dict):
+        return []
+    items = data.get("subtopics") or data.get("sub_topics") \
+        or data.get("topics") or data.get("items") or []
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except Exception:
+            items = []
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            t = (it.get("topic") or it.get("title") or "").strip()
+            c = (it.get("category") or "").strip().lower()
+        elif isinstance(it, str):
+            t = it.strip()
+            c = ""
+        else:
+            continue
+        if t:
+            out.append((t, c))
+    return out
 
 
 class Engine:
@@ -144,7 +160,7 @@ class Engine:
     async def _cycle(self):
         s = knowledge_stats()
         if s["total"] >= MAX_KNOWLEDGE_ITEMS:
-            self.last_debug = f"cap reached ({MAX_KNOWLEDGE_ITEMS} topics)"
+            self.last_debug = f"cap reached ({MAX_KNOWLEDGE_ITEMS})"
             return
         if self.cycles_completed % REFINE_EVERY_N_CYCLES == 3:
             await self._refine_one()
@@ -174,55 +190,53 @@ class Engine:
             upsert_knowledge(topic, category, content, confidence=0.6)
             log_learning_run(self.cycles_completed, topic, 1, 0, 1)
             self.last_debug = f"generated [{source}]: {topic}"
-            await self._expand_topics(topic, category)
+            try:
+                await self._expand_topics(topic, category)
+            except Exception as e:
+                self.last_debug += f" | expand err: {e}"
         else:
             err = gemini_mod.last_error or "empty response"
             log_learning_run(self.cycles_completed, topic, 0, 0, 1, error=err)
             self.last_debug = f"no content for: {topic} | {err}"
 
     async def _expand_topics(self, parent_topic, parent_category):
-        """Ask Gemini for SUGGESTIONS_PER_CYCLE new sub-topics."""
         if self.paused:
             return
         if pending_count() > 200:
+            self.last_debug += " | queue full"
             return
 
         self.gemini_calls += 1
-        user = SUGGEST_TOPICS_USER.format(
-            topic=parent_topic, category=parent_category,
-            n=SUGGESTIONS_PER_CYCLE)
-        system = SUGGEST_TOPICS_SYSTEM.format(n=SUGGESTIONS_PER_CYCLE)
-        raw = await gemini_mod._call(f"{system}\n\n---\n\n{user}",
-                                     json_mode=True)
+        try:
+            user = SUGGEST_TOPICS_USER.format(
+                topic=parent_topic, category=parent_category,
+                n=SUGGESTIONS_PER_CYCLE)
+        except Exception as e:
+            self.last_debug += f" | prompt err: {e}"
+            return
+
+        raw = await gemini_mod._call(
+            f"{SUGGEST_TOPICS_SYSTEM}\n\n---\n\n{user}", json_mode=True)
         if self.paused:
             return
         if not raw:
             self.last_debug += " | expand: no response"
             return
 
-        data = _robust_json(raw)
-        subtopics = data.get("subtopics", []) if isinstance(data, dict) else []
-        if not isinstance(subtopics, list):
-            subtopics = []
+        data = _safe_json(raw)
+        items = _extract_subtopics(data)
+        if not items:
+            self.last_debug += " | expand: 0 parsed"
+            return
 
         added = 0
-        for item in subtopics[:SUGGESTIONS_PER_CYCLE]:
-            if isinstance(item, dict):
-                t = (item.get("topic") or "").strip()
-                c = (item.get("category") or parent_category).strip()
-            elif isinstance(item, str):
-                t = item.strip()
+        for t, c in items[:SUGGESTIONS_PER_CYCLE]:
+            if c not in ALLOWED_CATEGORIES:
                 c = parent_category
-            else:
-                continue
             if add_pending_topic(t, c, source="ai",
                                  parent_topic=parent_topic):
                 added += 1
-
-        if added:
-            self.last_debug += f" | +{added} queued"
-        else:
-            self.last_debug += " | expand: 0 new"
+        self.last_debug += f" | +{added} queued"
 
     async def _refine_one(self):
         if self.paused:
