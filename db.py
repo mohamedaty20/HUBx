@@ -1,5 +1,5 @@
 # db.py
-# Turso with automatic local-SQLite fallback. Sanitizes legacy rows on boot.
+# Turso with local-SQLite fallback. Adds pending_topics queue for growth.
 
 import os
 import json
@@ -57,26 +57,18 @@ def get_conn():
     global _conn, _db_mode, _db_error
     if _conn is not None:
         return _conn
-
-    print("=== HUBx DB init ===")
-    print(f"URL env var name  = {_URL_KEY!r} (len={len(_TURSO_URL_RAW)})")
-    print(f"TOKEN env var name= {_TOKEN_KEY!r} (len={len(_TURSO_TOKEN_RAW)})")
-
     try:
         _conn = _try_turso()
         _db_mode = "turso"
         _db_error = ""
         print(f"DB MODE = turso ({_TURSO_URL_RAW[:40]}...)")
-        print("====================")
         return _conn
     except Exception as e:
         _db_error = f"{type(e).__name__}: {e}"
         print(f"Turso failed: {_db_error}")
-
     _conn = libsql.connect("hubx.db")
     _db_mode = "local"
     print("DB MODE = local SQLite")
-    print("====================")
     return _conn
 
 
@@ -86,8 +78,6 @@ def db_health():
         "connection": _TURSO_URL_RAW[:40] if _db_mode == "turso" else "hubx.db",
         "error": _db_error,
         "ok": _db_mode == "turso",
-        "url_key": _URL_KEY or "",
-        "token_key": _TOKEN_KEY or "",
     }
 
 
@@ -104,6 +94,14 @@ def init_db():
         confidence REAL DEFAULT 0.5,
         created_at TEXT,
         updated_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS pending_topics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        topic TEXT UNIQUE,
+        category TEXT,
+        source TEXT,
+        parent_topic TEXT,
+        created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS learning_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,31 +125,9 @@ def init_db():
     );
     """)
     conn.commit()
-    sanitize_existing()
 
 
-def sanitize_existing():
-    """Clean LaTeX garbage from any rows written before the sanitizer."""
-    try:
-        from gemini import sanitize_text
-    except Exception:
-        return
-    conn = get_conn()
-    try:
-        rows = conn.execute(
-            "SELECT id, content, refined_content FROM knowledge").fetchall()
-        for r in rows:
-            kid = r[0]
-            c = sanitize_text(r[1] or "")
-            rc = sanitize_text(r[2] or "")
-            if c != (r[1] or "") or rc != (r[2] or ""):
-                conn.execute(
-                    "UPDATE knowledge SET content=?, refined_content=? "
-                    "WHERE id=?", (c, rc, kid))
-        conn.commit()
-    except Exception as e:
-        logger.warning("sanitize_existing failed: %s", e)
-
+# ---------------- knowledge ----------------
 
 def upsert_knowledge(topic, category, content, confidence=0.5):
     conn = get_conn()
@@ -193,7 +169,7 @@ def oldest_knowledge_for_refinement(limit=1):
     """, (limit,)).fetchall()
 
 
-def get_all_knowledge(category=None, limit=200):
+def get_all_knowledge(category=None, limit=500):
     conn = get_conn()
     if category:
         return conn.execute("""
@@ -221,7 +197,9 @@ def knowledge_stats():
     refined = conn.execute(
         "SELECT COUNT(*) FROM knowledge WHERE refined_content != ''"
     ).fetchone()[0]
-    return {"total": total, "refined": refined}
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM pending_topics").fetchone()[0]
+    return {"total": total, "refined": refined, "pending": pending}
 
 
 def category_counts():
@@ -234,7 +212,6 @@ def category_counts():
 
 
 def confidence_bins():
-    """Return a list of (bin_label, count) for the confidence histogram."""
     conn = get_conn()
     rows = conn.execute(
         "SELECT confidence FROM knowledge WHERE confidence IS NOT NULL"
@@ -263,6 +240,63 @@ def runs_per_cycle(limit=40):
     """, (limit,)).fetchall()[::-1]
 
 
+# ---------------- pending_topics ----------------
+
+def add_pending_topic(topic, category, source="ai", parent_topic=""):
+    """Insert a topic into the pending queue. Ignores duplicates and
+    topics already in the knowledge table."""
+    conn = get_conn()
+    topic = (topic or "").strip()
+    category = (category or "").strip() or "general"
+    if not topic or len(topic) < 6:
+        return False
+    # Skip if already known
+    ex = conn.execute(
+        "SELECT 1 FROM knowledge WHERE topic = ?", (topic,)).fetchone()
+    if ex:
+        return False
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO pending_topics
+            (topic, category, source, parent_topic, created_at)
+            VALUES (?,?,?,?,?)
+        """, (topic, category, source, parent_topic,
+              datetime.datetime.utcnow().isoformat()))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def pop_pending_topic():
+    """Return and remove the oldest pending topic. Returns None if empty."""
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT id, topic, category FROM pending_topics
+        ORDER BY id ASC LIMIT 1
+    """).fetchone()
+    if not row:
+        return None
+    conn.execute("DELETE FROM pending_topics WHERE id = ?", (row[0],))
+    conn.commit()
+    return (row[1], row[2])
+
+
+def pending_count():
+    conn = get_conn()
+    return conn.execute("SELECT COUNT(*) FROM pending_topics").fetchone()[0]
+
+
+def recent_pending(limit=30):
+    conn = get_conn()
+    return conn.execute("""
+        SELECT topic, category, source, parent_topic, created_at
+        FROM pending_topics ORDER BY id DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+
+# ---------------- learning_runs ----------------
+
 def log_learning_run(cycle, topic, added, refined, calls, error=""):
     conn = get_conn()
     conn.execute("""
@@ -282,6 +316,8 @@ def recent_learning_runs(limit=20):
         FROM learning_runs ORDER BY id DESC LIMIT ?
     """, (limit,)).fetchall()
 
+
+# ---------------- check_reports ----------------
 
 def save_check_report(filename, file_type, original_text, issues,
                       score, summary):
