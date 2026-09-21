@@ -1,5 +1,6 @@
 # gemini.py
-# Gemini API wrapper with model fallback and error surfacing.
+# Gemini wrapper. Mirrors the working v1 call pattern:
+# one prompt, no system_instruction (that arg breaks on some models).
 
 import os
 import asyncio
@@ -17,27 +18,13 @@ from prompts import (
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
-# Fallback chain - tries each until one works.
-_PREFERRED = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-MODEL_CANDIDATES = [
-    _PREFERRED,
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
-]
-# Deduplicate while preserving order.
-_seen = set()
-MODEL_CANDIDATES = [m for m in MODEL_CANDIDATES
-                    if not (m in _seen or _seen.add(m))]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Public: last error observed by any call, so UI can show it.
+# Public: last error observed by any call.
 last_error = ""
-_working_model: str | None = None
 
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
@@ -54,90 +41,73 @@ async def _throttle():
         _last_call_time = time.monotonic()
 
 
-def _pick_model():
-    """Return the first model that previously worked, else try all."""
-    if _working_model:
-        return [_working_model]
-    return MODEL_CANDIDATES
+def _extract_text(resp) -> str:
+    """Try every known way to pull text out of a Gemini response."""
+    try:
+        t = resp.text
+        if t:
+            return t.strip()
+    except Exception:
+        pass
+    try:
+        parts = resp.candidates[0].content.parts
+        joined = "".join(getattr(p, "text", "") or "" for p in parts)
+        if joined.strip():
+            return joined.strip()
+    except Exception:
+        pass
+    return ""
 
 
-async def _try_text(model_name: str, system_prompt: str,
-                    user_prompt: str) -> str:
-    model = genai.GenerativeModel(
-        model_name, system_instruction=system_prompt)
-    resp = await asyncio.to_thread(
-        model.generate_content,
-        user_prompt,
-        generation_config=genai.types.GenerationConfig(temperature=0.6),
-    )
-    return (resp.text or "").strip()
-
-
-async def _call_text(system_prompt: str, user_prompt: str) -> str:
-    global last_error, _working_model
+async def _call(prompt: str, json_mode: bool = False) -> str:
+    """
+    Single low-level call. System + user merged into one prompt.
+    Returns raw text, or "" on failure. Sets last_error on failure.
+    """
+    global last_error
     if not GEMINI_API_KEY:
         last_error = "GEMINI_API_KEY not set"
         return ""
 
-    for model_name in _pick_model():
-        for attempt in range(2):
-            await _throttle()
+    cfg_kwargs = {"temperature": 0.4 if json_mode else 0.6}
+    if json_mode:
+        cfg_kwargs["response_mime_type"] = "application/json"
+
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    for attempt in range(3):
+        await _throttle()
+        try:
+            resp = await asyncio.to_thread(
+                model.generate_content,
+                prompt,
+                generation_config=genai.types.GenerationConfig(**cfg_kwargs),
+            )
+            text = _extract_text(resp)
+            if text:
+                last_error = ""
+                return text
+
+            # Empty response — log why.
+            reason = ""
             try:
-                text = await _try_text(model_name, system_prompt, user_prompt)
-                if text:
-                    _working_model = model_name
-                    last_error = ""
-                    return text
-                last_error = f"{model_name}: empty response"
-            except Exception as e:
-                last_error = f"{model_name}: {type(e).__name__}: {e}"
-                logger.warning("Gemini call failed on %s: %s",
-                               model_name, e)
-                await asyncio.sleep(2 ** attempt)
-    logger.error("All Gemini models failed. last_error=%s", last_error)
+                if resp.prompt_feedback:
+                    reason = f"prompt_feedback={resp.prompt_feedback}"
+            except Exception:
+                pass
+            try:
+                if resp.candidates:
+                    finish = getattr(resp.candidates[0], "finish_reason", "")
+                    reason += f" finish_reason={finish}"
+            except Exception:
+                pass
+            last_error = f"empty response ({reason or 'no detail'})"
+            logger.warning("Gemini returned empty. %s", last_error)
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            logger.warning("Gemini call failed (attempt %d): %s",
+                           attempt + 1, e)
+            await asyncio.sleep(2 ** attempt)
     return ""
-
-
-async def _try_json(model_name: str, system_prompt: str,
-                    user_prompt: str) -> dict:
-    import json
-    model = genai.GenerativeModel(
-        model_name, system_instruction=system_prompt)
-    resp = await asyncio.to_thread(
-        model.generate_content,
-        user_prompt,
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.4,
-            response_mime_type="application/json",
-        ),
-    )
-    raw = (resp.text or "").strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
-    return json.loads(raw)
-
-
-async def _call_json(system_prompt: str, user_prompt: str) -> dict:
-    global last_error, _working_model
-    if not GEMINI_API_KEY:
-        last_error = "GEMINI_API_KEY not set"
-        return {}
-
-    for model_name in _pick_model():
-        for attempt in range(2):
-            await _throttle()
-            try:
-                result = await _try_json(model_name, system_prompt, user_prompt)
-                if isinstance(result, dict):
-                    _working_model = model_name
-                    last_error = ""
-                    return result
-            except Exception as e:
-                last_error = f"{model_name}: {type(e).__name__}: {e}"
-                logger.warning("Gemini JSON call failed on %s: %s",
-                               model_name, e)
-                await asyncio.sleep(2 ** attempt)
-    return {}
 
 
 # ---------------------------------------------------------------
@@ -146,18 +116,32 @@ async def _call_json(system_prompt: str, user_prompt: str) -> dict:
 
 async def generate_knowledge(topic: str, category: str) -> str:
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
-    return await _call_text(KNOWLEDGE_SYSTEM_PROMPT, user)
+    prompt = f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}"
+    return await _call(prompt, json_mode=False)
 
 
 async def refine_knowledge(topic: str, existing: str) -> str:
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:4000])
-    return await _call_text(REFINE_SYSTEM_PROMPT, user)
+    prompt = f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}"
+    return await _call(prompt, json_mode=False)
 
 
 async def check_document(filename: str, file_type: str, text: str) -> dict:
+    import json
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
-    result = await _call_json(CHECKER_SYSTEM_PROMPT, user)
+    prompt = f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}"
+    raw = await _call(prompt, json_mode=True)
+    if not raw:
+        return {}
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+        result = json.loads(raw)
+    except Exception as e:
+        last_error_msg = f"JSON parse failed: {e}"
+        logger.warning(last_error_msg)
+        return {}
     if not isinstance(result, dict):
         return {}
     result.setdefault("score", 0.0)
@@ -167,28 +151,25 @@ async def check_document(filename: str, file_type: str, text: str) -> dict:
 
 
 async def ocr_image(path: str) -> str:
-    global last_error, _working_model
+    global last_error
     if not GEMINI_API_KEY:
+        last_error = "GEMINI_API_KEY not set"
         return ""
     try:
         from PIL import Image
         img = Image.open(path)
-        for model_name in _pick_model():
-            await _throttle()
-            try:
-                model = genai.GenerativeModel(model_name)
-                resp = await asyncio.to_thread(
-                    model.generate_content,
-                    ["Transcribe every word of text in this image. "
-                     "Preserve line breaks. Return plain text only.", img],
-                )
-                text = (resp.text or "").strip()
-                if text:
-                    _working_model = model_name
-                    return text
-            except Exception as e:
-                last_error = f"OCR {model_name}: {e}"
-                continue
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        await _throttle()
+        resp = await asyncio.to_thread(
+            model.generate_content,
+            ["Transcribe every word of text in this image. "
+             "Preserve line breaks. Return plain text only.", img],
+        )
+        text = _extract_text(resp)
+        if text:
+            last_error = ""
+        return text
     except Exception as e:
-        last_error = f"OCR load: {e}"
-    return ""
+        last_error = f"OCR: {e}"
+        logger.error("OCR failed: %s", e)
+        return ""
