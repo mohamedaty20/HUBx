@@ -1,28 +1,70 @@
 # db.py
-# Turso schema + CRUD for the self-learning knowledge store,
-# learning run log, and user check reports.
+# Turso schema + CRUD. Refuses to fall back to a local file on Render,
+# because Render's filesystem is ephemeral and would lose all data.
 
 import os
 import json
 import datetime
+import logging
 from typing import Any
 
 import libsql
 
-TURSO_URL = os.getenv("TURSO_DATABASE_URL", "file:hubx.db")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+logger = logging.getLogger(__name__)
+
+TURSO_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+ON_RENDER = bool(os.getenv("RENDER"))
 
 _conn = None
+_conn_info = "not connected"
 
 
 def get_conn():
-    global _conn
-    if _conn is None:
-        if TURSO_URL.startswith("file:"):
-            _conn = libsql.connect(TURSO_URL.replace("file:", ""))
-        else:
-            _conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+    global _conn, _conn_info
+    if _conn is not None:
+        return _conn
+
+    if TURSO_URL and TURSO_URL.startswith("libsql://"):
+        _conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+        _conn_info = f"turso: {TURSO_URL[:40]}..."
+        logger.info("Connected to Turso: %s", TURSO_URL[:40])
+    elif TURSO_URL and TURSO_URL.startswith("file:"):
+        if ON_RENDER:
+            raise RuntimeError(
+                "TURSO_DATABASE_URL is set to a local file but you are on "
+                "Render. Render's filesystem is ephemeral - all data will "
+                "be lost on every deploy. Set TURSO_DATABASE_URL to your "
+                "libsql:// URL in the Render Environment tab."
+            )
+        _conn = libsql.connect(TURSO_URL.replace("file:", ""))
+        _conn_info = f"local file: {TURSO_URL}"
+    else:
+        if ON_RENDER:
+            raise RuntimeError(
+                "TURSO_DATABASE_URL is not set. Add it to the Render "
+                "Environment tab: TURSO_DATABASE_URL=libsql://..."
+            )
+        _conn = libsql.connect("hubx.db")
+        _conn_info = "local file: hubx.db (dev only)"
     return _conn
+
+
+def db_health() -> dict:
+    """Returns connection info + row counts for the dashboard."""
+    info = {"connection": _conn_info, "ok": False, "error": ""}
+    try:
+        conn = get_conn()
+        info["knowledge"] = conn.execute(
+            "SELECT COUNT(*) FROM knowledge").fetchone()[0]
+        info["runs"] = conn.execute(
+            "SELECT COUNT(*) FROM learning_runs").fetchone()[0]
+        info["checks"] = conn.execute(
+            "SELECT COUNT(*) FROM check_reports").fetchone()[0]
+        info["ok"] = True
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info
 
 
 def init_db():
@@ -106,7 +148,6 @@ def set_refined(knowledge_id: int, refined: str, confidence: float = 0.7):
 
 
 def oldest_knowledge_for_refinement(limit: int = 1):
-    """Return the oldest-updated knowledge rows to refine next."""
     conn = get_conn()
     return conn.execute("""
         SELECT id, topic, category, content, refined_content, version
