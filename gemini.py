@@ -1,6 +1,5 @@
 # gemini.py
-# Gemini wrapper. Mirrors the working v1 call pattern:
-# one prompt, no system_instruction (that arg breaks on some models).
+# Gemini wrapper. Validates and cleans the model name, tries fallbacks.
 
 import os
 import asyncio
@@ -17,14 +16,37 @@ from prompts import (
 
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+
+def _clean_model(v):
+    v = (v or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    # If the value is literally the env var name, it's a config error.
+    if v.upper() in ("GEMINI_MODEL", "MODEL", ""):
+        return ""
+    # Strip a leading "models/" if present.
+    if v.startswith("models/"):
+        v = v[len("models/"):]
+    # Must start with "gemini-"
+    if not v.startswith("gemini-"):
+        return ""
+    return v
+
+
+_preferred = _clean_model(os.getenv("GEMINI_MODEL", ""))
+MODEL_CANDIDATES = []
+for m in [_preferred, "gemini-2.0-flash", "gemini-2.0-flash-lite",
+          "gemini-2.5-flash", "gemini-1.5-flash"]:
+    if m and m not in MODEL_CANDIDATES:
+        MODEL_CANDIDATES.append(m)
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Public: last error observed by any call.
 last_error = ""
+_working_model = None
 
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
@@ -41,8 +63,7 @@ async def _throttle():
         _last_call_time = time.monotonic()
 
 
-def _extract_text(resp) -> str:
-    """Try every known way to pull text out of a Gemini response."""
+def _extract_text(resp):
     try:
         t = resp.text
         if t:
@@ -59,54 +80,43 @@ def _extract_text(resp) -> str:
     return ""
 
 
-async def _call(prompt: str, json_mode: bool = False) -> str:
-    """
-    Single low-level call. System + user merged into one prompt.
-    Returns raw text, or "" on failure. Sets last_error on failure.
-    """
-    global last_error
+async def _try_once(model_name, prompt, json_mode):
+    kwargs = {"temperature": 0.4 if json_mode else 0.6}
+    if json_mode:
+        kwargs["response_mime_type"] = "application/json"
+    model = genai.GenerativeModel(model_name)
+    resp = await asyncio.to_thread(
+        model.generate_content,
+        prompt,
+        generation_config=genai.types.GenerationConfig(**kwargs),
+    )
+    return _extract_text(resp)
+
+
+async def _call(prompt, json_mode=False):
+    global last_error, _working_model
     if not GEMINI_API_KEY:
         last_error = "GEMINI_API_KEY not set"
         return ""
 
-    cfg_kwargs = {"temperature": 0.4 if json_mode else 0.6}
-    if json_mode:
-        cfg_kwargs["response_mime_type"] = "application/json"
+    models_to_try = [_working_model] if _working_model else MODEL_CANDIDATES
 
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    for attempt in range(3):
-        await _throttle()
-        try:
-            resp = await asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config=genai.types.GenerationConfig(**cfg_kwargs),
-            )
-            text = _extract_text(resp)
-            if text:
-                last_error = ""
-                return text
-
-            # Empty response — log why.
-            reason = ""
+    for model_name in models_to_try:
+        for attempt in range(2):
+            await _throttle()
             try:
-                if resp.prompt_feedback:
-                    reason = f"prompt_feedback={resp.prompt_feedback}"
-            except Exception:
-                pass
-            try:
-                if resp.candidates:
-                    finish = getattr(resp.candidates[0], "finish_reason", "")
-                    reason += f" finish_reason={finish}"
-            except Exception:
-                pass
-            last_error = f"empty response ({reason or 'no detail'})"
-            logger.warning("Gemini returned empty. %s", last_error)
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
-            logger.warning("Gemini call failed (attempt %d): %s",
-                           attempt + 1, e)
-            await asyncio.sleep(2 ** attempt)
+                text = await _try_once(model_name, prompt, json_mode)
+                if text:
+                    _working_model = model_name
+                    last_error = ""
+                    return text
+                last_error = f"{model_name}: empty response"
+            except Exception as e:
+                last_error = f"{model_name}: {type(e).__name__}: {e}"
+                logger.warning("Gemini call failed on %s: %s",
+                               model_name, e)
+                await asyncio.sleep(2 ** attempt)
+    logger.error("All models failed. last_error=%s", last_error)
     return ""
 
 
@@ -114,33 +124,31 @@ async def _call(prompt: str, json_mode: bool = False) -> str:
 # Public API
 # ---------------------------------------------------------------
 
-async def generate_knowledge(topic: str, category: str) -> str:
+async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
-    prompt = f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}"
-    return await _call(prompt, json_mode=False)
+    return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
+                       json_mode=False)
 
 
-async def refine_knowledge(topic: str, existing: str) -> str:
+async def refine_knowledge(topic, existing):
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:4000])
-    prompt = f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}"
-    return await _call(prompt, json_mode=False)
+    return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
+                       json_mode=False)
 
 
-async def check_document(filename: str, file_type: str, text: str) -> dict:
+async def check_document(filename, file_type, text):
     import json
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
-    prompt = f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}"
-    raw = await _call(prompt, json_mode=True)
+    raw = await _call(f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}",
+                      json_mode=True)
     if not raw:
         return {}
     try:
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
         result = json.loads(raw)
-    except Exception as e:
-        last_error_msg = f"JSON parse failed: {e}"
-        logger.warning(last_error_msg)
+    except Exception:
         return {}
     if not isinstance(result, dict):
         return {}
@@ -150,26 +158,30 @@ async def check_document(filename: str, file_type: str, text: str) -> dict:
     return result
 
 
-async def ocr_image(path: str) -> str:
-    global last_error
+async def ocr_image(path):
+    global last_error, _working_model
     if not GEMINI_API_KEY:
-        last_error = "GEMINI_API_KEY not set"
         return ""
     try:
         from PIL import Image
         img = Image.open(path)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        await _throttle()
-        resp = await asyncio.to_thread(
-            model.generate_content,
-            ["Transcribe every word of text in this image. "
-             "Preserve line breaks. Return plain text only.", img],
-        )
-        text = _extract_text(resp)
-        if text:
-            last_error = ""
-        return text
+        models = [_working_model] if _working_model else MODEL_CANDIDATES
+        for model_name in models:
+            await _throttle()
+            try:
+                model = genai.GenerativeModel(model_name)
+                resp = await asyncio.to_thread(
+                    model.generate_content,
+                    ["Transcribe every word of text in this image. "
+                     "Preserve line breaks. Return plain text only.", img],
+                )
+                t = _extract_text(resp)
+                if t:
+                    _working_model = model_name
+                    return t
+            except Exception as e:
+                last_error = f"OCR {model_name}: {e}"
+                continue
     except Exception as e:
-        last_error = f"OCR: {e}"
-        logger.error("OCR failed: %s", e)
-        return ""
+        last_error = f"OCR load: {e}"
+    return ""
