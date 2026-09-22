@@ -1,6 +1,6 @@
 # gemini.py
-# v14: no purge on boot (counter persists). Slower calls. Smaller output.
-#      Two calls share one throttle lock so token budget fits.
+# v15: max_tokens 4000 for bilingual output. No purge on boot.
+#      120s pacing to fit Groq's TPM wall.
 
 import os
 import re
@@ -29,10 +29,10 @@ MODEL = "openai/gpt-oss-120b"
 GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "600"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "40"))
 _QUOTA_BLOCK_SECONDS = 240
-ATTEMPT_TIMEOUT_SECONDS = 120
+ATTEMPT_TIMEOUT_SECONDS = 180
 
-# 120s between calls = 0.5 calls per minute. Safely under the TPM wall.
-MIN_CALL_GAP = 120.0
+# Bilingual output needs longer calls. 180s between calls.
+MIN_CALL_GAP = 180.0
 
 _quota_block_until = 0.0
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
@@ -45,8 +45,7 @@ last_error = ""
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 
-# NO purge on boot. The counter in Turso is the source of truth and
-# survives every deploy.
+# NO purge on boot. The counter persists across deploys.
 
 
 _LATEX_SIMPLE = [
@@ -99,7 +98,7 @@ async def _throttle():
         now = time.monotonic()
         wait = MIN_CALL_GAP - (now - _last_call_time)
         if wait > 0:
-            wait += random.uniform(0, 2.0)
+            wait += random.uniform(0, 3.0)
             await asyncio.sleep(wait)
         _last_call_time = time.monotonic()
 
@@ -108,10 +107,10 @@ def _is_quota_error(err_str):
     s = (err_str or "").lower()
     return ("429" in s or "quota" in s or "rate limit" in s
             or "too many requests" in s or "exceeded" in s
-            or "tokens" in s and "limit" in s)
+            or ("tokens" in s and "limit" in s))
 
 
-async def _call(prompt, json_mode=False, max_tokens=1500, max_retries=2):
+async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
     global last_error, _quota_block_until
 
     if not _client:
@@ -164,7 +163,8 @@ async def _call(prompt, json_mode=False, max_tokens=1500, max_retries=2):
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
                 _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
-                last_error = f"{MODEL}: Groq 429, cooling {_QUOTA_BLOCK_SECONDS}s"
+                last_error = (f"{MODEL}: Groq 429, cooling "
+                              f"{_QUOTA_BLOCK_SECONDS}s")
                 logger.warning(last_error)
                 return ""
             last_error = f"{MODEL}: {err_str}"
@@ -176,39 +176,43 @@ async def _call(prompt, json_mode=False, max_tokens=1500, max_retries=2):
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=1500)
+                       json_mode=False, max_tokens=4000)
 
 
 async def refine_knowledge(topic, existing):
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:6000])
     return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=1500)
+                       json_mode=False, max_tokens=4000)
 
 
 async def generate_template(name, category):
     user = TEMPLATE_USER_TEMPLATE.format(name=name, category=category)
     return await _call(f"{TEMPLATE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=1500)
+                       json_mode=False, max_tokens=4000)
 
 
 async def refine_template(name, existing):
     return await _call(
-        "Improve the following construction template. Keep bilingual "
-        "headers. Sample Filled Example must be a markdown table with "
-        "columns Field and Sample Value. No LaTeX, no \\square, no "
+        "Improve the following construction template. Keep it FULLY "
+        "BILINGUAL: every paragraph, bullet, and table cell in English "
+        "AND Arabic. Sample Filled Example MUST be a markdown table "
+        "with columns Field | Sample Value, each cell bilingual using "
+        "<br> between English and Arabic. No LaTeX, no \\square, no "
         "\\(...\\).\n\n---\n\n"
         f"Template: {name}\n\n{existing[:6000]}",
-        json_mode=False, max_tokens=1500)
+        json_mode=False, max_tokens=4000)
 
 
 async def suggest_subtopics(parent_topic, category, n=3):
     prompt = (
         f"Propose {n} new specific sub-topics within category "
         f"'{category}', inspired by: {parent_topic}. "
-        "6-14 words each. "
+        "Each topic string must be bilingual in the form "
+        "'English Title / العنوان بالعربية'. 6-14 words for the English "
+        "part. "
         'Return ONLY JSON: {"subtopics": ["...", "..."]}'
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=350)
+    raw = await _call(prompt, json_mode=True, max_tokens=500)
     if not raw:
         return []
     try:
@@ -232,10 +236,12 @@ async def suggest_subtemplates(parent_name, category, n=3):
     prompt = (
         f"Propose {n} new specific template names within category "
         f"'{category}', inspired by: {parent_name}. "
-        "6-14 words each. Bilingual. "
+        "Each name string must be bilingual in the form "
+        "'English Name / الاسم بالعربية'. 6-14 words for the English "
+        "part. "
         'Return ONLY JSON: {"templates": ["...", "..."]}'
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=350)
+    raw = await _call(prompt, json_mode=True, max_tokens=500)
     if not raw:
         return []
     try:
@@ -259,7 +265,7 @@ async def check_document(filename, file_type, text):
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
     raw = await _call(f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                      json_mode=True, max_tokens=2500)
+                      json_mode=True, max_tokens=3000)
     if not raw:
         return {}
     try:
@@ -293,7 +299,7 @@ async def ai_search(question, knowledge_context):
         f"=== EXCERPTS ===\n{knowledge_context}\n\n"
         f"=== QUESTION ===\n{question}\n"
     )
-    return await _call(prompt, json_mode=False, max_tokens=1200)
+    return await _call(prompt, json_mode=False, max_tokens=1500)
 
 
 async def ocr_image(path):
