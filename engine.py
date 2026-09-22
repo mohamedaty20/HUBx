@@ -1,10 +1,10 @@
 # engine.py
-# v6: don't waste Gemini calls. Skip suggest if generation failed.
-#     Only ask for fresh parent topic when queue is truly empty.
+# v7: honours focus mode + focus categories read from db.app_state.
 
 from __future__ import annotations
 import asyncio
 import inspect
+import json as _json
 import traceback
 
 from gemini import (
@@ -60,6 +60,24 @@ _ADD_TOPIC      = _find("add_pending_topic")
 _ADD_TEMPLATE   = _find("add_pending_template")
 _PENDING_COUNT  = _find("pending_count")
 _PENDING_TPL    = _find("pending_template_count")
+
+
+def _read_focus_state():
+    """Reads focus mode and category filter from db.app_state."""
+    try:
+        mode = _db.get_app_state("focus_mode", "both") or "both"
+        raw = _db.get_app_state("focus_categories", "") or ""
+        cats = []
+        if raw:
+            try:
+                parsed = _json.loads(raw)
+                if isinstance(parsed, list):
+                    cats = [str(x) for x in parsed]
+            except Exception:
+                cats = []
+        return mode, set(cats)
+    except Exception:
+        return "both", set()
 
 
 def _call_adapt(fn, *args, **kwargs):
@@ -223,9 +241,13 @@ class Engine:
         async with self._lock:
             self.last_status = "running"
 
-            if STATE.run_knowledge:
+            mode, focus_cats = _read_focus_state()
+            run_knowledge = mode in ("knowledge", "both")
+            run_templates = mode in ("templates", "both")
+
+            if run_knowledge:
                 try:
-                    await self._knowledge_step()
+                    await self._knowledge_step(focus_cats)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -233,9 +255,9 @@ class Engine:
                     self.last_debug = f"knowledge error: {e}"
                     print(f"[engine] knowledge step failed: {e}")
 
-            if STATE.run_templates:
+            if run_templates:
                 try:
-                    await self._template_step()
+                    await self._template_step(focus_cats)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -245,10 +267,11 @@ class Engine:
 
             self.ai_calls = self.gemini_calls
 
-    async def _knowledge_step(self):
+    async def _knowledge_step(self, focus_cats=None):
+        focus_cats = focus_cats or set()
         topic = category = None
 
-        for _ in range(15):
+        for _ in range(20):
             item = None
             if _POP_TOPIC:
                 try:
@@ -264,14 +287,16 @@ class Engine:
                 t, c = SEED_TOPICS[self._k_idx % len(SEED_TOPICS)]
                 self._k_idx += 1
 
+            # Category filter for focused mode
+            if focus_cats and c not in focus_cats:
+                continue
+
             if _existing_knowledge(t):
                 continue
 
             topic, category = t, c
             break
 
-        # Only ask Gemini for a fresh parent topic when the queue AND
-        # the seed list are exhausted. Otherwise it's a wasted call.
         if not topic:
             queue_empty = True
             if _PENDING_COUNT:
@@ -280,7 +305,7 @@ class Engine:
                 except Exception:
                     queue_empty = True
             if not queue_empty:
-                self.last_debug = "no new knowledge topics in queue"
+                self.last_debug = "no matching topics in queue"
                 return
             try:
                 subs = await suggest_subtopics(
@@ -303,8 +328,6 @@ class Engine:
         content = await generate_knowledge(topic, category)
         self.gemini_calls += 1
         if not content:
-            # Failed (429 or empty). Do NOT call suggest - it would just
-            # burn another call on the same blocked quota.
             self.last_debug = f"failed (quota or empty): {topic}"
             _save_lrun(self.cycles, topic, 0, 0, 1, "gemini empty")
             return
@@ -313,7 +336,6 @@ class Engine:
         self.last_debug = f"generated: {topic}"
         _save_lrun(self.cycles, topic, 1, 0, 1, "")
 
-        # expand only after a successful generation
         try:
             subs = await suggest_subtopics(
                 topic, category, n=int(SUGGESTIONS_PER_CYCLE or 3))
@@ -327,10 +349,11 @@ class Engine:
         except Exception as e:
             print(f"[engine] suggest_subtopics failed: {e}")
 
-    async def _template_step(self):
+    async def _template_step(self, focus_cats=None):
+        focus_cats = focus_cats or set()
         name = category = None
 
-        for _ in range(15):
+        for _ in range(20):
             item = None
             if _POP_TEMPLATE:
                 try:
@@ -350,6 +373,9 @@ class Engine:
                 else:
                     t, c = str(seed), "administrative"
 
+            if focus_cats and c not in focus_cats:
+                continue
+
             if _existing_template(t):
                 continue
 
@@ -364,7 +390,7 @@ class Engine:
                 except Exception:
                     queue_empty = True
             if not queue_empty:
-                self.last_debug = "no new templates in queue"
+                self.last_debug = "no matching templates in queue"
                 return
             try:
                 subs = await suggest_subtemplates(
