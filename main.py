@@ -436,7 +436,32 @@ body.lang-ar .hubx-side-btn {
 }
 </style>
 """, shared=True)
+# ---- paper PDF serving (for the Print button) ----
+import uuid
+from fastapi import Response as _FastResponse
 
+_PAPER_CACHE: dict[str, bytes] = {}
+_PAPER_ORDER: list[str] = []
+
+def _cache_paper_pdf(pdf_bytes: bytes) -> str:
+    tok = uuid.uuid4().hex
+    _PAPER_CACHE[tok] = pdf_bytes
+    _PAPER_ORDER.append(tok)
+    while len(_PAPER_ORDER) > 50:
+        old = _PAPER_ORDER.pop(0)
+        _PAPER_CACHE.pop(old, None)
+    return tok
+
+@app.get("/paper/{token}")
+def _serve_paper(token: str):
+    pdf = _PAPER_CACHE.get(token)
+    if not pdf:
+        return _FastResponse(status_code=404, content="not found")
+    return _FastResponse(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{token}.pdf"'},
+    )
 
 async def _keepalive():
     while True:
@@ -720,30 +745,94 @@ def _paper_pdf_bytes(html_str: str, rtl: bool) -> bytes:
         raise
 
 
-def _open_paper_dialog(title: str, category: str, version, body_md: str,
-                       meta: dict | None = None):
-    html = _paper_html(title, category, version, body_md, meta)
-    with ui.dialog() as d, ui.card().classes("hubx-card").style(
-            "max-width:96vw; max-height:96vh; overflow:auto;"):
-        ui.label(t("paper_preview")).classes("text-lg font-bold")
-        # render the paper inline (scrollable)
-        ui.html(html).classes("w-full")
-        with ui.row().classes("justify-end w-full gap-2 mt-2"):
-            def _dl():
-                try:
-                    pdf = _paper_pdf_bytes(html, is_rtl())
-                    tmp = tempfile.NamedTemporaryFile(
-                        delete=False, suffix=".pdf").name
-                    with open(tmp, "wb") as f:
-                        f.write(pdf)
-                    ui.download(tmp, filename=f"hubx_paper_{title[:30]}.pdf")
-                    ui.timer(15.0, lambda: _safe_unlink(tmp), once=True)
-                except Exception as e:
-                    ui.notify(f"PDF failed: {e}", color="negative")
-            ui.button(t("download_pdf"), on_click=_dl).classes(
-                "hubx-btn hubx-btn-danger")
-            ui.button(t("close"), on_click=d.close).classes(
-                "hubx-btn hubx-btn-ghost")
+def _paper_body_html(title: str, category: str, version,
+                     body_md: str, meta: dict | None = None) -> str:
+    """Inner div only — for on-screen preview. No <html>/<head>/<style>."""
+    meta = meta or {}
+    rtl = is_rtl()
+    rtl_cls = " rtl" if rtl else ""
+    today = datetime.utcnow().date().isoformat()
+    body_html = _md_to_html(body_md or "")
+
+    fields = [
+        (t("project_name"), meta.get("project_name") or title),
+        (t("engineer"),     meta.get("engineer") or ""),
+        (t("supervisor"),   meta.get("supervisor") or ""),
+        (t("company"),      meta.get("company") or ""),
+        (t("location"),     meta.get("location") or ""),
+        (t("category"),     category or ""),
+        (t("version"),      f"v{version}" if version is not None else ""),
+        (t("date"),         meta.get("date") or today),
+    ]
+    rows = "".join(
+        f'<tr><td class="lbl">{k}</td>'
+        f'<td class="val">{v or "&nbsp;"}</td></tr>'
+        for k, v in fields
+    )
+
+    return f"""<div class="hubx-paper{rtl_cls}">
+  <div class="cover">
+    <div class="org">{meta.get('company') or 'Egyptian Engineering Co.'}</div>
+    <div class="faculty">{meta.get('location') or 'Egypt'}</div>
+    <div class="rule"></div>
+    <div class="ptitle">{title or ''}</div>
+    <div class="subtitle">{category or 'Civil Engineering Document'}</div>
+  </div>
+  <table class="meta">{rows}</table>
+  <div class="section">
+    <h2>{t('description')}</h2>
+    <div class="body">{body_html}</div>
+  </div>
+  <div class="footer">HUBx · {today}</div>
+</div>"""
+
+
+def _open_paper_dialog(title: str, category: str, version,
+                       body_md: str, meta: dict | None = None):
+    body_div  = _paper_body_html(title, category, version, body_md, meta)
+    full_html = _paper_html(title, category, version, body_md, meta)
+
+    with ui.dialog() as d:
+        with ui.card().classes("hubx-card").style(
+                "max-width:96vw; max-height:96vh; "
+                "overflow:auto; width:auto; padding:16px;"):
+            ui.label(t("paper_preview")).classes("text-lg font-bold mb-2")
+
+            with ui.element("div").style(
+                    "background:#e9edf5; padding:16px; "
+                    "border-radius:10px; overflow:auto;"):
+                ui.html(body_div)
+
+            with ui.row().classes("justify-end w-full gap-2 mt-3"):
+                def _dl():
+                    try:
+                        pdf = _paper_pdf_bytes(full_html, is_rtl())
+                        tmp = tempfile.NamedTemporaryFile(
+                            delete=False, suffix=".pdf").name
+                        with open(tmp, "wb") as f:
+                            f.write(pdf)
+                        ui.download(tmp,
+                                    filename=f"hubx_paper_{title[:30]}.pdf")
+                        ui.timer(15.0, lambda: _safe_unlink(tmp), once=True)
+                    except Exception as e:
+                        ui.notify(f"PDF failed: {e}", color="negative")
+
+                def _print():
+                    try:
+                        pdf = _paper_pdf_bytes(full_html, is_rtl())
+                        token = _cache_paper_pdf(pdf)
+                        ui.run_javascript(
+                            f"window.open('/paper/{token}', '_blank');"
+                        )
+                    except Exception as e:
+                        ui.notify(f"Print failed: {e}", color="negative")
+
+                ui.button("🖨 Print", on_click=_print).classes(
+                    "hubx-btn hubx-btn-primary")
+                ui.button(t("download_pdf"), on_click=_dl).classes(
+                    "hubx-btn hubx-btn-danger")
+                ui.button(t("close"), on_click=d.close).classes(
+                    "hubx-btn hubx-btn-ghost")
     d.open()
 
 
@@ -1344,6 +1433,16 @@ def dashboard_page():
             ui.button(t("one_cycle"), on_click=do_one_cycle).classes(
                 "hubx-btn hubx-btn-primary")
 
+        def _is_paused() -> bool:
+            for attr in ("paused", "is_paused", "_paused"):
+                v = getattr(engine, attr, None)
+                if isinstance(v, bool):
+                    return v
+            running = getattr(engine, "running", None)
+            if isinstance(running, bool):
+                return not running
+            return True
+
         def refresh():
             try:
                 s = engine.stats()
@@ -1352,19 +1451,22 @@ def dashboard_page():
                      "knowledge_refined": 0, "template_total": 0,
                      "pending_topics": 0, "last_status": f"error: {e}",
                      "last_error": str(e), "last_debug": ""}
-            status_badge.text = s["last_status"]
-            status_badge.props(
-                f'color={"green" if not engine.paused else "orange"}')
-            cycles_label.text = str(s["cycles"])
-            gemini_label.text = str(s["gemini_calls"])
-            kb_label.text = str(s["knowledge_total"])
-            refined_label.text = str(s["knowledge_refined"])
-            tpl_label.text = str(s.get("template_total", 0))
-            queue_label.text = str(s.get("pending_topics", 0))
-            debug_label.text = s["last_debug"]
-            gemini_err_label.text = (
-                f"Gemini: {gemini_mod.last_error}"
-                if gemini_mod.last_error else "")
+            try:
+                status_badge.text = s["last_status"]
+                status_badge.props(
+                    f'color={"orange" if _is_paused() else "green"}')
+                cycles_label.text  = str(s["cycles"])
+                gemini_label.text  = str(s["gemini_calls"])
+                kb_label.text      = str(s["knowledge_total"])
+                refined_label.text = str(s["knowledge_refined"])
+                tpl_label.text     = str(s.get("template_total", 0))
+                queue_label.text   = str(s.get("pending_topics", 0))
+                debug_label.text   = s.get("last_debug", "")
+                gemini_err_label.text = (
+                    f"Gemini: {gemini_mod.last_error}"
+                    if gemini_mod.last_error else "")
+            except Exception as ex:
+                print(f"[dashboard refresh] {ex}")
 
         ui.timer(2.0, refresh)
         refresh()
