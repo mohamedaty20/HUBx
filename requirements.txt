@@ -1,4 +1,4 @@
-nicegui>=3.17.0
+nicegui==3.4.1
 libsql
 httpx
 beautifulsoup4
@@ -17,3 +17,4 @@ lxml
 html5lib
 pymupdf
 Pillow
+groq
