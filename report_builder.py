@@ -1,5 +1,5 @@
 # report_builder.py
-# v3: real markdown parser. Tables render as actual tables in PDF and DOCX.
+# v4: strips <br> from all output. PDF tables render as real tables.
 
 import io
 import re
@@ -9,7 +9,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
-                                TableStyle, PageBreak)
+                                TableStyle)
 from reportlab.lib import colors
 
 try:
@@ -20,6 +20,13 @@ except Exception:
 
 _PDF_FONT = _ARABIC_FONT or "Helvetica"
 _PDF_BOLD = (_ARABIC_FONT + "-Bold") if _ARABIC_FONT else "Helvetica-Bold"
+
+_BR_RE = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
+
+
+def _kill_br(s: str) -> str:
+    """Replace any <br> / <br/> / <BR> with a single space."""
+    return _BR_RE.sub(" ", str(s or ""))
 
 
 def _safe(s: Any) -> str:
@@ -46,15 +53,12 @@ def _pdf_styles():
     cell = ParagraphStyle("cell", parent=body, fontSize=9, leading=12,
                           spaceAfter=0)
     cell_hdr = ParagraphStyle("cell_hdr", parent=cell,
-                              fontName=_PDF_BOLD,
-                              textColor=colors.white)
+                              fontName=_PDF_BOLD, textColor=colors.white)
     warn = ParagraphStyle("warn", parent=body, textColor=colors.red)
     ok = ParagraphStyle("ok", parent=body, textColor=colors.green)
     return {"h1": h1, "h2": h2, "h3": h3, "body": body, "li": li,
             "cell": cell, "cell_hdr": cell_hdr, "warn": warn, "ok": ok}
 
-
-# ------------- markdown block parser -------------
 
 _TABLE_SEP_RE = re.compile(r"^[\s|:\-]+$")
 
@@ -74,28 +78,22 @@ def _split_row(line: str):
 
 
 def _parse_md_blocks(text: str):
-    """Yield (kind, payload) blocks.
-    kind ∈ {'h1','h2','h3','p','ul','ol','hr','table'}
-    """
     if not text:
         return
-    lines = text.replace("\r\n", "\n").split("\n")
+    lines = _kill_br(text).replace("\r\n", "\n").split("\n")
     i = 0
     while i < len(lines):
-        raw = lines[i]
-        line = raw.rstrip()
+        line = lines[i].rstrip()
 
         if not line.strip():
             i += 1
             continue
 
-        # Table?
         if _is_table_row(line):
             rows = []
             while i < len(lines) and _is_table_row(lines[i]):
                 rows.append(_split_row(lines[i]))
                 i += 1
-            # drop separator rows (all dashes/colons/spaces)
             clean = []
             for r in rows:
                 if all(_TABLE_SEP_RE.match(c) or c == "" for c in r):
@@ -116,12 +114,10 @@ def _parse_md_blocks(text: str):
         if line.strip() in ("---", "***", "___"):
             yield ("hr", None); i += 1; continue
 
-        # unordered list
         if re.match(r"^\s*[-*]\s+", line):
             items = []
             while i < len(lines):
-                l = lines[i]
-                m = re.match(r"^\s*[-*]\s+(.*)$", l)
+                m = re.match(r"^\s*[-*]\s+(.*)$", lines[i])
                 if not m:
                     break
                 items.append(m.group(1).rstrip())
@@ -129,12 +125,10 @@ def _parse_md_blocks(text: str):
             yield ("ul", items)
             continue
 
-        # ordered list
         if re.match(r"^\s*\d+[.)]\s+", line):
             items = []
             while i < len(lines):
-                l = lines[i]
-                m = re.match(r"^\s*\d+[.)]\s+(.*)$", l)
+                m = re.match(r"^\s*\d+[.)]\s+(.*)$", lines[i])
                 if not m:
                     break
                 items.append(m.group(1).rstrip())
@@ -142,7 +136,6 @@ def _parse_md_blocks(text: str):
             yield ("ol", items)
             continue
 
-        # paragraph (join until blank line or new block)
         para = [line.strip()]
         i += 1
         while i < len(lines):
@@ -160,6 +153,7 @@ def _parse_md_blocks(text: str):
 
 
 def _inline_to_html(s: str) -> str:
+    s = _kill_br(s)
     s = _safe(s)
     s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
     s = re.sub(r"\*(.+?)\*", r"<i>\1</i>", s)
@@ -178,19 +172,17 @@ def _shape_pdf(s):
 
 
 def _P_pdf(text, style):
-    """Arabic-aware Paragraph."""
-    shaped = _shape_pdf(str(text or ""))
+    shaped = _shape_pdf(_kill_br(str(text or "")))
     return Paragraph(_inline_to_html(shaped), style)
 
 
 def _strip_md(s: str) -> str:
-    s = re.sub(r"\*\*(.+?)\*\*", r"\1", str(s or ""))
+    s = _kill_br(s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
     s = re.sub(r"\*(.+?)\*", r"\1", s)
     s = re.sub(r"`(.+?)`", r"\1", s)
     return s
 
-
-# ------------- TXT -------------
 
 def _blocks_to_txt(blocks):
     out = []
@@ -216,8 +208,6 @@ def _blocks_to_txt(blocks):
             out.append("-" * 40)
     return "\n".join(out)
 
-
-# ------------- PDF -------------
 
 def _blocks_to_pdf(blocks, styles):
     flow = []
@@ -272,10 +262,8 @@ def _blocks_to_pdf(blocks, styles):
     return flow
 
 
-# ------------- DOCX -------------
-
 def _blocks_to_docx(blocks, doc):
-    from docx.shared import Pt, RGBColor
+    from docx.shared import RGBColor
     for kind, payload in blocks:
         if kind == "h1":
             doc.add_heading(_strip_md(payload), level=0)
@@ -313,21 +301,19 @@ def _blocks_to_docx(blocks, doc):
             doc.add_paragraph("")
 
 
-# ------------- public APIs -------------
-
 def build_txt(filename: str, result: dict) -> bytes:
     lines = [f"HUBx Report - {filename}", "=" * 60,
              f"Score: {result.get('score', 0.0)}", "",
-             "Summary:", result.get("summary", ""), ""]
+             "Summary:", _kill_br(result.get("summary", "")), ""]
     issues = result.get("issues", []) or []
     lines.append(f"Issues found: {len(issues)}")
     lines.append("-" * 60)
     for i, issue in enumerate(issues, 1):
         lines.append(f"\n[{i}] {issue.get('severity', '').upper()}")
-        lines.append(f"Location:  {issue.get('location', '')}")
-        lines.append(f"Problem:   {issue.get('problem', '')}")
-        lines.append(f"Fix:       {issue.get('fix', '')}")
-        lines.append(f"Reference: {issue.get('reference', '')}")
+        lines.append(f"Location:  {_kill_br(issue.get('location', ''))}")
+        lines.append(f"Problem:   {_kill_br(issue.get('problem', ''))}")
+        lines.append(f"Fix:       {_kill_br(issue.get('fix', ''))}")
+        lines.append(f"Reference: {_kill_br(issue.get('reference', ''))}")
     return "\n".join(lines).encode("utf-8")
 
 
@@ -381,16 +367,16 @@ def build_xlsx(filename: str, result: dict) -> bytes:
     ws.append(["Field", "Value"])
     ws.append(["File", filename])
     ws.append(["Score", result.get("score", 0.0)])
-    ws.append(["Summary", result.get("summary", "")])
+    ws.append(["Summary", _kill_br(result.get("summary", ""))])
     ws2 = wb.create_sheet("Issues")
     ws2.append(["#", "Severity", "Location", "Problem", "Fix", "Reference"])
     for i, issue in enumerate(result.get("issues", []) or [], 1):
         ws2.append([i,
-                    issue.get("severity", ""),
-                    issue.get("location", ""),
-                    issue.get("problem", ""),
-                    issue.get("fix", ""),
-                    issue.get("reference", "")])
+                    _kill_br(issue.get("severity", "")),
+                    _kill_br(issue.get("location", "")),
+                    _kill_br(issue.get("problem", "")),
+                    _kill_br(issue.get("fix", "")),
+                    _kill_br(issue.get("reference", ""))])
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
