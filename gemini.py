@@ -1,6 +1,5 @@
 # gemini.py
-# v5: per-attempt timeout on Gemini calls so a network stall can't
-#     freeze the whole learning cycle.
+# v6: 180s attempt timeout, no retry on timeout (preserves quota).
 
 import os
 import re
@@ -31,9 +30,9 @@ GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "400"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "30"))
 _QUOTA_BLOCK_SECONDS = 300
 
-# Hard timeout for a single Gemini attempt. Prevents a hung network
-# connection from blocking the entire cycle.
-ATTEMPT_TIMEOUT_SECONDS = 90
+# Hard timeout per Gemini attempt. 180s is enough for the largest notes
+# (1200-1800 words) on the free tier, while still bounding a real hang.
+ATTEMPT_TIMEOUT_SECONDS = 180
 
 _quota_block_until = 0.0
 
@@ -175,8 +174,6 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
 
         await _throttle()
         try:
-            # Hard timeout per attempt so a hung socket cannot block
-            # the whole learning cycle.
             resp = await asyncio.wait_for(
                 asyncio.to_thread(
                     model.generate_content,
@@ -194,8 +191,10 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
             last_error = (f"{MODEL}: attempt {attempt + 1}/{max_retries} "
                           f"timed out after {ATTEMPT_TIMEOUT_SECONDS}s")
             logger.warning(last_error)
-            await asyncio.sleep(2)
-            continue
+            # Do NOT retry on timeout: the model is slow, not broken.
+            # Retrying burns quota for the same result. Return empty so
+            # the engine moves on and tries a different topic next cycle.
+            return ""
         except Exception as e:
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
