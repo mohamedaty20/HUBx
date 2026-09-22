@@ -1,6 +1,6 @@
 # main.py
-# v12: focus subcategories. When focus != "both", engine filters topics
-#      by the chosen category list.
+# v13: focus selector uses buttons (works on mobile). Focus dialog built
+#      once per page instead of on-the-fly.
 
 import os
 import io
@@ -56,9 +56,9 @@ STRINGS = {
         "nav_check": "Check", "nav_knowledge": "Knowledge",
         "nav_templates": "Templates", "nav_charts": "Charts",
         "nav_dashboard": "Dashboard",
-        "focus_label": "AI Focus", "focus_knowledge": "Knowledge",
-        "focus_templates": "Templates", "focus_both": "Both",
-        "edit_cats": "Categories",
+        "focus_label": "AI Focus",
+        "focus_knowledge": "Knowledge", "focus_templates": "Templates",
+        "focus_both": "Both", "edit_cats": "Categories",
         "check_title": "Engineering Document Review",
         "check_sub": ("Upload a PDF, TXT, XLSX, PNG or JPG. Press Analyze "
                       "to run the AI compliance check against Egyptian codes."),
@@ -86,7 +86,7 @@ STRINGS = {
         "dash_title": "Learning Dashboard",
         "start": "Start learning", "pause": "Pause",
         "one_cycle": "Run one cycle now",
-        "cycles": "Cycles", "gemini_calls": "Gemini Calls",
+        "cycles": "Cycles", "gemini_calls": "AI Calls",
         "knowledge_stat": "Knowledge", "refined_stat": "Refined",
         "templates_stat": "Templates", "queue_stat": "Queue",
         "recent_runs": "Recent learning runs",
@@ -101,17 +101,19 @@ STRINGS = {
         "no_selection": "Tap ☰ to pick a topic.",
         "verify": "✔ Verified", "flag": "✖ Flag",
         "verified_badge": "✓ VERIFIED", "flagged_badge": "✖ FLAGGED",
+        "select_all": "Select All", "clear_all": "Clear",
+        "save": "Save",
     },
     "ar": {
         "brand": "HUBx",
         "nav_check": "الفحص", "nav_knowledge": "المعرفة",
         "nav_templates": "القوالب", "nav_charts": "الرسوم",
         "nav_dashboard": "لوحة التحكم",
-        "focus_label": "تركيز الذكاء", "focus_knowledge": "المعرفة",
-        "focus_templates": "القوالب", "focus_both": "الاثنان",
-        "edit_cats": "الفئات",
+        "focus_label": "تركيز الذكاء",
+        "focus_knowledge": "المعرفة", "focus_templates": "القوالب",
+        "focus_both": "الاثنان", "edit_cats": "الفئات",
         "check_title": "مراجعة المستندات الهندسية",
-        "check_sub": ("ارفع ملف PDF أو TXT أو XLSX أو صورة."),
+        "check_sub": "ارفع ملف PDF أو TXT أو XLSX أو صورة.",
         "step1": "١. رفع الملف", "no_file": "لم يتم رفع ملف",
         "step2": "٢. التحليل حسب الكود المصري",
         "analyze_now": "تحليل الآن", "step3": "٣. النتيجة",
@@ -134,7 +136,7 @@ STRINGS = {
         "dash_title": "لوحة التعلم",
         "start": "ابدأ التعلم", "pause": "إيقاف",
         "one_cycle": "دورة واحدة الآن",
-        "cycles": "الدورات", "gemini_calls": "استدعاءات Gemini",
+        "cycles": "الدورات", "gemini_calls": "استدعاءات الذكاء",
         "knowledge_stat": "المعرفة", "refined_stat": "مُحسَّن",
         "templates_stat": "القوالب", "queue_stat": "بالانتظار",
         "recent_runs": "آخر دورات التعلم",
@@ -149,6 +151,8 @@ STRINGS = {
         "no_selection": "اضغط ☰ لاختيار موضوع.",
         "verify": "✔ موثّق", "flag": "✖ علامة",
         "verified_badge": "✓ موثّق", "flagged_badge": "✖ معلَّم",
+        "select_all": "الكل", "clear_all": "مسح",
+        "save": "حفظ",
     },
 }
 
@@ -204,6 +208,22 @@ body, .q-page, .nicegui-content {
 .hubx-nav a:hover {
     color: var(--hubx-text) !important;
     background: rgba(79,140,255,0.12);
+}
+.hubx-focus-btn {
+    min-height: 30px !important;
+    padding: 4px 12px !important;
+    font-weight: 600 !important;
+    font-size: 0.78rem !important;
+    text-transform: none !important;
+    border-radius: 6px !important;
+    background: transparent !important;
+    border: 1px solid var(--hubx-border) !important;
+    color: var(--hubx-text-dim) !important;
+}
+.hubx-focus-btn.active {
+    background: var(--hubx-primary) !important;
+    color: white !important;
+    border-color: var(--hubx-primary) !important;
 }
 .hubx-lang-btn {
     min-width: 40px !important; min-height: 32px !important;
@@ -389,6 +409,8 @@ body.lang-ar .hubx-drawer-btn {
                   font-size: 0.72rem !important;
                   flex: 1 1 auto !important;
                   text-align: center !important; }
+    .hubx-focus-btn { font-size: 0.7rem !important;
+                      padding: 3px 8px !important; }
     .hubx-lang-btn { min-width: 32px !important;
                      min-height: 28px !important;
                      padding: 2px 6px !important;
@@ -492,74 +514,6 @@ def _save_focus_categories(mode: str, chosen: list):
     except Exception as e:
         print(f"[focus] save to db failed: {e}")
 
-def _open_focus_categories_dialog(mode: str):
-    if mode == "knowledge":
-        cats = list(KNOWLEDGE_CATEGORIES)
-    elif mode == "templates":
-        cats = list(TEMPLATE_CATEGORIES)
-    else:
-        return
-
-    current = set(_get_focus_categories())
-    selection = {c: (c in current) for c in cats}
-
-    with ui.dialog() as d:
-        with ui.card().classes("hubx-card").style(
-                "max-width:92vw; max-height:92vh; overflow:auto;"):
-            ui.label(f"Focus categories — {mode.title()}").classes(
-                "text-lg font-bold mb-2")
-            ui.label("Pick which subcategories the engine should learn. "
-                     "Leave all unchecked to mean 'all'.").classes(
-                "text-xs mb-3").style("color:var(--hubx-text-dim)")
-
-            cbs = {}
-            for c in cats:
-                cb = ui.checkbox(c, value=selection[c])
-                def _on_change(e, cc=c):
-                    selection[cc] = bool(e.value)
-                cb.on_change(_on_change)
-                cbs[c] = cb
-
-            def select_all():
-                for c in cats:
-                    cbs[c].value = True
-                    selection[c] = True
-
-            def clear_all():
-                for c in cats:
-                    cbs[c].value = False
-                    selection[c] = False
-
-            def save():
-                chosen = [c for c in cats if selection[c]]
-                _save_focus_categories(mode, chosen)
-                ui.notify(
-                    f"{len(chosen)} categories selected" if chosen
-                    else "All categories (no filter)",
-                    color="primary")
-                d.close()
-
-            with ui.row().classes("gap-2 mt-3 flex-wrap"):
-                ui.button("Select All", on_click=select_all).classes(
-                    "hubx-btn hubx-btn-accent")
-                ui.button("Clear", on_click=clear_all).classes(
-                    "hubx-btn hubx-btn-ghost")
-                ui.button("Save", on_click=save).classes(
-                    "hubx-btn hubx-btn-primary")
-    d.open()
-
-def set_focus(mode: str):
-    STATE.focus = mode
-    app.storage.user["focus"] = mode
-    try:
-        set_app_state("focus_mode", mode)
-    except Exception:
-        pass
-    if mode == "both":
-        _save_focus_categories("both", [])
-        ui.notify(f"{t('focus_label')}: {mode}", color="primary")
-    else:
-        _open_focus_categories_dialog(mode)
 
 def _lang_toggle():
     with ui.row().classes("gap-1 items-center"):
@@ -568,29 +522,102 @@ def _lang_toggle():
         ui.button("EN", on_click=lambda: set_lang("en")).classes(cls_en)
         ui.button("ع",  on_click=lambda: set_lang("ar")).classes(cls_ar)
 
-def _focus_selector():
-    with ui.row().classes("gap-2 items-center flex-wrap"):
-        ui.label(t("focus_label")).style(
-            "color:var(--hubx-text-dim);font-size:0.82rem")
-        ui.toggle(
-            {"knowledge": t("focus_knowledge"),
-             "templates": t("focus_templates"),
-             "both":      t("focus_both")},
-            value=STATE.focus,
-            on_change=lambda e: set_focus(e.value),
-        ).props("dense")
-        if STATE.focus in ("knowledge", "templates"):
-            ui.button(t("edit_cats"),
-                      on_click=lambda: _open_focus_categories_dialog(
-                          STATE.focus)
-                      ).classes("hubx-btn hubx-btn-ghost")
 
 def _header():
+    # Build the focus dialog ONCE per page (bound to this client).
+    focus_dlg = ui.dialog().props("persistent")
+    with focus_dlg:
+        with ui.card().classes("hubx-card").style(
+                "min-width:280px; max-width:92vw; max-height:92vh; "
+                "overflow:auto;"):
+            fd_title = ui.label("Focus Categories").classes(
+                "text-lg font-bold mb-1")
+            fd_hint = ui.label(
+                "Pick which subcategories the engine should learn. "
+                "Leave all unchecked to mean 'all'."
+            ).classes("text-xs mb-3").style("color:var(--hubx-text-dim)")
+            fd_holder = ui.column().classes("w-full gap-1")
+            fd_buttons = ui.row().classes("gap-2 mt-3 flex-wrap")
+
+    def _open_focus_dialog(mode: str):
+        if mode == "knowledge":
+            cats = list(KNOWLEDGE_CATEGORIES)
+            label = "Knowledge"
+        elif mode == "templates":
+            cats = list(TEMPLATE_CATEGORIES)
+            label = "Templates"
+        else:
+            return
+        current = set(_get_focus_categories())
+        fd_title.text = f"Focus: {label}"
+        fd_holder.clear()
+        fd_buttons.clear()
+        selections = {}
+        with fd_holder:
+            for c in cats:
+                cb = ui.checkbox(c, value=(c in current))
+                selections[c] = cb
+        with fd_buttons:
+            def select_all():
+                for cb in selections.values():
+                    cb.value = True
+
+            def clear_all():
+                for cb in selections.values():
+                    cb.value = False
+
+            def save():
+                chosen = [c for c, cb in selections.items() if cb.value]
+                _save_focus_categories(mode, chosen)
+                ui.notify(
+                    f"{len(chosen)} selected" if chosen
+                    else "All categories (no filter)",
+                    color="primary")
+                focus_dlg.close()
+
+            ui.button(t("select_all"), on_click=select_all).classes(
+                "hubx-btn hubx-btn-accent")
+            ui.button(t("clear_all"), on_click=clear_all).classes(
+                "hubx-btn hubx-btn-ghost")
+            ui.button(t("save"), on_click=save).classes(
+                "hubx-btn hubx-btn-primary")
+        focus_dlg.open()
+
+    def set_mode(mode: str):
+        STATE.focus = mode
+        app.storage.user["focus"] = mode
+        try:
+            set_app_state("focus_mode", mode)
+        except Exception:
+            pass
+        if mode == "both":
+            _save_focus_categories("both", [])
+            ui.notify(f"{t('focus_label')}: {mode}", color="primary")
+        else:
+            _open_focus_dialog(mode)
+
     with ui.row().classes("hubx-header items-center justify-between "
                           "w-full flex-wrap gap-2"):
-        with ui.row().classes("items-center gap-3 flex-wrap"):
+        with ui.row().classes("items-center gap-2 flex-wrap"):
             ui.label(t("brand")).classes("hubx-brand")
-            _focus_selector()
+            ui.label(t("focus_label")).style(
+                "color:var(--hubx-text-dim);font-size:0.8rem")
+            for m in ("knowledge", "templates", "both"):
+                active = ("hubx-focus-btn active"
+                          if STATE.focus == m else "hubx-focus-btn")
+                label = {
+                    "knowledge": t("focus_knowledge"),
+                    "templates": t("focus_templates"),
+                    "both":      t("focus_both"),
+                }[m]
+                ui.button(label,
+                          on_click=lambda mm=m: set_mode(mm)
+                          ).classes(active)
+            if STATE.focus in ("knowledge", "templates"):
+                ui.button(
+                    "⚙ " + t("edit_cats"),
+                    on_click=lambda: _open_focus_dialog(STATE.focus)
+                ).classes("hubx-btn hubx-btn-ghost")
         with ui.row().classes("hubx-nav items-center gap-1 flex-wrap"):
             ui.link(t("nav_check"), "/")
             ui.link(t("nav_knowledge"), "/knowledge")
@@ -1558,7 +1585,7 @@ async def dashboard_page():
                 q = gemini_usage_stats()
             except Exception:
                 q = {"last_1h": 0, "last_24h": 0,
-                     "hour_limit": 100, "day_limit": 400}
+                     "hour_limit": 60, "day_limit": 800}
             return s, q
 
         async def refresh():
