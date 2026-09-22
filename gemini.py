@@ -1,5 +1,6 @@
 # gemini.py
-# v6: 180s attempt timeout, no retry on timeout (preserves quota).
+# v7: hourly cap 100, MIN_CALL_GAP 5s to respect 15 RPM free tier,
+#     429 → block 300s and return, no retry storm.
 
 import os
 import re
@@ -27,12 +28,15 @@ MODEL = "gemini-3.5-flash-lite"
 # ==================================================================
 
 GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "400"))
-GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "30"))
+GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "100"))
 _QUOTA_BLOCK_SECONDS = 300
 
-# Hard timeout per Gemini attempt. 180s is enough for the largest notes
-# (1200-1800 words) on the free tier, while still bounding a real hang.
+# Hard timeout per attempt.
 ATTEMPT_TIMEOUT_SECONDS = 180
+
+# Minimum seconds between two Gemini calls. Free tier is 15 RPM, so
+# 5s keeps us at 12/min safely under the limit.
+MIN_CALL_GAP = 5.0
 
 _quota_block_until = 0.0
 
@@ -45,7 +49,6 @@ last_error = ""
 
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
-MIN_CALL_GAP = 2.0
 
 try:
     purge_old_gemini_usage(keep_days=3)
@@ -117,22 +120,6 @@ def _extract_text(resp):
     return ""
 
 
-def _parse_retry_seconds(err_str, fallback):
-    try:
-        m = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)\s*s", err_str)
-        if m:
-            return float(m.group(1))
-    except Exception:
-        pass
-    try:
-        m = re.search(r"'seconds':\s*(\d+)", err_str)
-        if m:
-            return float(m.group(1))
-    except Exception:
-        pass
-    return float(fallback)
-
-
 def _is_quota_error(err_str):
     s = (err_str or "").lower()
     return ("429" in s or "quota" in s or "resourceexhausted" in s
@@ -165,7 +152,7 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
         )
         if not allowed:
             _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
-            last_error = (f"{MODEL}: daily/hourly cap reached "
+            last_error = (f"{MODEL}: cap reached "
                           f"({GEMINI_DAY_LIMIT}/day, "
                           f"{GEMINI_HOUR_LIMIT}/hour), paused "
                           f"{_QUOTA_BLOCK_SECONDS}s")
@@ -191,21 +178,17 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
             last_error = (f"{MODEL}: attempt {attempt + 1}/{max_retries} "
                           f"timed out after {ATTEMPT_TIMEOUT_SECONDS}s")
             logger.warning(last_error)
-            # Do NOT retry on timeout: the model is slow, not broken.
-            # Retrying burns quota for the same result. Return empty so
-            # the engine moves on and tries a different topic next cycle.
             return ""
         except Exception as e:
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
-                backoff = 5 * (2 ** attempt)
-                wait_s = _parse_retry_seconds(str(e), backoff)
-                wait_s = min(max(wait_s, 5.0), 180.0)
-                last_error = (f"{MODEL}: Gemini 429, waiting {wait_s:.0f}s "
-                              f"(attempt {attempt + 1}/{max_retries})")
+                # Google is rate-limiting us. Retrying immediately makes
+                # it worse. Block for a while and let the next cycle try.
+                _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
+                last_error = (f"{MODEL}: Gemini 429, paused "
+                              f"{_QUOTA_BLOCK_SECONDS}s")
                 logger.warning(last_error)
-                await asyncio.sleep(wait_s)
-                continue
+                return ""
             last_error = f"{MODEL}: {err_str}"
             logger.warning("Gemini call failed (attempt %d): %s",
                            attempt + 1, e)
