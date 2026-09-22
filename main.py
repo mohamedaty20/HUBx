@@ -1,12 +1,13 @@
 # main.py
-# v11: dashboard refresh runs DB calls off the event loop (fixes
-#      "connection lost" on dashboard).
+# v12: focus subcategories. When focus != "both", engine filters topics
+#      by the chosen category list.
 
 import os
 import io
 import asyncio
 import tempfile
 import csv
+import json
 from collections import Counter
 from datetime import datetime
 
@@ -33,14 +34,19 @@ from report_builder import (build_txt, build_pdf, build_xlsx,
 
 PORT = int(os.getenv("PORT", "8080"))
 
+KNOWLEDGE_CATEGORIES = [
+    "concrete", "steel", "soil", "water", "roads",
+    "quality_management", "egyptian_codes", "safety", "surveying",
+]
+TEMPLATE_CATEGORIES = [
+    "administrative", "quality", "safety", "technical",
+    "financial", "legal", "handover",
+]
+
 
 class _State:
     focus = "both"
     lang  = "en"
-    @property
-    def run_knowledge(self): return self.focus in ("knowledge", "both")
-    @property
-    def run_templates(self): return self.focus in ("templates", "both")
 
 STATE = _State()
 
@@ -52,6 +58,7 @@ STRINGS = {
         "nav_dashboard": "Dashboard",
         "focus_label": "AI Focus", "focus_knowledge": "Knowledge",
         "focus_templates": "Templates", "focus_both": "Both",
+        "edit_cats": "Categories",
         "check_title": "Engineering Document Review",
         "check_sub": ("Upload a PDF, TXT, XLSX, PNG or JPG. Press Analyze "
                       "to run the AI compliance check against Egyptian codes."),
@@ -69,8 +76,7 @@ STRINGS = {
         "all_topics": "All topics", "browse": "Browse",
         "templates_title": "Egyptian Site Paper Templates",
         "templates_sub": ("Ready-to-use construction documents for Egyptian "
-                          "companies. Generated and refined automatically. "
-                          "Download as PDF, DOCX or TXT."),
+                          "companies."),
         "templates_word": "Templates", "refined_word": "Refined",
         "queue_word": "Queue", "all_categories": "All categories",
         "preview_paper": "Paper view", "btn_pdf": "PDF",
@@ -103,22 +109,22 @@ STRINGS = {
         "nav_dashboard": "لوحة التحكم",
         "focus_label": "تركيز الذكاء", "focus_knowledge": "المعرفة",
         "focus_templates": "القوالب", "focus_both": "الاثنان",
+        "edit_cats": "الفئات",
         "check_title": "مراجعة المستندات الهندسية",
-        "check_sub": ("ارفع ملف PDF أو TXT أو XLSX أو صورة. اضغط تحليل "
-                      "لتشغيل الفحص الآلي مقابل الكود المصري."),
+        "check_sub": ("ارفع ملف PDF أو TXT أو XLSX أو صورة."),
         "step1": "١. رفع الملف", "no_file": "لم يتم رفع ملف",
         "step2": "٢. التحليل حسب الكود المصري",
         "analyze_now": "تحليل الآن", "step3": "٣. النتيجة",
         "dl_txt": "تحميل TXT", "dl_pdf": "تحميل PDF",
         "dl_xlsx": "تحميل XLSX",
         "knowledge_title": "قاعدة المعرفة",
-        "knowledge_sub": ("ملاحظات الجودة المدنية المُتعلَّمة ذاتياً."),
+        "knowledge_sub": "ملاحظات الجودة المدنية المُتعلَّمة ذاتياً.",
         "ai_search": "بحث بالذكاء الاصطناعي", "ask": "اسأل",
         "ask_ph": "مثال: ما متطلبات معالجة الخرسانة في الجو الحار؟",
         "categories": "الفئات", "topics": "المواضيع",
         "all_topics": "كل المواضيع", "browse": "تصفح",
         "templates_title": "قوالب الأوراق للمواقع المصرية",
-        "templates_sub": ("مستندات جاهزة للشركات المصرية."),
+        "templates_sub": "مستندات جاهزة للشركات المصرية.",
         "templates_word": "القوالب", "refined_word": "مُحسَّن",
         "queue_word": "بالانتظار", "all_categories": "كل الفئات",
         "preview_paper": "عرض الورقة", "btn_pdf": "PDF",
@@ -154,9 +160,6 @@ def is_rtl() -> bool:
 
 init_db()
 
-# ============================================================
-# CSS
-# ============================================================
 ui.add_head_html("""
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -475,10 +478,88 @@ def set_lang(code: str):
     app.storage.user["lang"] = code
     ui.navigate.reload()
 
+def _get_focus_categories():
+    raw = app.storage.user.get("focus_categories", [])
+    if isinstance(raw, list):
+        return raw
+    return []
+
+def _save_focus_categories(mode: str, chosen: list):
+    app.storage.user["focus_categories"] = list(chosen)
+    try:
+        set_app_state("focus_mode", mode)
+        set_app_state("focus_categories", json.dumps(list(chosen)))
+    except Exception as e:
+        print(f"[focus] save to db failed: {e}")
+
+def _open_focus_categories_dialog(mode: str):
+    if mode == "knowledge":
+        cats = list(KNOWLEDGE_CATEGORIES)
+    elif mode == "templates":
+        cats = list(TEMPLATE_CATEGORIES)
+    else:
+        return
+
+    current = set(_get_focus_categories())
+    selection = {c: (c in current) for c in cats}
+
+    with ui.dialog() as d:
+        with ui.card().classes("hubx-card").style(
+                "max-width:92vw; max-height:92vh; overflow:auto;"):
+            ui.label(f"Focus categories — {mode.title()}").classes(
+                "text-lg font-bold mb-2")
+            ui.label("Pick which subcategories the engine should learn. "
+                     "Leave all unchecked to mean 'all'.").classes(
+                "text-xs mb-3").style("color:var(--hubx-text-dim)")
+
+            cbs = {}
+            for c in cats:
+                cb = ui.checkbox(c, value=selection[c])
+                def _on_change(e, cc=c):
+                    selection[cc] = bool(e.value)
+                cb.on_change(_on_change)
+                cbs[c] = cb
+
+            def select_all():
+                for c in cats:
+                    cbs[c].value = True
+                    selection[c] = True
+
+            def clear_all():
+                for c in cats:
+                    cbs[c].value = False
+                    selection[c] = False
+
+            def save():
+                chosen = [c for c in cats if selection[c]]
+                _save_focus_categories(mode, chosen)
+                ui.notify(
+                    f"{len(chosen)} categories selected" if chosen
+                    else "All categories (no filter)",
+                    color="primary")
+                d.close()
+
+            with ui.row().classes("gap-2 mt-3 flex-wrap"):
+                ui.button("Select All", on_click=select_all).classes(
+                    "hubx-btn hubx-btn-accent")
+                ui.button("Clear", on_click=clear_all).classes(
+                    "hubx-btn hubx-btn-ghost")
+                ui.button("Save", on_click=save).classes(
+                    "hubx-btn hubx-btn-primary")
+    d.open()
+
 def set_focus(mode: str):
     STATE.focus = mode
     app.storage.user["focus"] = mode
-    ui.notify(f"{t('focus_label')}: {mode}", color="primary")
+    try:
+        set_app_state("focus_mode", mode)
+    except Exception:
+        pass
+    if mode == "both":
+        _save_focus_categories("both", [])
+        ui.notify(f"{t('focus_label')}: {mode}", color="primary")
+    else:
+        _open_focus_categories_dialog(mode)
 
 def _lang_toggle():
     with ui.row().classes("gap-1 items-center"):
@@ -488,7 +569,7 @@ def _lang_toggle():
         ui.button("ع",  on_click=lambda: set_lang("ar")).classes(cls_ar)
 
 def _focus_selector():
-    with ui.row().classes("gap-2 items-center"):
+    with ui.row().classes("gap-2 items-center flex-wrap"):
         ui.label(t("focus_label")).style(
             "color:var(--hubx-text-dim);font-size:0.82rem")
         ui.toggle(
@@ -498,7 +579,11 @@ def _focus_selector():
             value=STATE.focus,
             on_change=lambda e: set_focus(e.value),
         ).props("dense")
-
+        if STATE.focus in ("knowledge", "templates"):
+            ui.button(t("edit_cats"),
+                      on_click=lambda: _open_focus_categories_dialog(
+                          STATE.focus)
+                      ).classes("hubx-btn hubx-btn-ghost")
 
 def _header():
     with ui.row().classes("hubx-header items-center justify-between "
@@ -655,7 +740,7 @@ def _md_to_html(md):
     return "\n".join(out)
 
 
-def _paper_pdf_bytes(html_str: str, rtl: bool) -> bytes:
+def _paper_pdf_bytes(html_str, rtl):
     from arabic_font import css_for_weasyprint
     font_css = css_for_weasyprint()
     full = f"""<!doctype html><html><head><meta charset="utf-8">
@@ -795,9 +880,6 @@ def _safe_unlink(p):
         pass
 
 
-# ============================================================
-# / CHECK
-# ============================================================
 @ui.page("/")
 def check_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -864,7 +946,7 @@ def check_page():
                     state["original_text"])
                 progress.style("opacity:0")
                 if not result:
-                    err_label.text = f"Gemini error: {gemini_mod.last_error}"
+                    err_label.text = f"AI error: {gemini_mod.last_error}"
                     ui.notify("Analysis failed.", color="red"); return
                 state["result"] = result
                 render_result()
@@ -935,9 +1017,6 @@ def check_page():
                 "hubx-btn hubx-btn-primary")
 
 
-# ============================================================
-# / KNOWLEDGE
-# ============================================================
 @ui.page("/knowledge")
 def knowledge_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -1134,9 +1213,6 @@ def knowledge_page():
     ui.timer(45.0, refresh_all)
 
 
-# ============================================================
-# / TEMPLATES
-# ============================================================
 @ui.page("/templates")
 def templates_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -1306,9 +1382,6 @@ def templates_page():
     ui.timer(45.0, refresh)
 
 
-# ============================================================
-# / CHARTS
-# ============================================================
 @ui.page("/charts")
 def charts_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -1419,9 +1492,6 @@ def charts_page():
         ui.timer(60.0, refresh)
 
 
-# ============================================================
-# / DASHBOARD
-# ============================================================
 @ui.page("/dashboard")
 async def dashboard_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -1476,7 +1546,6 @@ async def dashboard_page():
                  "hubx-btn hubx-btn-primary")
 
         def _do_refresh_sync():
-            """All blocking DB work runs here, in a worker thread."""
             try:
                 s = engine.stats()
             except Exception as e:
@@ -1506,10 +1575,10 @@ async def dashboard_page():
                                 f'{s.get("pending_templates",0)}')
             debug_label.text = s["last_debug"]
             gemini_err_label.text = (
-                f"Gemini: {gemini_mod.last_error}"
+                f"AI: {gemini_mod.last_error}"
                 if gemini_mod.last_error else "")
             quota_label.text = (
-                f"Gemini usage — last 1h: "
+                f"AI usage — last 1h: "
                 f"{q['last_1h']}/{q['hour_limit']}"
                 f"  ·  last 24h: {q['last_24h']}/{q['day_limit']}")
 
