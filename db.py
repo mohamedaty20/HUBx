@@ -1,5 +1,5 @@
 # db.py
-# v6: verified/flagged columns, get_knowledge_by_topic, safe migrations.
+# v7: gemini_usage_stats default hour_limit 100.
 
 import os
 import json
@@ -83,7 +83,6 @@ def db_health():
 
 
 def _ensure_column(conn, table, column, ddl):
-    """Safely add a column if it doesn't exist (SQLite / Turso)."""
     try:
         cols = [r[1] for r in
                 conn.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -180,7 +179,6 @@ def init_db():
     """)
     conn.commit()
 
-    # --- safe migrations for existing DBs ---
     _ensure_column(conn, "knowledge", "verified",
                    "verified INTEGER DEFAULT 0")
     _ensure_column(conn, "knowledge", "flagged",
@@ -192,9 +190,6 @@ def init_db():
     conn.commit()
 
 
-# ---------------------------------------------------------------
-# App state
-# ---------------------------------------------------------------
 def get_app_state(key, default=""):
     try:
         conn = get_conn()
@@ -218,9 +213,6 @@ def set_app_state(key, value):
         logger.warning("set_app_state(%s) failed: %s", key, e)
 
 
-# ---------------------------------------------------------------
-# Gemini usage
-# ---------------------------------------------------------------
 def _utcnow_iso():
     return datetime.datetime.utcnow().isoformat()
 
@@ -230,7 +222,7 @@ def _iso_ago(seconds):
             - datetime.timedelta(seconds=seconds)).isoformat()
 
 
-def check_and_increment_gemini_usage(day_limit=400, hour_limit=30):
+def check_and_increment_gemini_usage(day_limit=400, hour_limit=100):
     try:
         conn = get_conn()
         day_count = conn.execute(
@@ -254,7 +246,7 @@ def check_and_increment_gemini_usage(day_limit=400, hour_limit=30):
         return True
 
 
-def gemini_usage_stats(day_limit=400, hour_limit=30):
+def gemini_usage_stats(day_limit=400, hour_limit=100):
     try:
         conn = get_conn()
         day_count = conn.execute(
@@ -286,9 +278,6 @@ def purge_old_gemini_usage(keep_days=3):
         logger.warning("purge_old_gemini_usage failed: %s", e)
 
 
-# ---------------------------------------------------------------
-# Knowledge
-# ---------------------------------------------------------------
 def upsert_knowledge(topic, category, content, confidence=0.5):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
@@ -342,7 +331,6 @@ def replace_knowledge_with_refined(knowledge_id, refined):
 
 
 def oldest_unverified_knowledge(limit=1):
-    """Oldest row that is neither verified nor flagged."""
     conn = get_conn()
     return conn.execute("""
         SELECT id, topic, category, content, refined_content, version
@@ -457,9 +445,6 @@ def runs_per_cycle(limit=40):
     """, (limit,)).fetchall()[::-1]
 
 
-# ---------------------------------------------------------------
-# Templates
-# ---------------------------------------------------------------
 def upsert_template(name, category, content, confidence=0.5):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
@@ -580,9 +565,6 @@ def template_stats():
             "verified": verified, "flagged": flagged}
 
 
-# ---------------------------------------------------------------
-# Pending queues
-# ---------------------------------------------------------------
 def add_pending_topic(topic, category, source="ai", parent_topic=""):
     conn = get_conn()
     topic = (topic or "").strip()
@@ -667,9 +649,6 @@ def pending_template_count():
         "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
 
 
-# ---------------------------------------------------------------
-# Runs
-# ---------------------------------------------------------------
 def log_learning_run(cycle, topic, added, refined, calls, error=""):
     conn = get_conn()
     conn.execute("""
@@ -710,9 +689,6 @@ def recent_template_runs(limit=20):
     """, (limit,)).fetchall()
 
 
-# ---------------------------------------------------------------
-# Check reports
-# ---------------------------------------------------------------
 def save_check_report(filename, file_type, original_text, issues,
                       score, summary, compliance=""):
     conn = get_conn()
