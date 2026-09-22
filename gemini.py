@@ -1,6 +1,6 @@
 # gemini.py
-# Gemini wrapper with sanitizer, model hardcoded, template generation,
-# and AI-powered knowledge search.
+# Gemini wrapper with sanitizer, quota-aware pacing,
+# template generation, and AI-powered knowledge search.
 
 import os
 import re
@@ -18,6 +18,9 @@ from prompts import (
     TEMPLATE_SYSTEM_PROMPT, TEMPLATE_USER_TEMPLATE,
 )
 
+from db import (check_and_increment_gemini_usage,
+                gemini_usage_stats, purge_old_gemini_usage)
+
 logger = logging.getLogger(__name__)
 
 # ==================================================================
@@ -25,6 +28,16 @@ logger = logging.getLogger(__name__)
 # ==================================================================
 MODEL = "gemini-3.5-flash-lite"
 # ==================================================================
+
+# Daily + hourly soft caps enforced by db.check_and_increment_gemini_usage.
+# Free tier is 500 RPD; leave headroom for manual AI-search / doc-check.
+GEMINI_DAY_LIMIT = 400
+GEMINI_HOUR_LIMIT = 30
+
+# In-memory block so the engine loop does not spin the DB every 20s
+# while we are over the cap. Cleared when the timer expires.
+_quota_block_until = 0.0
+_QUOTA_BLOCK_SECONDS = 300
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
@@ -37,10 +50,16 @@ _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 MIN_CALL_GAP = 2.0
 
+# Purge old usage rows once at import time (safe, small).
+try:
+    purge_old_gemini_usage(keep_days=3)
+except Exception:
+    pass
+
+
 # ---------------------------------------------------------------
 # LaTeX sanitizer
 # ---------------------------------------------------------------
-
 _LATEX_SIMPLE = [
     (r"\\times\b", "×"), (r"\\cdot\b", "·"), (r"\\div\b", "÷"),
     (r"\\pm\b", "±"), (r"\\mp\b", "∓"), (r"\\geq\b", "≥"),
@@ -82,7 +101,6 @@ def sanitize_text(s):
 # ---------------------------------------------------------------
 # Low-level call
 # ---------------------------------------------------------------
-
 async def _throttle():
     global _last_call_time
     async with _rate_lock:
@@ -111,7 +129,6 @@ def _extract_text(resp):
 
 
 def _parse_retry_seconds(err_str, fallback):
-    """Extract 'retry in Ns' from a Gemini 429 error; fall back to `fallback`."""
     try:
         m = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)\s*s", err_str)
         if m:
@@ -134,9 +151,17 @@ def _is_quota_error(err_str):
 
 
 async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
-    global last_error
+    global last_error, _quota_block_until
+
     if not GEMINI_API_KEY:
         last_error = "GEMINI_API_KEY not set"
+        return ""
+
+    # -- soft block set after a previous cap hit -------------------
+    now_m = time.monotonic()
+    if now_m < _quota_block_until:
+        left = int(_quota_block_until - now_m)
+        last_error = f"{MODEL}: quota cap reached, paused {left}s"
         return ""
 
     kwargs = {"temperature": 0.4 if json_mode else 0.7,
@@ -146,6 +171,20 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
 
     model = genai.GenerativeModel(MODEL)
     for attempt in range(max_retries):
+        # quota check BEFORE every attempt (counts retries too)
+        allowed = check_and_increment_gemini_usage(
+            day_limit=GEMINI_DAY_LIMIT,
+            hour_limit=GEMINI_HOUR_LIMIT,
+        )
+        if not allowed:
+            _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
+            last_error = (f"{MODEL}: daily/hourly cap reached "
+                          f"({GEMINI_DAY_LIMIT}/day, "
+                          f"{GEMINI_HOUR_LIMIT}/hour), paused "
+                          f"{_QUOTA_BLOCK_SECONDS}s")
+            logger.warning(last_error)
+            return ""
+
         await _throttle()
         try:
             resp = await asyncio.to_thread(
@@ -161,15 +200,13 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
         except Exception as e:
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
-                backoff = 5 * (2 ** attempt)  # 5, 10, 20, 40, 80, 160
+                # Gemini itself says quota — back off hard.
+                backoff = 5 * (2 ** attempt)
                 wait_s = _parse_retry_seconds(str(e), backoff)
-                wait_s = min(max(wait_s, 5.0), 180.0)  # clamp to 5..180s
-                last_error = (f"{MODEL}: quota exceeded, "
-                              f"waiting {wait_s:.0f}s "
+                wait_s = min(max(wait_s, 5.0), 180.0)
+                last_error = (f"{MODEL}: Gemini 429, waiting {wait_s:.0f}s "
                               f"(attempt {attempt + 1}/{max_retries})")
-                logger.warning(
-                    "Gemini quota hit. Sleeping %.0fs before retry %d/%d",
-                    wait_s, attempt + 1, max_retries)
+                logger.warning(last_error)
                 await asyncio.sleep(wait_s)
                 continue
             last_error = f"{MODEL}: {err_str}"
@@ -182,7 +219,6 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
 # ---------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------
-
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
@@ -266,6 +302,11 @@ async def ai_search(question, knowledge_context):
 async def ocr_image(path):
     global last_error
     if not GEMINI_API_KEY:
+        return ""
+    allowed = check_and_increment_gemini_usage(
+        day_limit=GEMINI_DAY_LIMIT, hour_limit=GEMINI_HOUR_LIMIT)
+    if not allowed:
+        last_error = "quota cap reached (OCR skipped)"
         return ""
     try:
         from PIL import Image
