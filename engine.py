@@ -1,6 +1,6 @@
 # engine.py
-# v8: phase-based expansion. Every cycle tries to advance a phase first.
-#     Falls back to generating new when nothing is phaseable.
+# v9: phase expansion appends only the new section. On failure, bump
+#     phase_ts so the same item isn't retried immediately.
 
 from __future__ import annotations
 import asyncio
@@ -34,33 +34,6 @@ def _get_max_phase():
         return max(1, min(8, n))
     except Exception:
         return MAX_PHASE_DEFAULT
-
-
-def _call_adapt(fn, *args, **kwargs):
-    if not fn:
-        return None
-    if args:
-        try:
-            return fn(*args)
-        except TypeError:
-            pass
-        except Exception as e:
-            print(f"[db] {getattr(fn, '__name__', fn)} failed: {e}")
-            return None
-    try:
-        return fn(**kwargs)
-    except TypeError:
-        pass
-    except Exception as e:
-        print(f"[db] {getattr(fn, '__name__', fn)} failed: {e}")
-        return None
-    try:
-        sig = inspect.signature(fn)
-        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return fn(**filtered)
-    except Exception as e:
-        print(f"[db] {getattr(fn, '__name__', fn)} filtered failed: {e}")
-        return None
 
 
 def _read_focus_state():
@@ -179,7 +152,6 @@ class Engine:
             run_k = mode in ("knowledge", "both")
             run_t = mode in ("templates", "both")
 
-            # 1. Try phase advancement first (higher priority).
             if run_k:
                 if await self._advance_knowledge(max_phase):
                     self.ai_calls = self.gemini_calls
@@ -189,7 +161,6 @@ class Engine:
                     self.ai_calls = self.gemini_calls
                     return
 
-            # 2. Nothing to phase — generate new content.
             if run_k:
                 try:
                     await self._knowledge_step(focus_cats)
@@ -226,21 +197,31 @@ class Engine:
             return False
 
         self.last_debug = f"phase {phase}->{target}: {topic}"
-        new_content = await expand_phase(topic, category,
+        new_section = await expand_phase(topic, category,
                                          content or "", phase, target)
         self.gemini_calls += 1
-        if not new_content or len(new_content) < len(content or ""):
-            self.last_debug = f"phase expand failed: {topic}"
-            return True  # we tried, don't fall back to generate in same cycle
 
+        # ALWAYS bump phase_ts so we don't retry the same item for 4h.
+        if not new_section or len(new_section.strip()) < 200:
+            # Failed or too short. Bump timestamp but don't advance.
+            try:
+                _db.advance_knowledge_phase(kid, content or "", phase)
+            except Exception:
+                pass
+            self.last_debug = f"phase expand failed: {topic}"
+            _db.log_learning_run(self.cycles, topic, 0, 0, 1,
+                                 f"phase->{target} failed")
+            return True
+
+        # Append the new section to existing content.
+        combined = (content or "").rstrip() + "\n\n\n" + new_section.strip()
         try:
-            _db.advance_knowledge_phase(kid, new_content, target)
+            _db.advance_knowledge_phase(kid, combined, target)
         except Exception as e:
             print(f"[engine] advance_knowledge_phase failed: {e}")
             return True
 
-        _db.log_learning_run(self.cycles, topic, 0, 1, 1,
-                             f"phase->{target}")
+        _db.log_learning_run(self.cycles, topic, 0, 1, 1, f"phase->{target}")
         self.last_debug = f"advanced to phase {target}: {topic}"
         return True
 
@@ -259,21 +240,28 @@ class Engine:
             return False
 
         self.last_debug = f"phase {phase}->{target}: {name}"
-        new_content = await expand_phase(name, category,
+        new_section = await expand_phase(name, category,
                                          content or "", phase, target)
         self.gemini_calls += 1
-        if not new_content or len(new_content) < len(content or ""):
+
+        if not new_section or len(new_section.strip()) < 200:
+            try:
+                _db.advance_template_phase(tid, content or "", phase)
+            except Exception:
+                pass
             self.last_debug = f"phase expand failed: {name}"
+            _db.log_template_run(self.cycles, name, 0, 0, 1,
+                                 f"phase->{target} failed")
             return True
 
+        combined = (content or "").rstrip() + "\n\n\n" + new_section.strip()
         try:
-            _db.advance_template_phase(tid, new_content, target)
+            _db.advance_template_phase(tid, combined, target)
         except Exception as e:
             print(f"[engine] advance_template_phase failed: {e}")
             return True
 
-        _db.log_template_run(self.cycles, name, 0, 1, 1,
-                             f"phase->{target}")
+        _db.log_template_run(self.cycles, name, 0, 1, 1, f"phase->{target}")
         self.last_debug = f"advanced to phase {target}: {name}"
         return True
 
