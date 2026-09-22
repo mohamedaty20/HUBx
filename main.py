@@ -1,12 +1,9 @@
 # main.py
 # NiceGUI app v4
-# Changes vs v3:
-#   1) Focus selector in header (Knowledge / Templates / Both) -> drives engine
-#   2) EN / ع language toggle -> every label, RTL layout, Arabic font
-#   3) Paper-format A4 preview + PDF for templates (positioned fields)
-#   4) Arabic-safe PDF export (WeasyPrint + Cairo font)
-# v5: mobile-first layout fixes — no horizontal overflow, wrapping header,
-#     banner uses text glyphs (no Material Icons dependency), stacked sidebar.
+# v5: mobile-first layout — no horizontal overflow, wrapping header,
+#     banner uses text glyphs, Gemini quota widget.
+# v6: knowledge & templates now use a slide-in drawer for categories/topics.
+#     Reader content is full-width, no card, no border.
 
 import os
 import io
@@ -37,11 +34,11 @@ from report_builder import (build_txt, build_pdf, build_xlsx,
 PORT = int(os.getenv("PORT", "8080"))
 
 # ============================================================
-# STATE + I18N  (inlined so this file is self-contained)
+# STATE + I18N
 # ============================================================
 class _State:
-    focus = "both"          # "knowledge" | "templates" | "both"
-    lang  = "en"            # "en" | "ar"
+    focus = "both"
+    lang  = "en"
     @property
     def run_knowledge(self): return self.focus in ("knowledge", "both")
     @property
@@ -81,6 +78,7 @@ STRINGS = {
         "categories": "Categories",
         "topics": "Topics",
         "all_topics": "All topics",
+        "browse": "Browse",
         "templates_title": "Egyptian Site Paper Templates",
         "templates_sub": ("Ready-to-use construction documents for Egyptian "
                           "companies. Generated and refined automatically. "
@@ -120,6 +118,7 @@ STRINGS = {
         "version": "Version",
         "confidence": "Confidence",
         "description": "Description",
+        "no_selection": "Tap ☰ to pick a topic.",
     },
     "ar": {
         "brand": "HUBx",
@@ -152,6 +151,7 @@ STRINGS = {
         "categories": "الفئات",
         "topics": "المواضيع",
         "all_topics": "كل المواضيع",
+        "browse": "تصفح",
         "templates_title": "قوالب الأوراق للمواقع المصرية",
         "templates_sub": ("مستندات جاهزة للشركات المصرية. تُولَّد وتُحسَّن "
                           "تلقائياً. حمّلها PDF أو DOCX أو TXT."),
@@ -190,6 +190,7 @@ STRINGS = {
         "version": "الإصدار",
         "confidence": "الثقة",
         "description": "الوصف",
+        "no_selection": "اضغط ☰ لاختيار موضوع.",
     },
 }
 
@@ -202,7 +203,7 @@ def is_rtl() -> bool:
 init_db()
 
 # ============================================================
-# CSS  (extended with Cairo font, RTL, paper CSS)
+# CSS
 # ============================================================
 ui.add_head_html("""
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -228,7 +229,6 @@ ui.add_head_html("""
 * { font-family: 'JetBrains Mono', 'Cairo', monospace !important; }
 body.lang-ar, body.lang-ar * { font-family: 'Cairo', 'JetBrains Mono', sans-serif !important; }
 body.lang-ar { direction: rtl; }
-body.lang-ar .hubx-nav a { direction: rtl; }
 body, .q-page, .nicegui-content {
     background: var(--hubx-bg) !important;
     color: var(--hubx-text) !important;
@@ -298,20 +298,21 @@ body, .q-page, .nicegui-content {
 .hubx-btn-ghost:hover { border-color: var(--hubx-primary) !important;
                         color: var(--hubx-primary) !important; }
 
+/* Reader markdown — full width, no border */
 .hubx-body h1 { font-size: 1.55rem; font-weight: 800; margin: 0.2em 0 0.5em 0;
                 line-height: 1.25; letter-spacing: -0.3px; }
 .hubx-body h2 { font-size: 1.2rem; font-weight: 700; margin: 0.9em 0 0.35em 0;
                 line-height: 1.3; color: var(--hubx-primary-2); }
 .hubx-body h3 { font-size: 1.02rem; font-weight: 700; margin: 0.7em 0 0.25em 0;
                 line-height: 1.3; }
-.hubx-body p  { font-size: 0.9rem; line-height: 1.5; margin: 0.35em 0;
+.hubx-body p  { font-size: 0.95rem; line-height: 1.6; margin: 0.4em 0;
                 color: var(--hubx-text); text-align: left !important; }
 .hubx-body ul, .hubx-body ol { margin: 0.3em 0 0.5em 1.2em; }
-.hubx-body li { font-size: 0.9rem; line-height: 1.45; margin: 0.15em 0;
+.hubx-body li { font-size: 0.95rem; line-height: 1.55; margin: 0.15em 0;
                 text-align: left !important; }
 .hubx-body strong { font-weight: 700; color: #fff; }
 .hubx-body table { width: 100%; border-collapse: collapse;
-                   margin: 0.5em 0; font-size: 0.85rem; }
+                   margin: 0.5em 0; font-size: 0.88rem; }
 .hubx-body th, .hubx-body td {
     border: 1px solid var(--hubx-border); padding: 6px 8px;
     text-align: left !important;
@@ -319,7 +320,7 @@ body, .q-page, .nicegui-content {
 .hubx-body th { background: var(--hubx-surface-2); font-weight: 700; }
 .hubx-body code { background: var(--hubx-surface-2);
                   padding: 1px 6px; border-radius: 4px;
-                  font-size: 0.85rem; }
+                  font-size: 0.88rem; }
 .hubx-body hr { border: none; border-top: 1px solid var(--hubx-border);
                 margin: 0.8em 0; }
 .hubx-body blockquote {
@@ -337,28 +338,27 @@ body.lang-ar .hubx-body blockquote {
     padding-left: 0; padding-right: 12px;
 }
 
-.hubx-side-btn {
-    font-size: 0.88rem !important; font-weight: 500 !important;
+/* Drawer button */
+.hubx-drawer-btn {
+    font-size: 0.84rem !important; font-weight: 500 !important;
     text-align: left !important; justify-content: flex-start !important;
-    text-transform: none !important; padding: 8px 12px !important;
-    border-radius: var(--hubx-radius-sm) !important;
+    text-transform: none !important; padding: 6px 10px !important;
+    border-radius: 6px !important;
     color: var(--hubx-text) !important; width: 100% !important;
-    min-height: 36px !important;
+    min-height: 34px !important;
+    line-height: 1.25 !important;
+    white-space: normal !important;
 }
-body.lang-ar .hubx-side-btn {
+body.lang-ar .hubx-drawer-btn {
     text-align: right !important; justify-content: flex-end !important;
 }
-.hubx-side-btn:hover { background: rgba(79,140,255,0.12) !important; }
-.hubx-side-btn.selected {
+.hubx-drawer-btn:hover { background: rgba(79,140,255,0.12) !important; }
+.hubx-drawer-btn.selected {
     background: var(--hubx-primary) !important;
     color: white !important;
     font-weight: 700 !important;
 }
-.hubx-cat-header {
-    font-size: 0.8rem; font-weight: 700; letter-spacing: 0.8px;
-    color: var(--hubx-text-dim); text-transform: uppercase;
-    margin: 10px 0 4px 4px;
-}
+
 .hubx-badge {
     padding: 2px 8px; border-radius: 10px; font-size: 0.72rem;
     font-weight: 700;
@@ -372,13 +372,11 @@ body.lang-ar .hubx-side-btn {
                    letter-spacing: 0.6px; text-transform: uppercase; }
 .hubx-stat-value { font-size: 1.2rem; font-weight: 800; color: #fff; }
 
+/* Drawer container */
+.hubx-drawer { background: var(--hubx-surface) !important; }
+.hubx-drawer .q-drawer__content { background: var(--hubx-surface) !important; }
+
 /* ---------- PAPER (A4) ---------- */
-.hubx-paper-wrap {
-    background: #e9edf5;
-    padding: 18px;
-    border-radius: var(--hubx-radius);
-    display: flex; justify-content: center;
-}
 .hubx-paper {
     background: #ffffff; color: #111111;
     width: 210mm; min-height: 297mm;
@@ -393,24 +391,20 @@ body.lang-ar .hubx-side-btn {
 .hubx-paper .cover { text-align: center; padding-top: 30mm; }
 .hubx-paper .cover .org { font-size: 14pt; font-weight: 700;
                           letter-spacing: .5px; }
-.hubx-paper .cover .faculty { font-size: 12pt; margin-top: 4mm;
-                              color: #333; }
+.hubx-paper .cover .faculty { font-size: 12pt; margin-top: 4mm; color: #333; }
 .hubx-paper .cover .rule { height: 2px; background: #111;
                            margin: 8mm auto; width: 60%; }
 .hubx-paper .cover .ptitle { font-size: 22pt; font-weight: 800;
                              margin: 10mm 0; }
 .hubx-paper .cover .subtitle { font-size: 13pt; color: #444;
                                margin-bottom: 12mm; }
-.hubx-paper .meta { width: 100%; margin-top: 18mm;
-                    border-collapse: collapse; }
-.hubx-paper .meta td { padding: 3mm 2mm; font-size: 12pt;
-                       vertical-align: top; }
+.hubx-paper .meta { width: 100%; margin-top: 18mm; border-collapse: collapse; }
+.hubx-paper .meta td { padding: 3mm 2mm; font-size: 12pt; vertical-align: top; }
 .hubx-paper .meta .lbl { width: 35%; font-weight: 700; color: #222; }
 .hubx-paper .meta .val { width: 65%; border-bottom: 1px dotted #999; }
 .hubx-paper .section { margin-top: 10mm; }
 .hubx-paper .section h2 { font-size: 14pt; border-bottom: 1.5px solid #111;
-                          padding-bottom: 2mm; margin-bottom: 4mm;
-                          color: #111; }
+                          padding-bottom: 2mm; margin-bottom: 4mm; color: #111; }
 .hubx-paper .section .body { text-align: justify; }
 .hubx-paper .body p, .hubx-paper .body li {
     font-size: 12pt !important; color: #111 !important;
@@ -463,30 +457,16 @@ body.lang-ar .hubx-side-btn {
     }
 
     .hubx-title { font-size: 1.15rem !important; }
-    .hubx-subtitle { font-size: 0.8rem !important; margin-bottom: 10px !important; }
+    .hubx-subtitle { font-size: 0.8rem !important;
+                     margin-bottom: 10px !important; }
     .hubx-card { padding: 12px !important; }
-    .hubx-body p, .hubx-body li, .hubx-body th, .hubx-body td {
-        font-size: 0.8rem !important;
-    }
-
-    .hubx-stack-mobile {
-        flex-direction: column !important;
-        flex-wrap: wrap !important;
-    }
-    .hubx-stack-mobile > * {
-        width: 100% !important;
-        min-width: 0 !important;
-        max-width: 100% !important;
-        height: auto !important;
-        max-height: 55vh !important;
-        flex: 1 1 auto !important;
-    }
+    .hubx-body p, .hubx-body li { font-size: 0.9rem !important; }
+    .hubx-body h1 { font-size: 1.25rem !important; }
+    .hubx-body h2 { font-size: 1.05rem !important; }
 
     .hubx-stat { min-width: 80px !important; padding: 8px 10px !important; }
     .hubx-stat-value { font-size: 1rem !important; }
     .hubx-stat-label { font-size: 0.62rem !important; }
-
-    .hubx-hide-mobile { display: none !important; }
 
     .hubx-paper { width: 100% !important; padding: 10px !important;
                   min-height: auto !important; }
@@ -496,11 +476,13 @@ body.lang-ar .hubx-side-btn {
     .q-table th, .q-table td { padding: 4px 6px !important; }
 
     .q-dialog__inner > div { max-width: 96vw !important; }
+
+    .hubx-drawer { width: 84vw !important; max-width: 84vw !important; }
 }
 </style>
 """, shared=True)
 
-# ---- paper PDF serving (for the Print button) ----
+# ---- paper PDF serving ----
 import uuid
 from fastapi import Response as _FastResponse
 
@@ -632,7 +614,7 @@ def _stat(label):
 
 
 # ============================================================
-# PAPER FORMAT (A4)  -> preview + PDF
+# PAPER FORMAT (A4)
 # ============================================================
 def _paper_html(title: str, category: str, version, body_md: str,
                 meta: dict | None = None) -> str:
@@ -640,7 +622,6 @@ def _paper_html(title: str, category: str, version, body_md: str,
     rtl = is_rtl()
     rtl_cls = " rtl" if rtl else ""
     today = datetime.utcnow().date().isoformat()
-
     body_html = _md_to_html(body_md or "")
 
     fields = [
@@ -711,9 +692,6 @@ def _md_to_html(md: str) -> str:
                 tag = "th" if i == 0 else "td"
                 out.append("<tr>" + "".join(
                     f"<{tag}>{_inline(c)}</{tag}>" for c in cells) + "</tr>")
-                if i == 0 and len(rows) > 1 and set(rows[1].replace("|", "")
-                                                   .replace(" ", "").strip()) <= set("-:") | {""}:
-                    pass
             out.append("</table>")
         in_table = False
 
@@ -1063,7 +1041,22 @@ def knowledge_page():
     _header()
     _db_banner()
 
-    with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-3"):
+    selected = {"cat": None}
+
+    # ---- Drawer (categories + topics) ----
+    drawer_cls = ui.right_drawer if is_rtl() else ui.left_drawer
+    with drawer_cls(value=False, bordered=True).classes("hubx-drawer") as kdrawer:
+        with ui.column().classes("w-full p-3 gap-1"):
+            ui.label(t("categories")).classes("font-bold text-base")
+            cat_container = ui.column().classes("w-full gap-1")
+            ui.separator().style("border-color:var(--hubx-border)")
+            ui.label(t("topics")).classes("font-bold text-base mt-2")
+            topic_label = ui.label("").classes("text-xs").style(
+                "color:var(--hubx-text-dim)")
+            topic_container = ui.column().classes("w-full gap-0.5")
+
+    # ---- Main content ----
+    with ui.column().classes("w-full p-2 gap-3"):
         ui.label(t("knowledge_title")).classes("hubx-title")
         ui.label(t("knowledge_sub")).classes("hubx-subtitle")
 
@@ -1101,98 +1094,94 @@ def knowledge_page():
             ask_btn.on("click", do_search)
             q_input.on("keydown.enter", do_search)
 
-        selected = {"cat": None}
-        with ui.row().classes("w-full gap-3 flex-wrap hubx-stack-mobile"):
-            with ui.card().classes("hubx-card w-72 shrink-0 h-[75vh] "
-                                   "overflow-auto"):
-                ui.label(t("categories")).classes("font-bold text-base")
-                cat_container = ui.column().classes("w-full gap-1 mt-2")
-                ui.separator().style("border-color:var(--hubx-border)")
-                ui.label(t("topics")).classes("font-bold text-base mt-2")
-                topic_label = ui.label("").classes(
-                    "text-xs").style("color:var(--hubx-text-dim)")
-                topic_container = ui.column().classes("w-full gap-0.5")
+        # Browse button + reader
+        with ui.row().classes("w-full items-center gap-2 mt-2"):
+            ui.button("☰  " + t("browse"),
+                      on_click=lambda: kdrawer.set_value(not kdrawer.value)
+                      ).classes("hubx-btn hubx-btn-ghost")
+            ui.label("").classes("text-xs").style(
+                "color:var(--hubx-text-dim)")
 
-            with ui.card().classes("hubx-card flex-1 h-[75vh] "
-                                   "overflow-auto"):
-                reader_toolbar = ui.row().classes(
-                    "w-full gap-2 mb-2 items-center flex-wrap")
-                detail = ui.markdown("").classes(
-                    "hubx-body whitespace-pre-wrap w-full")
+        reader_toolbar = ui.row().classes(
+            "w-full gap-2 items-center flex-wrap")
+        detail = ui.markdown(t("no_selection")).classes(
+            "hubx-body w-full whitespace-pre-wrap")
 
-        def show_item(kid):
-            k = get_knowledge_by_id(kid)
-            if not k:
-                return
-            body = k[4] or k[3] or "(empty)"
-            detail.content = (f"# {k[1]}\n\n"
-                              f"**{t('category')}:** {k[2]}  ·  "
-                              f"**{t('version')}:** v{k[5]}  ·  "
-                              f"**{t('confidence')}:** {round(k[6] or 0, 2)}\n\n"
-                              f"---\n\n{body}")
-            reader_toolbar.clear()
-            with reader_toolbar:
-                ui.button(t("btn_pdf"), on_click=lambda: ui.download(
-                    topic_pdf(k[1], k[2], k[5], body),
-                    filename=f"hubx_{k[1][:30]}.pdf")
-                ).classes("hubx-btn hubx-btn-danger")
-                ui.button(t("btn_docx"), on_click=lambda: ui.download(
-                    topic_docx(k[1], k[2], k[5], body),
-                    filename=f"hubx_{k[1][:30]}.docx")
-                ).classes("hubx-btn hubx-btn-primary")
-                ui.button(t("btn_txt"), on_click=lambda: ui.download(
-                    topic_txt(k[1], k[2], k[5], body),
-                    filename=f"hubx_{k[1][:30]}.txt")
-                ).classes("hubx-btn hubx-btn-ghost")
-                ui.button(t("preview_paper"),
-                          on_click=lambda: _open_paper_dialog(
-                              k[1], k[2], k[5], body, {})
-                ).classes("hubx-btn hubx-btn-accent")
+    # ---- Behaviour ----
+    def show_item(kid):
+        k = get_knowledge_by_id(kid)
+        if not k:
+            return
+        body = k[4] or k[3] or "(empty)"
+        detail.content = (f"# {k[1]}\n\n"
+                          f"**{t('category')}:** {k[2]}  ·  "
+                          f"**{t('version')}:** v{k[5]}  ·  "
+                          f"**{t('confidence')}:** {round(k[6] or 0, 2)}\n\n"
+                          f"---\n\n{body}")
+        reader_toolbar.clear()
+        with reader_toolbar:
+            ui.button(t("btn_pdf"), on_click=lambda: ui.download(
+                topic_pdf(k[1], k[2], k[5], body),
+                filename=f"hubx_{k[1][:30]}.pdf")
+            ).classes("hubx-btn hubx-btn-danger")
+            ui.button(t("btn_docx"), on_click=lambda: ui.download(
+                topic_docx(k[1], k[2], k[5], body),
+                filename=f"hubx_{k[1][:30]}.docx")
+            ).classes("hubx-btn hubx-btn-primary")
+            ui.button(t("btn_txt"), on_click=lambda: ui.download(
+                topic_txt(k[1], k[2], k[5], body),
+                filename=f"hubx_{k[1][:30]}.txt")
+            ).classes("hubx-btn hubx-btn-ghost")
+            ui.button(t("preview_paper"),
+                      on_click=lambda: _open_paper_dialog(
+                          k[1], k[2], k[5], body, {})
+            ).classes("hubx-btn hubx-btn-accent")
+        kdrawer.set_value(False)  # auto-close drawer after pick
 
-        def render_topics():
-            topic_container.clear()
-            cat = selected["cat"]
-            rows = get_all_knowledge(category=cat, limit=1000)
-            topic_label.text = (f"{len(rows)} {t('topics')}"
-                                if cat else f"{len(rows)} {t('all_topics')}")
-            with topic_container:
-                if not rows:
-                    ui.label("(empty)").classes("italic text-xs").style(
-                        "color:var(--hubx-text-dim);padding:8px")
-                for r in rows[:300]:
-                    kid, topic, ver = r[0], r[1], r[5]
-                    b = ui.button(f"{topic[:48]}  ·  v{ver}").classes(
-                        "hubx-side-btn")
-                    b.on("click", lambda k=kid: show_item(k))
+    def render_topics():
+        topic_container.clear()
+        cat = selected["cat"]
+        rows = get_all_knowledge(category=cat, limit=1000)
+        topic_label.text = (f"{len(rows)} {t('topics')}"
+                            if cat else f"{len(rows)} {t('all_topics')}")
+        with topic_container:
+            if not rows:
+                ui.label("(empty)").classes("italic text-xs").style(
+                    "color:var(--hubx-text-dim);padding:8px")
+            for r in rows[:300]:
+                kid, topic, ver = r[0], r[1], r[5]
+                b = ui.button(f"{topic[:60]}  ·  v{ver}").classes(
+                    "hubx-drawer-btn")
+                b.on("click", lambda k=kid: show_item(k))
 
-        def render_categories():
-            cat_container.clear()
-            counts = category_counts()
-            with cat_container:
-                b = ui.button(t("all_topics")).classes(
-                    "hubx-side-btn" +
-                    (" selected" if selected["cat"] is None else ""))
-                b.on("click", lambda: select_category(None))
-                for cat, n in counts:
-                    cls = "hubx-side-btn" + (
-                        " selected" if selected["cat"] == cat else "")
-                    b = ui.button(f"{cat}  ({n})").classes(cls)
-                    b.on("click", lambda c=cat: select_category(c))
+    def render_categories():
+        cat_container.clear()
+        counts = category_counts()
+        with cat_container:
+            b = ui.button(t("all_topics")).classes(
+                "hubx-drawer-btn" +
+                (" selected" if selected["cat"] is None else ""))
+            b.on("click", lambda: select_category(None))
+            for cat, n in counts:
+                cls = "hubx-drawer-btn" + (
+                    " selected" if selected["cat"] == cat else "")
+                b = ui.button(f"{cat}  ({n})").classes(cls)
+                b.on("click", lambda c=cat: select_category(c))
 
-        def select_category(cat):
-            selected["cat"] = cat
+    def select_category(cat):
+        selected["cat"] = cat
+        render_categories()
+        render_topics()
+
+    def refresh_all():
+        try:
             render_categories()
             render_topics()
+        except Exception as e:
+            print(f"refresh error: {e}")
 
-        def refresh_all():
-            try:
-                render_categories()
-                render_topics()
-            except Exception as e:
-                print(f"refresh error: {e}")
-
-        refresh_all()
-        ui.timer(8.0, refresh_all)
+    refresh_all()
+    ui.timer(8.0, refresh_all)
 
 
 # ============================================================
@@ -1206,109 +1195,115 @@ def templates_page():
     _header()
     _db_banner()
 
-    with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-3"):
+    tstats = template_stats()
+    selected = {"cat": None}
+
+    # ---- Drawer ----
+    drawer_cls = ui.right_drawer if is_rtl() else ui.left_drawer
+    with drawer_cls(value=False, bordered=True).classes("hubx-drawer") as tdrawer:
+        with ui.column().classes("w-full p-3 gap-1"):
+            ui.label(t("categories")).classes("font-bold text-base")
+            cat_container = ui.column().classes("w-full gap-1")
+            ui.separator().style("border-color:var(--hubx-border)")
+            ui.label(t("templates_word")).classes("font-bold text-base mt-2")
+            topic_label = ui.label("").classes("text-xs").style(
+                "color:var(--hubx-text-dim)")
+            t_container = ui.column().classes("w-full gap-0.5")
+
+    # ---- Main content ----
+    with ui.column().classes("w-full p-2 gap-3"):
         ui.label(t("templates_title")).classes("hubx-title")
         ui.label(t("templates_sub")).classes("hubx-subtitle")
 
-        tstats = template_stats()
         with ui.row().classes("gap-3 mb-2 flex-wrap"):
             _stat(t("templates_word")).text = str(tstats["total"])
             _stat(t("refined_word")).text = str(tstats["refined"])
             _stat(t("queue_word")).text = str(tstats["pending"])
 
-        selected = {"cat": None}
-        with ui.row().classes("w-full gap-3 flex-wrap hubx-stack-mobile"):
-            with ui.card().classes("hubx-card w-72 shrink-0 h-[75vh] "
-                                   "overflow-auto"):
-                ui.label(t("categories")).classes("font-bold text-base")
-                cat_container = ui.column().classes("w-full gap-1 mt-2")
-                ui.separator().style("border-color:var(--hubx-border)")
-                ui.label(t("templates_word")).classes(
-                    "font-bold text-base mt-2")
-                topic_label = ui.label("").classes(
-                    "text-xs").style("color:var(--hubx-text-dim)")
-                t_container = ui.column().classes("w-full gap-0.5")
+        with ui.row().classes("w-full items-center gap-2 mt-2"):
+            ui.button("☰  " + t("browse"),
+                      on_click=lambda: tdrawer.set_value(not tdrawer.value)
+                      ).classes("hubx-btn hubx-btn-ghost")
 
-            with ui.card().classes("hubx-card flex-1 h-[75vh] "
-                                   "overflow-auto"):
-                toolbar = ui.row().classes(
-                    "w-full gap-2 mb-2 items-center flex-wrap")
-                detail = ui.markdown("").classes(
-                    "hubx-body whitespace-pre-wrap w-full")
+        toolbar = ui.row().classes(
+            "w-full gap-2 items-center flex-wrap")
+        detail = ui.markdown(t("no_selection")).classes(
+            "hubx-body w-full whitespace-pre-wrap")
 
-        def show_template(tid):
-            tmpl = get_template_by_id(tid)
-            if not tmpl:
-                return
-            body = tmpl[4] or tmpl[3] or "(empty)"
-            detail.content = (f"# {tmpl[1]}\n\n"
-                              f"**{t('category')}:** {tmpl[2]}  ·  "
-                              f"**{t('version')}:** v{tmpl[5]}  ·  "
-                              f"**{t('confidence')}:** {round(tmpl[6] or 0, 2)}\n\n"
-                              f"---\n\n{body}")
-            toolbar.clear()
-            with toolbar:
-                ui.button(t("btn_pdf"), on_click=lambda: ui.download(
-                    topic_pdf(tmpl[1], tmpl[2], tmpl[5], body),
-                    filename=f"hubx_tpl_{tmpl[1][:30]}.pdf")
-                ).classes("hubx-btn hubx-btn-danger")
-                ui.button(t("btn_docx"), on_click=lambda: ui.download(
-                    topic_docx(tmpl[1], tmpl[2], tmpl[5], body),
-                    filename=f"hubx_tpl_{tmpl[1][:30]}.docx")
-                ).classes("hubx-btn hubx-btn-primary")
-                ui.button(t("btn_txt"), on_click=lambda: ui.download(
-                    topic_txt(tmpl[1], tmpl[2], tmpl[5], body),
-                    filename=f"hubx_tpl_{tmpl[1][:30]}.txt")
-                ).classes("hubx-btn hubx-btn-ghost")
-                ui.button(t("preview_paper"),
-                          on_click=lambda: _open_paper_dialog(
-                              tmpl[1], tmpl[2], tmpl[5], body, {})
-                ).classes("hubx-btn hubx-btn-accent")
+    # ---- Behaviour ----
+    def show_template(tid):
+        tmpl = get_template_by_id(tid)
+        if not tmpl:
+            return
+        body = tmpl[4] or tmpl[3] or "(empty)"
+        detail.content = (f"# {tmpl[1]}\n\n"
+                          f"**{t('category')}:** {tmpl[2]}  ·  "
+                          f"**{t('version')}:** v{tmpl[5]}  ·  "
+                          f"**{t('confidence')}:** {round(tmpl[6] or 0, 2)}\n\n"
+                          f"---\n\n{body}")
+        toolbar.clear()
+        with toolbar:
+            ui.button(t("btn_pdf"), on_click=lambda: ui.download(
+                topic_pdf(tmpl[1], tmpl[2], tmpl[5], body),
+                filename=f"hubx_tpl_{tmpl[1][:30]}.pdf")
+            ).classes("hubx-btn hubx-btn-danger")
+            ui.button(t("btn_docx"), on_click=lambda: ui.download(
+                topic_docx(tmpl[1], tmpl[2], tmpl[5], body),
+                filename=f"hubx_tpl_{tmpl[1][:30]}.docx")
+            ).classes("hubx-btn hubx-btn-primary")
+            ui.button(t("btn_txt"), on_click=lambda: ui.download(
+                topic_txt(tmpl[1], tmpl[2], tmpl[5], body),
+                filename=f"hubx_tpl_{tmpl[1][:30]}.txt")
+            ).classes("hubx-btn hubx-btn-ghost")
+            ui.button(t("preview_paper"),
+                      on_click=lambda: _open_paper_dialog(
+                          tmpl[1], tmpl[2], tmpl[5], body, {})
+            ).classes("hubx-btn hubx-btn-accent")
+        tdrawer.set_value(False)
 
-        def render_templates():
-            t_container.clear()
-            cat = selected["cat"]
-            rows = get_all_templates(category=cat, limit=500)
-            topic_label.text = (f"{len(rows)} {t('templates_word')}"
-                                if cat else f"{len(rows)} {t('templates_word')}")
-            with t_container:
-                if not rows:
-                    ui.label("(empty)").classes("italic text-xs").style(
-                        "color:var(--hubx-text-dim);padding:8px")
-                for r in rows[:300]:
-                    tid, name, ver = r[0], r[1], r[5]
-                    b = ui.button(f"{name[:44]}  ·  v{ver}").classes(
-                        "hubx-side-btn")
-                    b.on("click", lambda t_=tid: show_template(t_))
+    def render_templates():
+        t_container.clear()
+        cat = selected["cat"]
+        rows = get_all_templates(category=cat, limit=500)
+        topic_label.text = f"{len(rows)} {t('templates_word')}"
+        with t_container:
+            if not rows:
+                ui.label("(empty)").classes("italic text-xs").style(
+                    "color:var(--hubx-text-dim);padding:8px")
+            for r in rows[:300]:
+                tid, name, ver = r[0], r[1], r[5]
+                b = ui.button(f"{name[:60]}  ·  v{ver}").classes(
+                    "hubx-drawer-btn")
+                b.on("click", lambda t_=tid: show_template(t_))
 
-        def render_cats():
-            cat_container.clear()
-            counts = template_category_counts()
-            with cat_container:
-                b = ui.button(t("all_categories")).classes(
-                    "hubx-side-btn" +
-                    (" selected" if selected["cat"] is None else ""))
-                b.on("click", lambda: sel(None))
-                for cat, n in counts:
-                    cls = "hubx-side-btn" + (
-                        " selected" if selected["cat"] == cat else "")
-                    b = ui.button(f"{cat}  ({n})").classes(cls)
-                    b.on("click", lambda c=cat: sel(c))
+    def render_cats():
+        cat_container.clear()
+        counts = template_category_counts()
+        with cat_container:
+            b = ui.button(t("all_categories")).classes(
+                "hubx-drawer-btn" +
+                (" selected" if selected["cat"] is None else ""))
+            b.on("click", lambda: sel(None))
+            for cat, n in counts:
+                cls = "hubx-drawer-btn" + (
+                    " selected" if selected["cat"] == cat else "")
+                b = ui.button(f"{cat}  ({n})").classes(cls)
+                b.on("click", lambda c=cat: sel(c))
 
-        def sel(cat):
-            selected["cat"] = cat
+    def sel(cat):
+        selected["cat"] = cat
+        render_cats()
+        render_templates()
+
+    def refresh():
+        try:
             render_cats()
             render_templates()
+        except Exception as e:
+            print(f"tpl refresh: {e}")
 
-        def refresh():
-            try:
-                render_cats()
-                render_templates()
-            except Exception as e:
-                print(f"tpl refresh: {e}")
-
-        refresh()
-        ui.timer(8.0, refresh)
+    refresh()
+    ui.timer(8.0, refresh)
 
 
 # ============================================================
