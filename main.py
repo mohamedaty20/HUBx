@@ -1421,7 +1421,7 @@ def charts_page():
 # / DASHBOARD
 # ============================================================
 @ui.page("/dashboard")
-def dashboard_page():
+async def dashboard_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
     STATE.focus = app.storage.user.get("focus", STATE.focus)
     _apply_body_class()
