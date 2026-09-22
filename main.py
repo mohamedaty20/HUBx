@@ -1435,72 +1435,30 @@ def dashboard_page():
 
                 
 
-        def refresh():
-            # --- engine values (getattr only, never engine.stats()) ---
-            cycles = 0
-            for n in ("cycles", "cycles_completed", "_cycles"):
-                v = getattr(engine, n, None)
-                if v is not None:
-                    cycles = v
-                    break
-
-            gemini = 0
-            for n in ("gemini_calls", "ai_calls", "_gemini_calls"):
-                v = getattr(engine, n, None)
-                if v is not None:
-                    gemini = v
-                    break
-
-            last_status = (getattr(engine, "last_status", None)
-                           or getattr(engine, "status", None)
-                           or "idle")
-            last_debug = (getattr(engine, "last_debug", None)
-                          or getattr(engine, "debug", None)
-                          or "")
-
-            paused = True
-            for n in ("paused", "is_paused", "_paused"):
-                v = getattr(engine, n, None)
-                if isinstance(v, bool):
-                    paused = v
-                    break
-            else:
-                r = getattr(engine, "running", None)
-                if isinstance(r, bool):
-                    paused = not r
-
-            # --- db counts ---
-            kb_total = kb_refined = tpl_total = tpl_queue = 0
+                def refresh():
             try:
-                ks = knowledge_stats()
-                kb_total = ks.get("total", 0)
-                kb_refined = ks.get("refined", 0)
-            except Exception:
-                pass
-            try:
-                ts = template_stats()
-                tpl_total = ts.get("total", 0)
-                tpl_queue = ts.get("pending", 0)
-            except Exception:
-                pass
+                s = engine.stats()
+            except Exception as e:
+                s = {"cycles": 0, "gemini_calls": 0, "knowledge_total": 0,
+                     "knowledge_refined": 0, "template_total": 0,
+                     "pending_topics": 0, "last_status": f"error: {e}",
+                     "last_error": str(e), "last_debug": ""}
+            status_badge.text = s["last_status"]
+            status_badge.props(
+                f'color={"green" if not engine.paused else "orange"}')
+            cycles_label.text = str(s["cycles"])
+            gemini_label.text = str(s["gemini_calls"])
+            kb_label.text = str(s["knowledge_total"])
+            refined_label.text = str(s["knowledge_refined"])
+            tpl_label.text = str(s.get("template_total", 0))
+            queue_label.text = str(s.get("pending_topics", 0))
+            debug_label.text = s["last_debug"]
+            gemini_err_label.text = (
+                f"Gemini: {gemini_mod.last_error}"
+                if gemini_mod.last_error else "")
 
-            # --- push to UI (never let a bad value crash the page) ---
-            try:
-                status_badge.text = str(last_status)
-                status_badge.props(
-                    f'color={"orange" if paused else "green"}')
-                cycles_label.text = str(cycles)
-                gemini_label.text = str(gemini)
-                kb_label.text = str(kb_total)
-                refined_label.text = str(kb_refined)
-                tpl_label.text = str(tpl_total)
-                queue_label.text = str(tpl_queue)
-                debug_label.text = str(last_debug)
-                gemini_err_label.text = (
-                    f"Gemini: {gemini_mod.last_error}"
-                    if gemini_mod.last_error else "")
-            except Exception as ex:
-                print(f"[dashboard refresh] {ex}")
+        ui.timer(2.0, refresh)
+        refresh()
         ui.timer(2.0, refresh)
         refresh()
 
