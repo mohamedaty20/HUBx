@@ -1,6 +1,6 @@
 # gemini.py
-# v13: sanitizer handles \square, \boxed, \checkmark, generic \cmd{...}.
-#      Prompts now English-only, so no bilingual mess.
+# v14: no purge on boot (counter persists). Slower calls. Smaller output.
+#      Two calls share one throttle lock so token budget fits.
 
 import os
 import re
@@ -20,17 +20,19 @@ from prompts import (
 )
 
 from db import (check_and_increment_gemini_usage,
-                gemini_usage_stats, purge_old_gemini_usage)
+                gemini_usage_stats)
 
 logger = logging.getLogger(__name__)
 
 MODEL = "openai/gpt-oss-120b"
 
-GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "800"))
-GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "60"))
-_QUOTA_BLOCK_SECONDS = 180
-ATTEMPT_TIMEOUT_SECONDS = 90
-MIN_CALL_GAP = 60.0
+GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "600"))
+GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "40"))
+_QUOTA_BLOCK_SECONDS = 240
+ATTEMPT_TIMEOUT_SECONDS = 120
+
+# 120s between calls = 0.5 calls per minute. Safely under the TPM wall.
+MIN_CALL_GAP = 120.0
 
 _quota_block_until = 0.0
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
@@ -43,11 +45,8 @@ last_error = ""
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 
-try:
-    purge_old_gemini_usage(keep_seconds=0)
-    print("[gemini] usage counter cleared on startup")
-except Exception as e:
-    print(f"[gemini] purge failed: {e}")
+# NO purge on boot. The counter in Turso is the source of truth and
+# survives every deploy.
 
 
 _LATEX_SIMPLE = [
@@ -67,7 +66,6 @@ _LATEX_SIMPLE = [
     (r"\\checkmark\b", "✓"), (r"\\check\b", "✓"),
     (r"\\bullet\b", "•"), (r"\\cdots\b", "…"),
     (r"\\ldots\b", "…"), (r"\\dots\b", "…"),
-    (r"\\leq\b", "≤"), (r"\\geq\b", "≥"),
 ]
 
 
@@ -75,16 +73,12 @@ def sanitize_text(s):
     if not s:
         return s
     s = str(s)
-    # Remove \( ... \) and \[ ... \] math delimiters entirely
     s = re.sub(r"\\\(([^)]*)\\\)", r"\1", s)
     s = re.sub(r"\\\[([^\]]*)\\\]", r"\1", s)
-    # Unwrap \text{...}, \mathbf{...}, etc
     s = re.sub(r"\\text(?:bf|it|rm|sf|tt)?\{([^{}]*)\}", r"\1", s)
     s = re.sub(r"\\math(?:bf|it|rm|sf|tt)\{([^{}]*)\}", r"\1", s)
     s = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", s)
-    # Generic \command{...} -> keep inner content
     s = re.sub(r"\\[A-Za-z]+\{([^{}]*)\}", r"\1", s)
-    # Fractions, roots, superscripts, subscripts
     s = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", s)
     s = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", s)
     s = re.sub(r"\^\{([^{}]*)\}", r"^(\1)", s)
@@ -105,7 +99,7 @@ async def _throttle():
         now = time.monotonic()
         wait = MIN_CALL_GAP - (now - _last_call_time)
         if wait > 0:
-            wait += random.uniform(0, 1.0)
+            wait += random.uniform(0, 2.0)
             await asyncio.sleep(wait)
         _last_call_time = time.monotonic()
 
@@ -113,10 +107,11 @@ async def _throttle():
 def _is_quota_error(err_str):
     s = (err_str or "").lower()
     return ("429" in s or "quota" in s or "rate limit" in s
-            or "too many requests" in s or "exceeded" in s)
+            or "too many requests" in s or "exceeded" in s
+            or "tokens" in s and "limit" in s)
 
 
-async def _call(prompt, json_mode=False, max_tokens=2000, max_retries=2):
+async def _call(prompt, json_mode=False, max_tokens=1500, max_retries=2):
     global last_error, _quota_block_until
 
     if not _client:
@@ -126,7 +121,7 @@ async def _call(prompt, json_mode=False, max_tokens=2000, max_retries=2):
     now_m = time.monotonic()
     if now_m < _quota_block_until:
         left = int(_quota_block_until - now_m)
-        last_error = f"{MODEL}: paused after 429, {left}s left"
+        last_error = f"{MODEL}: cooling down, {left}s left"
         return ""
 
     kwargs = {
@@ -143,9 +138,8 @@ async def _call(prompt, json_mode=False, max_tokens=2000, max_retries=2):
             day_limit=GEMINI_DAY_LIMIT, hour_limit=GEMINI_HOUR_LIMIT)
         if not allowed:
             _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
-            last_error = (f"{MODEL}: cap reached "
-                          f"({GEMINI_DAY_LIMIT}/day, "
-                          f"{GEMINI_HOUR_LIMIT}/hour), paused "
+            last_error = (f"{MODEL}: our cap reached "
+                          f"({GEMINI_HOUR_LIMIT}/hour), paused "
                           f"{_QUOTA_BLOCK_SECONDS}s")
             logger.warning(last_error)
             return ""
@@ -170,51 +164,51 @@ async def _call(prompt, json_mode=False, max_tokens=2000, max_retries=2):
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
                 _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
-                last_error = f"{MODEL}: 429, paused {_QUOTA_BLOCK_SECONDS}s"
+                last_error = f"{MODEL}: Groq 429, cooling {_QUOTA_BLOCK_SECONDS}s"
                 logger.warning(last_error)
                 return ""
             last_error = f"{MODEL}: {err_str}"
             logger.warning("LLM call failed (attempt %d): %s", attempt + 1, e)
-            await asyncio.sleep(3 * (attempt + 1))
+            await asyncio.sleep(4 * (attempt + 1))
     return ""
 
 
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=2400)
+                       json_mode=False, max_tokens=1500)
 
 
 async def refine_knowledge(topic, existing):
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:6000])
     return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=2400)
+                       json_mode=False, max_tokens=1500)
 
 
 async def generate_template(name, category):
     user = TEMPLATE_USER_TEMPLATE.format(name=name, category=category)
     return await _call(f"{TEMPLATE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=2400)
+                       json_mode=False, max_tokens=1500)
 
 
 async def refine_template(name, existing):
     return await _call(
-        "Improve the following construction template. English only. "
-        "Sample Filled Example must be a markdown table with columns "
-        "Field and Sample Value. Keep the same structure. No LaTeX, "
-        "no Arabic.\n\n---\n\n"
+        "Improve the following construction template. Keep bilingual "
+        "headers. Sample Filled Example must be a markdown table with "
+        "columns Field and Sample Value. No LaTeX, no \\square, no "
+        "\\(...\\).\n\n---\n\n"
         f"Template: {name}\n\n{existing[:6000]}",
-        json_mode=False, max_tokens=2400)
+        json_mode=False, max_tokens=1500)
 
 
 async def suggest_subtopics(parent_topic, category, n=3):
     prompt = (
         f"Propose {n} new specific sub-topics within category "
-        f"'{category}', inspired by this parent topic: {parent_topic}. "
-        "English only. No Arabic. 6-14 words each. "
+        f"'{category}', inspired by: {parent_topic}. "
+        "6-14 words each. "
         'Return ONLY JSON: {"subtopics": ["...", "..."]}'
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=400)
+    raw = await _call(prompt, json_mode=True, max_tokens=350)
     if not raw:
         return []
     try:
@@ -237,11 +231,11 @@ async def suggest_subtopics(parent_topic, category, n=3):
 async def suggest_subtemplates(parent_name, category, n=3):
     prompt = (
         f"Propose {n} new specific template names within category "
-        f"'{category}', inspired by this parent: {parent_name}. "
-        "English only. No Arabic. 6-14 words each. "
+        f"'{category}', inspired by: {parent_name}. "
+        "6-14 words each. Bilingual. "
         'Return ONLY JSON: {"templates": ["...", "..."]}'
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=400)
+    raw = await _call(prompt, json_mode=True, max_tokens=350)
     if not raw:
         return []
     try:
@@ -265,7 +259,7 @@ async def check_document(filename, file_type, text):
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
     raw = await _call(f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                      json_mode=True, max_tokens=3000)
+                      json_mode=True, max_tokens=2500)
     if not raw:
         return {}
     try:
@@ -292,14 +286,14 @@ async def check_document(filename, file_type, text):
 async def ai_search(question, knowledge_context):
     prompt = (
         "You are a senior Egyptian civil quality engineer. Answer using "
-        "ONLY the excerpts below. English only. No LaTeX.\n\n"
-        "RULES:\n- 300-600 words.\n- Use markdown headings and bullets.\n"
+        "ONLY the excerpts below. No LaTeX, no \\square.\n\n"
+        "RULES:\n- 300-600 words.\n- Markdown headings and bullets.\n"
         "- Cite topic names in brackets.\n"
-        "- End with '## Related topics' list.\n\n"
+        "- End with '## Related topics'.\n\n"
         f"=== EXCERPTS ===\n{knowledge_context}\n\n"
         f"=== QUESTION ===\n{question}\n"
     )
-    return await _call(prompt, json_mode=False, max_tokens=1500)
+    return await _call(prompt, json_mode=False, max_tokens=1200)
 
 
 async def ocr_image(path):
