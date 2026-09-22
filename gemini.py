@@ -1,6 +1,6 @@
 # gemini.py
-# v7: hourly cap 100, MIN_CALL_GAP 5s to respect 15 RPM free tier,
-#     429 → block 300s and return, no retry storm.
+# v8: max_tokens 3000 for knowledge/template/refine (was 8192),
+#     hourly cap hint 100, 180s timeout, no retry on 429/timeout.
 
 import os
 import re
@@ -31,11 +31,7 @@ GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "400"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "100"))
 _QUOTA_BLOCK_SECONDS = 300
 
-# Hard timeout per attempt.
 ATTEMPT_TIMEOUT_SECONDS = 180
-
-# Minimum seconds between two Gemini calls. Free tier is 15 RPM, so
-# 5s keeps us at 12/min safely under the limit.
 MIN_CALL_GAP = 5.0
 
 _quota_block_until = 0.0
@@ -126,7 +122,7 @@ def _is_quota_error(err_str):
             or "rate limit" in s or "exceeded" in s)
 
 
-async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
+async def _call(prompt, json_mode=False, max_tokens=3000, max_retries=6):
     global last_error, _quota_block_until
 
     if not GEMINI_API_KEY:
@@ -182,8 +178,6 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
         except Exception as e:
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
-                # Google is rate-limiting us. Retrying immediately makes
-                # it worse. Block for a while and let the next cycle try.
                 _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
                 last_error = (f"{MODEL}: Gemini 429, paused "
                               f"{_QUOTA_BLOCK_SECONDS}s")
@@ -199,19 +193,19 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=8192)
+                       json_mode=False, max_tokens=3000)
 
 
 async def refine_knowledge(topic, existing):
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:6000])
     return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=8192)
+                       json_mode=False, max_tokens=3000)
 
 
 async def generate_template(name, category):
     user = TEMPLATE_USER_TEMPLATE.format(name=name, category=category)
     return await _call(f"{TEMPLATE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=8192)
+                       json_mode=False, max_tokens=3000)
 
 
 async def refine_template(name, existing):
@@ -221,7 +215,7 @@ async def refine_template(name, existing):
         "mistakes. Keep the same structure. Return only the improved "
         "template, plain text, no LaTeX.\n\n---\n\n"
         f"Template: {name}\n\n{existing[:6000]}",
-        json_mode=False, max_tokens=8192)
+        json_mode=False, max_tokens=3000)
 
 
 async def suggest_subtopics(parent_topic, category, n=3):
