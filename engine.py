@@ -1,6 +1,6 @@
 # engine.py
-# v4: real expansion loop — pop pending first, suggest sub-topics after
-#     each generation. Refine only unverified/unflagged rows.
+# v5: skip existing topics instead of refining them. Drain dupe queue
+#     quickly. Ask Gemini for a fresh topic when queue is exhausted.
 
 from __future__ import annotations
 import asyncio
@@ -37,9 +37,6 @@ except Exception:
 PAUSED_KEY = "engine_paused_by_user"
 
 
-# ==================================================================
-# DB adapters
-# ==================================================================
 def _find(*names):
     for n in names:
         fn = getattr(_db, n, None)
@@ -61,8 +58,6 @@ _POP_TOPIC      = _find("pop_pending_topic")
 _POP_TEMPLATE   = _find("pop_pending_template")
 _ADD_TOPIC      = _find("add_pending_topic")
 _ADD_TEMPLATE   = _find("add_pending_template")
-_OLDEST_KN      = _find("oldest_unverified_knowledge")
-_OLDEST_TPL     = _find("oldest_unverified_template")
 
 
 def _call_adapt(fn, *args, **kwargs):
@@ -148,9 +143,6 @@ def _existing_template(name):
         return None
 
 
-# ==================================================================
-# Engine
-# ==================================================================
 class Engine:
     def __init__(self):
         self.running = False
@@ -255,56 +247,53 @@ class Engine:
 
     # -------- knowledge --------
     async def _knowledge_step(self):
-        # 1. Try pending queue
-        item = None
-        if _POP_TOPIC:
-            try:
-                item = _POP_TOPIC()
-            except Exception:
-                item = None
+        """Find a genuinely new topic. Skip existing. Drain queue fast."""
+        topic = category = None
 
-        if item:
-            topic, category = item[0], item[1]
-            source = "pending"
-        else:
-            # fall back to seeds
-            if not SEED_TOPICS:
-                return
-            topic, category = SEED_TOPICS[self._k_idx % len(SEED_TOPICS)]
-            self._k_idx += 1
-            source = "seed"
+        # Try up to 15 candidates in one cycle. Existing ones are
+        # dropped quickly without a Gemini call.
+        for _ in range(15):
+            item = None
+            if _POP_TOPIC:
+                try:
+                    item = _POP_TOPIC()
+                except Exception:
+                    item = None
 
-        existing = _existing_knowledge(topic)
-
-        # Skip already-verified and NOT flagged
-        if existing:
-            try:
-                verified = existing[9] if len(existing) > 9 else 0
-                flagged = existing[10] if len(existing) > 10 else 0
-            except Exception:
-                verified, flagged = 0, 0
-            if verified and not flagged:
-                self.last_debug = f"skipped verified: {topic}"
-                return
-
-        if existing:
-            # refine
-            body = existing[4] or existing[3] or ""
-            self.last_debug = f"refining: {topic}"
-            new_body = await refine_knowledge(topic, body)
-            self.gemini_calls += 1
-            if new_body:
-                ver = (existing[5] or 1) + 1
-                conf = existing[6] or 0.7
-                _save_knowledge(topic, category, new_body,
-                                version=ver, confidence=conf)
-                self.last_debug = f"refined: {topic}"
-                _save_lrun(self.cycles, topic, 0, 1, 1, "")
+            if item:
+                t, c = item[0], item[1]
             else:
-                _save_lrun(self.cycles, topic, 0, 0, 1, "refine empty")
+                if not SEED_TOPICS:
+                    break
+                t, c = SEED_TOPICS[self._k_idx % len(SEED_TOPICS)]
+                self._k_idx += 1
+
+            if _existing_knowledge(t):
+                # Already have it. Skip. No Gemini call.
+                continue
+
+            topic, category = t, c
+            break
+
+        # Nothing new in queue or seeds. Ask Gemini for a fresh topic.
+        if not topic:
+            try:
+                subs = await suggest_subtopics(
+                    "Egyptian civil quality engineering",
+                    "quality_management", n=1)
+                self.gemini_calls += 1
+                if subs:
+                    t = subs[0]
+                    if not _existing_knowledge(t):
+                        topic = t
+                        category = "quality_management"
+            except Exception as e:
+                print(f"[engine] fresh topic suggestion failed: {e}")
+
+        if not topic:
+            self.last_debug = "no new knowledge topics available"
             return
 
-        # generate new
         self.last_debug = f"generating: {topic}"
         content = await generate_knowledge(topic, category)
         self.gemini_calls += 1
@@ -313,15 +302,14 @@ class Engine:
             _save_lrun(self.cycles, topic, 0, 0, 1, "gemini empty")
             return
 
-        _save_knowledge(topic, category, content,
-                        version=1, confidence=0.7)
+        _save_knowledge(topic, category, content, version=1, confidence=0.7)
         self.last_debug = f"generated: {topic}"
         _save_lrun(self.cycles, topic, 1, 0, 1, "")
 
-        # expand: ask for sub-topics
+        # expand the queue
         try:
-            subs = await suggest_subtopics(topic, category,
-                                           n=int(SUGGESTIONS_PER_CYCLE or 3))
+            subs = await suggest_subtopics(
+                topic, category, n=int(SUGGESTIONS_PER_CYCLE or 3))
             self.gemini_calls += 1
             added = 0
             if _ADD_TOPIC:
@@ -334,51 +322,50 @@ class Engine:
 
     # -------- templates --------
     async def _template_step(self):
-        item = None
-        if _POP_TEMPLATE:
-            try:
-                item = _POP_TEMPLATE()
-            except Exception:
-                item = None
+        name = category = None
 
-        if item:
-            name, category = item[0], item[1]
-        else:
-            if not SEED_TEMPLATES:
-                return
-            seed = SEED_TEMPLATES[self._t_idx % len(SEED_TEMPLATES)]
-            self._t_idx += 1
-            if isinstance(seed, (list, tuple)) and len(seed) >= 2:
-                name, category = seed[0], seed[1]
+        for _ in range(15):
+            item = None
+            if _POP_TEMPLATE:
+                try:
+                    item = _POP_TEMPLATE()
+                except Exception:
+                    item = None
+
+            if item:
+                t, c = item[0], item[1]
             else:
-                name, category = str(seed), "administrative"
+                if not SEED_TEMPLATES:
+                    break
+                seed = SEED_TEMPLATES[self._t_idx % len(SEED_TEMPLATES)]
+                self._t_idx += 1
+                if isinstance(seed, (list, tuple)) and len(seed) >= 2:
+                    t, c = seed[0], seed[1]
+                else:
+                    t, c = str(seed), "administrative"
 
-        existing = _existing_template(name)
+            if _existing_template(t):
+                continue
 
-        if existing:
+            name, category = t, c
+            break
+
+        if not name:
             try:
-                verified = existing[9] if len(existing) > 9 else 0
-                flagged = existing[10] if len(existing) > 10 else 0
-            except Exception:
-                verified, flagged = 0, 0
-            if verified and not flagged:
-                self.last_debug = f"skipped verified: {name}"
-                return
+                subs = await suggest_subtemplates(
+                    "Egyptian construction site template",
+                    "quality", n=1)
+                self.gemini_calls += 1
+                if subs:
+                    t = subs[0]
+                    if not _existing_template(t):
+                        name = t
+                        category = "quality"
+            except Exception as e:
+                print(f"[engine] fresh template suggestion failed: {e}")
 
-        if existing:
-            body = existing[4] or existing[3] or ""
-            self.last_debug = f"refining template: {name}"
-            new_body = await refine_template(name, body)
-            self.gemini_calls += 1
-            if new_body:
-                ver = (existing[5] or 1) + 1
-                conf = existing[6] or 0.7
-                _save_template(name, category, new_body,
-                               version=ver, confidence=conf)
-                self.last_debug = f"refined template: {name}"
-                _save_trun(self.cycles, name, 0, 1, "")
-            else:
-                _save_trun(self.cycles, name, 0, 0, "refine empty")
+        if not name:
+            self.last_debug = "no new templates available"
             return
 
         self.last_debug = f"generating template: {name}"
@@ -389,14 +376,13 @@ class Engine:
             _save_trun(self.cycles, name, 0, 0, "gemini empty")
             return
 
-        _save_template(name, category, content,
-                       version=1, confidence=0.7)
+        _save_template(name, category, content, version=1, confidence=0.7)
         self.last_debug = f"generated template: {name}"
         _save_trun(self.cycles, name, 1, 0, "")
 
         try:
-            subs = await suggest_subtemplates(name, category,
-                                              n=int(SUGGESTIONS_PER_CYCLE or 3))
+            subs = await suggest_subtemplates(
+                name, category, n=int(SUGGESTIONS_PER_CYCLE or 3))
             self.gemini_calls += 1
             added = 0
             if _ADD_TEMPLATE:
