@@ -3,6 +3,7 @@
 # v5: mobile-first layout
 # v6: slide-in drawer for categories/topics
 # v7: reader flush-left, tables horizontally scrollable
+# v8: engine auto-starts on boot; pause is persisted in DB.
 
 import os
 import io
@@ -22,8 +23,9 @@ from db import (init_db, get_all_knowledge, get_knowledge_by_id,
                 get_all_templates, get_template_by_id,
                 template_category_counts, template_stats,
                 recent_template_runs,
-                gemini_usage_stats)
-from engine import engine
+                gemini_usage_stats,
+                get_app_state, set_app_state)
+from engine import engine, auto_start_if_needed
 from file_reader import extract_text
 from gemini import check_document, ai_search
 import gemini as gemini_mod
@@ -295,7 +297,6 @@ body, .q-page, .nicegui-content {
 .hubx-btn-ghost:hover { border-color: var(--hubx-primary) !important;
                         color: var(--hubx-primary) !important; }
 
-/* Reader markdown — flush left, scrollable tables */
 .hubx-body h1 { font-size: 1.55rem; font-weight: 800; margin: 0.2em 0 0.5em 0;
                 line-height: 1.25; letter-spacing: -0.3px; }
 .hubx-body h2 { font-size: 1.2rem; font-weight: 700; margin: 0.9em 0 0.35em 0;
@@ -313,7 +314,6 @@ body, .q-page, .nicegui-content {
                 text-align: left !important; padding-left: 0; }
 .hubx-body strong { font-weight: 700; color: #fff; }
 
-/* Tables: block + scroll, so all columns reachable */
 .hubx-body table {
     display: block;
     overflow-x: auto;
@@ -394,7 +394,6 @@ body.lang-ar .hubx-drawer-btn {
 .hubx-drawer { background: var(--hubx-surface) !important; }
 .hubx-drawer .q-drawer__content { background: var(--hubx-surface) !important; }
 
-/* ---------- PAPER (A4) ---------- */
 .hubx-paper {
     background: #ffffff; color: #111111;
     width: 210mm; min-height: 297mm;
@@ -439,7 +438,6 @@ body.lang-ar .hubx-drawer-btn {
                       font-size: 9pt; color: #666;
                       border-top: 1px solid #ccc; padding-top: 4mm; }
 
-/* ---------- MOBILE ---------- */
 @media (max-width: 768px) {
     html, body { overflow-x: hidden !important; max-width: 100vw !important; }
     .q-page, .nicegui-content { overflow-x: hidden !important; }
@@ -532,6 +530,7 @@ def _serve_paper(token: str):
         headers={"Content-Disposition": f'inline; filename="{token}.pdf"'},
     )
 
+
 async def _keepalive():
     while True:
         await asyncio.sleep(600)
@@ -545,7 +544,12 @@ async def _keepalive():
             pass
 
 
-app.on_startup(lambda: asyncio.create_task(_keepalive()))
+def _boot_tasks():
+    asyncio.create_task(_keepalive())
+    asyncio.create_task(auto_start_if_needed())
+
+
+app.on_startup(_boot_tasks)
 
 
 def _apply_body_class():
@@ -1451,7 +1455,7 @@ def dashboard_page():
             "color:var(--hubx-text-dim);font-size:0.82rem")
 
         async def do_start():
-            await engine.start()
+            await engine.start(by_user=True)
             refresh()
 
         async def do_pause():
