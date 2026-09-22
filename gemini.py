@@ -24,7 +24,7 @@ from db import (check_and_increment_gemini_usage,
 
 logger = logging.getLogger(__name__)
 
-MODEL = "openai/gpt-oss-120b"
+MODEL = "openai/gpt-oss-20b"
 
 GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "600"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "40"))
@@ -32,7 +32,7 @@ _QUOTA_BLOCK_SECONDS = 240
 ATTEMPT_TIMEOUT_SECONDS = 180
 
 # Bilingual output needs longer calls. 180s between calls.
-MIN_CALL_GAP = 180.0
+MIN_CALL_GAP = 240.0
 
 _quota_block_until = 0.0
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
