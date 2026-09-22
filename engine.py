@@ -1,18 +1,7 @@
 # engine.py
 """
-Self-learning loop for the Egypt civil-engineering knowledge + template tool.
-
-Uses:
-    gemini.py   -> generate_knowledge, refine_knowledge,
-                   generate_template, refine_template
-    db.py       -> storage (defensive: works with several function names)
-    sources.py  -> SEED_TOPICS, SEED_TEMPLATES, intervals
-    state.py    -> STATE.focus (knowledge / templates / both)   [optional]
-
-Attributes main.py expects (all present):
-    running, paused, cycles, cycles_completed, gemini_calls, ai_calls,
-    last_status, last_error, last_debug
-    async start(), async pause(), async _cycle(), stats()
+Self-learning loop.
+v3: auto-start on boot, persisted pause state in DB.
 """
 
 from __future__ import annotations
@@ -20,16 +9,13 @@ import asyncio
 import inspect
 import traceback
 
-# --- their real gemini.py (model = gemini-3.5-flash-lite lives there) ---
 from gemini import (
     generate_knowledge, refine_knowledge,
     generate_template, refine_template,
 )
 
-# --- their real db.py ---
 import db as _db
 
-# --- seed data + intervals from sources.py ---
 from sources import (
     LEARNING_INTERVAL_SECONDS, TEMPLATE_INTERVAL_SECONDS,
     REFINE_EVERY_N_CYCLES, SUGGESTIONS_PER_CYCLE,
@@ -37,7 +23,6 @@ from sources import (
     SEED_TOPICS, SEED_TEMPLATES,
 )
 
-# --- focus state (optional file; falls back gracefully) ---
 try:
     from state import STATE
 except Exception:
@@ -50,8 +35,11 @@ except Exception:
     STATE = _S()
 
 
+PAUSED_KEY = "engine_paused_by_user"
+
+
 # ==================================================================
-# DB adapters — call whatever the real db.py actually exposes
+# DB adapters
 # ==================================================================
 def _find(*names):
     for n in names:
@@ -77,10 +65,8 @@ _GET_TEMPLATE_BY_NAME   = _find("get_template_by_name",
 
 
 def _call_adapt(fn, *args, **kwargs):
-    """Call fn trying positional first, then kwargs, then signature-filtered."""
     if not fn:
         return None
-
     if args:
         try:
             return fn(*args)
@@ -89,7 +75,6 @@ def _call_adapt(fn, *args, **kwargs):
         except Exception as e:
             print(f"[db] {getattr(fn, '__name__', fn)} (positional) failed: {e}")
             return None
-
     try:
         return fn(**kwargs)
     except TypeError:
@@ -97,7 +82,6 @@ def _call_adapt(fn, *args, **kwargs):
     except Exception as e:
         print(f"[db] {getattr(fn, '__name__', fn)} (kwargs) failed: {e}")
         return None
-
     try:
         sig = inspect.signature(fn)
         filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -197,8 +181,7 @@ class Engine:
         self._k_idx = 0
         self._t_idx = 0
 
-    # -------- controls --------
-    async def start(self):
+    async def start(self, by_user=True):
         if self.running:
             return
         self.running = True
@@ -206,6 +189,9 @@ class Engine:
         self.last_status = "running"
         self.last_error = ""
         self.last_debug = "started"
+        if by_user:
+            # user explicitly pressed Start -> clear the persisted pause
+            _db.set_app_state(PAUSED_KEY, "0")
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop())
         else:
@@ -216,6 +202,8 @@ class Engine:
         self.paused = True
         self.last_status = "paused"
         self.last_debug = "paused"
+        # persist so next boot does NOT auto-start
+        _db.set_app_state(PAUSED_KEY, "1")
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -224,7 +212,6 @@ class Engine:
                 pass
         self._task = None
 
-    # -------- loop --------
     async def _loop(self):
         try:
             while self.running:
@@ -255,7 +242,6 @@ class Engine:
             self.last_status = "paused"
             raise
 
-    # -------- one cycle --------
     async def _cycle(self):
         async with self._lock:
             self.last_status = "running"
@@ -282,7 +268,6 @@ class Engine:
 
             self.ai_calls = self.gemini_calls
 
-    # -------- knowledge --------
     async def _knowledge_step(self):
         if not SEED_TOPICS:
             return
@@ -327,7 +312,6 @@ class Engine:
             self.last_debug = f"empty: {topic}"
             _save_lrun(self.cycles, topic, 0, 0, 1, "gemini empty")
 
-    # -------- templates --------
     async def _template_step(self):
         if not SEED_TEMPLATES:
             return
@@ -375,7 +359,6 @@ class Engine:
             self.last_debug = f"empty template: {name}"
             _save_trun(self.cycles, name, 0, 0, "gemini empty")
 
-    # -------- stats for /dashboard --------
     def stats(self) -> dict:
         kb_total = kb_refined = 0
         tpl_total = tpl_pending = 0
@@ -408,3 +391,23 @@ class Engine:
 
 
 engine = Engine()
+
+
+# ==================================================================
+# Boot helper
+# ==================================================================
+async def auto_start_if_needed():
+    """Called on app boot. Starts the engine unless the user had paused it."""
+    try:
+        paused_flag = _db.get_app_state(PAUSED_KEY, "0")
+    except Exception:
+        paused_flag = "0"
+    if str(paused_flag) == "1":
+        engine.paused = True
+        engine.running = False
+        engine.last_status = "paused"
+        engine.last_debug = "auto-start skipped (paused by user)"
+        print("[engine] auto-start skipped — user previously paused")
+        return
+    print("[engine] auto-starting on boot")
+    await engine.start(by_user=False)
