@@ -1,6 +1,6 @@
 # gemini.py
-# v15: max_tokens 4000 for bilingual output. No purge on boot.
-#      120s pacing to fit Groq's TPM wall.
+# v16: JSON calls get 1500 tokens (was 500, caused truncation).
+#      n=2 default for suggestion calls. BadRequestError caught.
 
 import os
 import re
@@ -30,8 +30,6 @@ GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "600"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "40"))
 _QUOTA_BLOCK_SECONDS = 240
 ATTEMPT_TIMEOUT_SECONDS = 180
-
-# Bilingual output needs longer calls. 180s between calls.
 MIN_CALL_GAP = 240.0
 
 _quota_block_until = 0.0
@@ -44,8 +42,6 @@ if GROQ_API_KEY:
 last_error = ""
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
-
-# NO purge on boot. The counter persists across deploys.
 
 
 _LATEX_SIMPLE = [
@@ -110,6 +106,13 @@ def _is_quota_error(err_str):
             or ("tokens" in s and "limit" in s))
 
 
+def _is_json_validation_error(err_str):
+    s = (err_str or "").lower()
+    return ("json_validate_failed" in s
+            or "failed to generate json" in s
+            or "max completion tokens reached" in s)
+
+
 async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
     global last_error, _quota_block_until
 
@@ -167,6 +170,12 @@ async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
                               f"{_QUOTA_BLOCK_SECONDS}s")
                 logger.warning(last_error)
                 return ""
+            if _is_json_validation_error(err_str):
+                # Output was truncated or malformed. Don't retry — same
+                # budget will produce the same truncation.
+                last_error = f"{MODEL}: JSON too large for budget"
+                logger.warning(last_error)
+                return ""
             last_error = f"{MODEL}: {err_str}"
             logger.warning("LLM call failed (attempt %d): %s", attempt + 1, e)
             await asyncio.sleep(4 * (attempt + 1))
@@ -195,24 +204,23 @@ async def refine_template(name, existing):
     return await _call(
         "Improve the following construction template. Keep it FULLY "
         "BILINGUAL: every paragraph, bullet, and table cell in English "
-        "AND Arabic. Sample Filled Example MUST be a markdown table "
-        "with columns Field | Sample Value, each cell bilingual using "
-        "<br> between English and Arabic. No LaTeX, no \\square, no "
-        "\\(...\\).\n\n---\n\n"
+        "AND Arabic separated by ' / '. Sample Filled Example MUST be "
+        "a markdown table with columns Field | Sample Value. "
+        "Never use <br>. No LaTeX, no \\square, no \\(...\\).\n\n"
+        "---\n\n"
         f"Template: {name}\n\n{existing[:6000]}",
         json_mode=False, max_tokens=4000)
 
 
-async def suggest_subtopics(parent_topic, category, n=3):
+async def suggest_subtopics(parent_topic, category, n=2):
     prompt = (
-        f"Propose {n} new specific sub-topics within category "
-        f"'{category}', inspired by: {parent_topic}. "
-        "Each topic string must be bilingual in the form "
-        "'English Title / العنوان بالعربية'. 6-14 words for the English "
-        "part. "
-        'Return ONLY JSON: {"subtopics": ["...", "..."]}'
+        f"Return a JSON object with one key 'subtopics' whose value is "
+        f"an array of exactly {n} short bilingual strings. "
+        f"Category: {category}. Parent: {parent_topic}. "
+        "Each string: 'English Title / العربية'. English part 4-8 words. "
+        "Keep total output under 200 tokens."
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=500)
+    raw = await _call(prompt, json_mode=True, max_tokens=1500)
     if not raw:
         return []
     try:
@@ -232,16 +240,15 @@ async def suggest_subtopics(parent_topic, category, n=3):
     return []
 
 
-async def suggest_subtemplates(parent_name, category, n=3):
+async def suggest_subtemplates(parent_name, category, n=2):
     prompt = (
-        f"Propose {n} new specific template names within category "
-        f"'{category}', inspired by: {parent_name}. "
-        "Each name string must be bilingual in the form "
-        "'English Name / الاسم بالعربية'. 6-14 words for the English "
-        "part. "
-        'Return ONLY JSON: {"templates": ["...", "..."]}'
+        f"Return a JSON object with one key 'templates' whose value is "
+        f"an array of exactly {n} short bilingual strings. "
+        f"Category: {category}. Parent: {parent_name}. "
+        "Each string: 'English Name / الاسم بالعربية'. English part "
+        "4-8 words. Keep total output under 200 tokens."
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=500)
+    raw = await _call(prompt, json_mode=True, max_tokens=1500)
     if not raw:
         return []
     try:
@@ -292,7 +299,7 @@ async def check_document(filename, file_type, text):
 async def ai_search(question, knowledge_context):
     prompt = (
         "You are a senior Egyptian civil quality engineer. Answer using "
-        "ONLY the excerpts below. No LaTeX, no \\square.\n\n"
+        "ONLY the excerpts below. No LaTeX, no <br>.\n\n"
         "RULES:\n- 300-600 words.\n- Markdown headings and bullets.\n"
         "- Cite topic names in brackets.\n"
         "- End with '## Related topics'.\n\n"
