@@ -1,7 +1,5 @@
 # db.py
-# Turso with local fallback. Version replacement + templates + search.
-# v4: gemini_usage table + daily/hourly quota counter.
-# v5: app_state key/value table for persisting user pause/resume.
+# v6: verified/flagged columns, get_knowledge_by_topic, safe migrations.
 
 import os
 import json
@@ -82,6 +80,19 @@ def db_health():
         "error": _db_error,
         "ok": _db_mode == "turso",
     }
+
+
+def _ensure_column(conn, table, column, ddl):
+    """Safely add a column if it doesn't exist (SQLite / Turso)."""
+    try:
+        cols = [r[1] for r in
+                conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+            conn.commit()
+            print(f"[db] added column {table}.{column}")
+    except Exception as e:
+        logger.warning("ensure_column %s.%s failed: %s", table, column, e)
 
 
 def init_db():
@@ -169,9 +180,20 @@ def init_db():
     """)
     conn.commit()
 
+    # --- safe migrations for existing DBs ---
+    _ensure_column(conn, "knowledge", "verified",
+                   "verified INTEGER DEFAULT 0")
+    _ensure_column(conn, "knowledge", "flagged",
+                   "flagged INTEGER DEFAULT 0")
+    _ensure_column(conn, "templates", "verified",
+                   "verified INTEGER DEFAULT 0")
+    _ensure_column(conn, "templates", "flagged",
+                   "flagged INTEGER DEFAULT 0")
+    conn.commit()
+
 
 # ---------------------------------------------------------------
-# App state (small persistent key/value store)
+# App state
 # ---------------------------------------------------------------
 def get_app_state(key, default=""):
     try:
@@ -197,7 +219,7 @@ def set_app_state(key, value):
 
 
 # ---------------------------------------------------------------
-# Gemini usage counter
+# Gemini usage
 # ---------------------------------------------------------------
 def _utcnow_iso():
     return datetime.datetime.utcnow().isoformat()
@@ -209,11 +231,6 @@ def _iso_ago(seconds):
 
 
 def check_and_increment_gemini_usage(day_limit=400, hour_limit=30):
-    """
-    Return True if a Gemini call is allowed right now, and record it.
-    Return False if the daily or hourly cap is reached.
-    Fail-open: if the DB itself is broken, allow the call (log warning).
-    """
     try:
         conn = get_conn()
         day_count = conn.execute(
@@ -294,6 +311,18 @@ def upsert_knowledge(topic, category, content, confidence=0.5):
     return cur.lastrowid
 
 
+def get_knowledge_by_topic(topic):
+    conn = get_conn()
+    return conn.execute(
+        "SELECT * FROM knowledge WHERE topic=?", (topic,)).fetchone()
+
+
+def get_knowledge_by_id(knowledge_id):
+    conn = get_conn()
+    return conn.execute(
+        "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone()
+
+
 def replace_knowledge_with_refined(knowledge_id, refined):
     conn = get_conn()
     row = conn.execute(
@@ -312,12 +341,37 @@ def replace_knowledge_with_refined(knowledge_id, refined):
     conn.commit()
 
 
-def oldest_knowledge_for_refinement(limit=1):
+def oldest_unverified_knowledge(limit=1):
+    """Oldest row that is neither verified nor flagged."""
     conn = get_conn()
     return conn.execute("""
         SELECT id, topic, category, content, refined_content, version
-        FROM knowledge ORDER BY updated_at ASC LIMIT ?
+        FROM knowledge
+        WHERE COALESCE(verified,0)=0 AND COALESCE(flagged,0)=0
+        ORDER BY updated_at ASC LIMIT ?
     """, (limit,)).fetchall()
+
+
+def verify_knowledge(kid):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE knowledge SET verified=1, flagged=0, "
+        "confidence=1.0 WHERE id=?", (kid,))
+    conn.commit()
+
+
+def flag_knowledge(kid):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE knowledge SET flagged=1, verified=0 WHERE id=?", (kid,))
+    conn.commit()
+
+
+def clear_knowledge_flags(kid):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE knowledge SET flagged=0 WHERE id=?", (kid,))
+    conn.commit()
 
 
 def get_all_knowledge(category=None, limit=500):
@@ -334,12 +388,6 @@ def get_all_knowledge(category=None, limit=500):
                confidence, updated_at
         FROM knowledge ORDER BY updated_at DESC LIMIT ?
     """, (limit,)).fetchall()
-
-
-def get_knowledge_by_id(knowledge_id):
-    conn = get_conn()
-    return conn.execute(
-        "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone()
 
 
 def search_knowledge(query, limit=8):
@@ -361,7 +409,14 @@ def knowledge_stats():
     ).fetchone()[0]
     pending = conn.execute(
         "SELECT COUNT(*) FROM pending_topics").fetchone()[0]
-    return {"total": total, "refined": refined, "pending": pending}
+    verified = conn.execute(
+        "SELECT COUNT(*) FROM knowledge WHERE COALESCE(verified,0)=1"
+    ).fetchone()[0]
+    flagged = conn.execute(
+        "SELECT COUNT(*) FROM knowledge WHERE COALESCE(flagged,0)=1"
+    ).fetchone()[0]
+    return {"total": total, "refined": refined, "pending": pending,
+            "verified": verified, "flagged": flagged}
 
 
 def category_counts():
@@ -427,6 +482,18 @@ def upsert_template(name, category, content, confidence=0.5):
     return cur.lastrowid
 
 
+def get_template_by_name(name):
+    conn = get_conn()
+    return conn.execute(
+        "SELECT * FROM templates WHERE name=?", (name,)).fetchone()
+
+
+def get_template_by_id(template_id):
+    conn = get_conn()
+    return conn.execute(
+        "SELECT * FROM templates WHERE id=?", (template_id,)).fetchone()
+
+
 def replace_template_with_refined(template_id, refined):
     conn = get_conn()
     row = conn.execute(
@@ -445,12 +512,29 @@ def replace_template_with_refined(template_id, refined):
     conn.commit()
 
 
-def oldest_template_for_refinement(limit=1):
+def oldest_unverified_template(limit=1):
     conn = get_conn()
     return conn.execute("""
         SELECT id, name, category, content, refined_content, version
-        FROM templates ORDER BY updated_at ASC LIMIT ?
+        FROM templates
+        WHERE COALESCE(verified,0)=0 AND COALESCE(flagged,0)=0
+        ORDER BY updated_at ASC LIMIT ?
     """, (limit,)).fetchall()
+
+
+def verify_template(tid):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE templates SET verified=1, flagged=0, "
+        "confidence=1.0 WHERE id=?", (tid,))
+    conn.commit()
+
+
+def flag_template(tid):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE templates SET flagged=1, verified=0 WHERE id=?", (tid,))
+    conn.commit()
 
 
 def get_all_templates(category=None, limit=200):
@@ -467,12 +551,6 @@ def get_all_templates(category=None, limit=200):
                confidence, updated_at
         FROM templates ORDER BY updated_at DESC LIMIT ?
     """, (limit,)).fetchall()
-
-
-def get_template_by_id(template_id):
-    conn = get_conn()
-    return conn.execute(
-        "SELECT * FROM templates WHERE id=?", (template_id,)).fetchone()
 
 
 def template_category_counts():
@@ -492,7 +570,14 @@ def template_stats():
     ).fetchone()[0]
     pending = conn.execute(
         "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
-    return {"total": total, "refined": refined, "pending": pending}
+    verified = conn.execute(
+        "SELECT COUNT(*) FROM templates WHERE COALESCE(verified,0)=1"
+    ).fetchone()[0]
+    flagged = conn.execute(
+        "SELECT COUNT(*) FROM templates WHERE COALESCE(flagged,0)=1"
+    ).fetchone()[0]
+    return {"total": total, "refined": refined, "pending": pending,
+            "verified": verified, "flagged": flagged}
 
 
 # ---------------------------------------------------------------
