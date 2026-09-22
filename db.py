@@ -1,5 +1,6 @@
 # db.py
-# v8: refined counter counts version > 1 (was refined_content != '').
+# v9: purge_old_gemini_usage accepts keep_seconds; Gemini usage
+#     defaults raised to match Groq free tier (800/day, 60/hour).
 
 import os
 import json
@@ -222,7 +223,7 @@ def _iso_ago(seconds):
             - datetime.timedelta(seconds=seconds)).isoformat()
 
 
-def check_and_increment_gemini_usage(day_limit=400, hour_limit=100):
+def check_and_increment_gemini_usage(day_limit=800, hour_limit=60):
     try:
         conn = get_conn()
         day_count = conn.execute(
@@ -246,7 +247,7 @@ def check_and_increment_gemini_usage(day_limit=400, hour_limit=100):
         return True
 
 
-def gemini_usage_stats(day_limit=400, hour_limit=100):
+def gemini_usage_stats(day_limit=800, hour_limit=60):
     try:
         conn = get_conn()
         day_count = conn.execute(
@@ -268,12 +269,16 @@ def gemini_usage_stats(day_limit=400, hour_limit=100):
                 "day_limit": day_limit, "hour_limit": hour_limit}
 
 
-def purge_old_gemini_usage(keep_days=3):
+def purge_old_gemini_usage(keep_days=None, keep_seconds=None):
+    """Delete gemini_usage rows older than the given window."""
+    if keep_seconds is None:
+        keep_seconds = (keep_days or 3) * 86400
     try:
         conn = get_conn()
         conn.execute("DELETE FROM gemini_usage WHERE ts < ?",
-                     (_iso_ago(keep_days * 86400),))
+                     (_iso_ago(keep_seconds),))
         conn.commit()
+        print(f"[db] purged gemini_usage older than {keep_seconds}s")
     except Exception as e:
         logger.warning("purge_old_gemini_usage failed: %s", e)
 
