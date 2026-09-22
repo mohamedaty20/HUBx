@@ -1,9 +1,8 @@
 # main.py
 # NiceGUI app v4
-# v5: mobile-first layout — no horizontal overflow, wrapping header,
-#     banner uses text glyphs, Gemini quota widget.
-# v6: knowledge & templates now use a slide-in drawer for categories/topics.
-#     Reader content is full-width, no card, no border.
+# v5: mobile-first layout
+# v6: slide-in drawer for categories/topics
+# v7: reader flush-left, tables horizontally scrollable
 
 import os
 import io
@@ -33,9 +32,7 @@ from report_builder import (build_txt, build_pdf, build_xlsx,
 
 PORT = int(os.getenv("PORT", "8080"))
 
-# ============================================================
-# STATE + I18N
-# ============================================================
+
 class _State:
     focus = "both"
     lang  = "en"
@@ -298,7 +295,7 @@ body, .q-page, .nicegui-content {
 .hubx-btn-ghost:hover { border-color: var(--hubx-primary) !important;
                         color: var(--hubx-primary) !important; }
 
-/* Reader markdown — full width, no border */
+/* Reader markdown — flush left, scrollable tables */
 .hubx-body h1 { font-size: 1.55rem; font-weight: 800; margin: 0.2em 0 0.5em 0;
                 line-height: 1.25; letter-spacing: -0.3px; }
 .hubx-body h2 { font-size: 1.2rem; font-weight: 700; margin: 0.9em 0 0.35em 0;
@@ -307,15 +304,34 @@ body, .q-page, .nicegui-content {
                 line-height: 1.3; }
 .hubx-body p  { font-size: 0.95rem; line-height: 1.6; margin: 0.4em 0;
                 color: var(--hubx-text); text-align: left !important; }
-.hubx-body ul, .hubx-body ol { margin: 0.3em 0 0.5em 1.2em; }
+.hubx-body ul, .hubx-body ol {
+    margin: 0.3em 0 0.6em 0;
+    padding-left: 0;
+    list-style-position: inside;
+}
 .hubx-body li { font-size: 0.95rem; line-height: 1.55; margin: 0.15em 0;
-                text-align: left !important; }
+                text-align: left !important; padding-left: 0; }
 .hubx-body strong { font-weight: 700; color: #fff; }
-.hubx-body table { width: 100%; border-collapse: collapse;
-                   margin: 0.5em 0; font-size: 0.88rem; }
+
+/* Tables: block + scroll, so all columns reachable */
+.hubx-body table {
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.5em 0;
+    font-size: 0.85rem;
+    -webkit-overflow-scrolling: touch;
+}
 .hubx-body th, .hubx-body td {
-    border: 1px solid var(--hubx-border); padding: 6px 8px;
+    border: 1px solid var(--hubx-border);
+    padding: 6px 8px;
     text-align: left !important;
+    white-space: normal;
+    word-break: break-word;
+    min-width: 90px;
+    vertical-align: top;
 }
 .hubx-body th { background: var(--hubx-surface-2); font-weight: 700; }
 .hubx-body code { background: var(--hubx-surface-2);
@@ -337,8 +353,11 @@ body.lang-ar .hubx-body blockquote {
     border-left: none; border-right: 3px solid var(--hubx-primary);
     padding-left: 0; padding-right: 12px;
 }
+body.lang-ar .hubx-body ul, body.lang-ar .hubx-body ol {
+    padding-left: 0; padding-right: 0;
+    list-style-position: inside;
+}
 
-/* Drawer button */
 .hubx-drawer-btn {
     font-size: 0.84rem !important; font-weight: 500 !important;
     text-align: left !important; justify-content: flex-start !important;
@@ -372,7 +391,6 @@ body.lang-ar .hubx-drawer-btn {
                    letter-spacing: 0.6px; text-transform: uppercase; }
 .hubx-stat-value { font-size: 1.2rem; font-weight: 800; color: #fff; }
 
-/* Drawer container */
 .hubx-drawer { background: var(--hubx-surface) !important; }
 .hubx-drawer .q-drawer__content { background: var(--hubx-surface) !important; }
 
@@ -460,9 +478,14 @@ body.lang-ar .hubx-drawer-btn {
     .hubx-subtitle { font-size: 0.8rem !important;
                      margin-bottom: 10px !important; }
     .hubx-card { padding: 12px !important; }
-    .hubx-body p, .hubx-body li { font-size: 0.9rem !important; }
+
+    .hubx-body p, .hubx-body li { font-size: 0.92rem !important; }
     .hubx-body h1 { font-size: 1.25rem !important; }
     .hubx-body h2 { font-size: 1.05rem !important; }
+    .hubx-body h3 { font-size: 0.98rem !important; }
+    .hubx-body table { font-size: 0.8rem !important; }
+    .hubx-body th, .hubx-body td { min-width: 80px !important;
+                                   padding: 5px 6px !important; }
 
     .hubx-stat { min-width: 80px !important; padding: 8px 10px !important; }
     .hubx-stat-value { font-size: 1rem !important; }
@@ -525,9 +548,6 @@ async def _keepalive():
 app.on_startup(lambda: asyncio.create_task(_keepalive()))
 
 
-# ============================================================
-# LANGUAGE + FOCUS HELPERS
-# ============================================================
 def _apply_body_class():
     cls = "lang-ar" if is_rtl() else "lang-en"
     ui.run_javascript(
@@ -565,9 +585,6 @@ def _focus_selector():
         ).props("dense")
 
 
-# ============================================================
-# HEADER
-# ============================================================
 def _header():
     with ui.row().classes("hubx-header items-center justify-between "
                           "w-full flex-wrap gap-2"):
@@ -613,9 +630,6 @@ def _stat(label):
         return lbl
 
 
-# ============================================================
-# PAPER FORMAT (A4)
-# ============================================================
 def _paper_html(title: str, category: str, version, body_md: str,
                 meta: dict | None = None) -> str:
     meta = meta or {}
@@ -878,9 +892,6 @@ def _safe_unlink(p):
         pass
 
 
-# ============================================================
-# /  CHECK PAGE
-# ============================================================
 @ui.page("/")
 def check_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -1030,9 +1041,6 @@ def check_page():
                 "hubx-btn hubx-btn-primary")
 
 
-# ============================================================
-# /knowledge
-# ============================================================
 @ui.page("/knowledge")
 def knowledge_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -1043,7 +1051,6 @@ def knowledge_page():
 
     selected = {"cat": None}
 
-    # ---- Drawer (categories + topics) ----
     drawer_cls = ui.right_drawer if is_rtl() else ui.left_drawer
     with drawer_cls(value=False, bordered=True).classes("hubx-drawer") as kdrawer:
         with ui.column().classes("w-full p-3 gap-1"):
@@ -1055,7 +1062,6 @@ def knowledge_page():
                 "color:var(--hubx-text-dim)")
             topic_container = ui.column().classes("w-full gap-0.5")
 
-    # ---- Main content ----
     with ui.column().classes("w-full p-2 gap-3"):
         ui.label(t("knowledge_title")).classes("hubx-title")
         ui.label(t("knowledge_sub")).classes("hubx-subtitle")
@@ -1094,20 +1100,16 @@ def knowledge_page():
             ask_btn.on("click", do_search)
             q_input.on("keydown.enter", do_search)
 
-        # Browse button + reader
         with ui.row().classes("w-full items-center gap-2 mt-2"):
             ui.button("☰  " + t("browse"),
                       on_click=lambda: kdrawer.set_value(not kdrawer.value)
                       ).classes("hubx-btn hubx-btn-ghost")
-            ui.label("").classes("text-xs").style(
-                "color:var(--hubx-text-dim)")
 
         reader_toolbar = ui.row().classes(
             "w-full gap-2 items-center flex-wrap")
         detail = ui.markdown(t("no_selection")).classes(
-            "hubx-body w-full whitespace-pre-wrap")
+            "hubx-body w-full")
 
-    # ---- Behaviour ----
     def show_item(kid):
         k = get_knowledge_by_id(kid)
         if not k:
@@ -1136,7 +1138,7 @@ def knowledge_page():
                       on_click=lambda: _open_paper_dialog(
                           k[1], k[2], k[5], body, {})
             ).classes("hubx-btn hubx-btn-accent")
-        kdrawer.set_value(False)  # auto-close drawer after pick
+        kdrawer.set_value(False)
 
     def render_topics():
         topic_container.clear()
@@ -1184,9 +1186,6 @@ def knowledge_page():
     ui.timer(8.0, refresh_all)
 
 
-# ============================================================
-# /templates
-# ============================================================
 @ui.page("/templates")
 def templates_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -1198,7 +1197,6 @@ def templates_page():
     tstats = template_stats()
     selected = {"cat": None}
 
-    # ---- Drawer ----
     drawer_cls = ui.right_drawer if is_rtl() else ui.left_drawer
     with drawer_cls(value=False, bordered=True).classes("hubx-drawer") as tdrawer:
         with ui.column().classes("w-full p-3 gap-1"):
@@ -1210,7 +1208,6 @@ def templates_page():
                 "color:var(--hubx-text-dim)")
             t_container = ui.column().classes("w-full gap-0.5")
 
-    # ---- Main content ----
     with ui.column().classes("w-full p-2 gap-3"):
         ui.label(t("templates_title")).classes("hubx-title")
         ui.label(t("templates_sub")).classes("hubx-subtitle")
@@ -1228,9 +1225,8 @@ def templates_page():
         toolbar = ui.row().classes(
             "w-full gap-2 items-center flex-wrap")
         detail = ui.markdown(t("no_selection")).classes(
-            "hubx-body w-full whitespace-pre-wrap")
+            "hubx-body w-full")
 
-    # ---- Behaviour ----
     def show_template(tid):
         tmpl = get_template_by_id(tid)
         if not tmpl:
@@ -1306,9 +1302,6 @@ def templates_page():
     ui.timer(8.0, refresh)
 
 
-# ============================================================
-# /charts
-# ============================================================
 @ui.page("/charts")
 def charts_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
@@ -1430,9 +1423,6 @@ def charts_page():
         ui.timer(8.0, refresh)
 
 
-# ============================================================
-# /dashboard
-# ============================================================
 @ui.page("/dashboard")
 def dashboard_page():
     STATE.lang = app.storage.user.get("lang", STATE.lang)
