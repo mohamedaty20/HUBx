@@ -1,6 +1,7 @@
 # gemini.py
-# v18: expand_phase asks ONLY for the new section, not the whole doc.
-#      Massively smaller output, never truncated.
+# v19: gpt-oss-20b is a reasoning model — reasoning_effort=low + bigger
+#      budget. Otherwise the whole budget is burned by internal thinking
+#      and content comes back empty.
 
 import os
 import re
@@ -30,8 +31,11 @@ MODEL = "openai/gpt-oss-20b"
 GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "600"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "40"))
 _QUOTA_BLOCK_SECONDS = 240
-ATTEMPT_TIMEOUT_SECONDS = 180
+ATTEMPT_TIMEOUT_SECONDS = 240
 MIN_CALL_GAP = 240.0
+
+# Reasoning models need a lot of headroom. Set low to save tokens.
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")
 
 _quota_block_until = 0.0
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
@@ -113,7 +117,38 @@ def _is_json_validation_error(err_str):
             or "max completion tokens reached" in s)
 
 
-async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
+def _extract_content(resp):
+    """
+    Groq gpt-oss models return message.content OR message.reasoning.
+    If content is empty but reasoning exists, that means the model
+    thought but never produced the final answer.
+    """
+    try:
+        msg = resp.choices[0].message
+    except Exception:
+        return "", False
+
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        content = content.strip()
+    else:
+        content = ""
+
+    reasoning = ""
+    try:
+        reasoning = getattr(msg, "reasoning", None) or ""
+    except Exception:
+        reasoning = ""
+
+    if content:
+        return content, True
+    if reasoning:
+        # Got reasoning but no output. Not usable.
+        return "", False
+    return "", False
+
+
+async def _call(prompt, json_mode=False, max_tokens=6000, max_retries=2):
     global last_error, _quota_block_until
 
     if not _client:
@@ -131,6 +166,7 @@ async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.4 if json_mode else 0.7,
         "max_tokens": max_tokens,
+        "reasoning_effort": REASONING_EFFORT,
     }
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
@@ -152,11 +188,18 @@ async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
                 _client.chat.completions.create(**kwargs),
                 timeout=ATTEMPT_TIMEOUT_SECONDS,
             )
-            text = (resp.choices[0].message.content or "").strip()
-            if text:
+            text, ok = _extract_content(resp)
+            if ok and text:
                 last_error = ""
                 return sanitize_text(text)
-            last_error = f"{MODEL}: empty response"
+            # Emtpy content OR only reasoning — treat as failure.
+            # Try once more with a nudge.
+            if attempt == 0:
+                last_error = f"{MODEL}: empty content, retrying"
+                logger.warning(last_error)
+                continue
+            last_error = f"{MODEL}: empty content twice"
+            return ""
         except asyncio.TimeoutError:
             last_error = (f"{MODEL}: attempt {attempt + 1}/{max_retries} "
                           f"timed out after {ATTEMPT_TIMEOUT_SECONDS}s")
@@ -183,19 +226,19 @@ async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=4000)
+                       json_mode=False, max_tokens=6000)
 
 
 async def refine_knowledge(topic, existing):
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:6000])
     return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=4000)
+                       json_mode=False, max_tokens=6000)
 
 
 async def generate_template(name, category):
     user = TEMPLATE_USER_TEMPLATE.format(name=name, category=category)
     return await _call(f"{TEMPLATE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=4000)
+                       json_mode=False, max_tokens=6000)
 
 
 async def refine_template(name, existing):
@@ -205,50 +248,42 @@ async def refine_template(name, existing):
         "Never use <br>. No LaTeX, no \\square, no \\(...\\).\n\n"
         "---\n\n"
         f"Template: {name}\n\n{existing[:6000]}",
-        json_mode=False, max_tokens=4000)
+        json_mode=False, max_tokens=6000)
 
 
 async def expand_phase(title, category, current_content,
                        current_phase, target_phase):
     """
-    Generate ONLY the new phase section. Engine appends it to the existing
-    document. This keeps output small — never truncated by token budget.
+    Generate ONLY the new phase section. Appended by engine.
+    Reasoning models get extra token budget + low reasoning effort.
     """
     instructions = PHASE_INSTRUCTIONS.get(target_phase, "")
     if not instructions:
         return ""
 
-    # Show only the last 1500 chars of existing content as context,
-    # not the whole document. Prevents input bloat.
     tail = (current_content or "")[-1500:]
-    context_hint = f"...[existing content ends with]...\n{tail}" if tail else ""
+    context_hint = f"...[existing ends with]...\n{tail}" if tail else ""
 
     prompt = (
-        "You are a senior Egyptian civil quality engineer. You are "
-        "writing ONE new section to append to an existing bilingual "
-        "reference document. DO NOT reproduce the existing document. "
-        "Return ONLY the new section.\n\n"
+        "You are a senior Egyptian civil quality engineer. Write ONE new "
+        "section to append to an existing bilingual document. Do NOT "
+        "reproduce the existing document. Return ONLY the new section.\n\n"
         f"Document title: {title}\n"
         f"Category: {category}\n"
         f"Current phase: {current_phase}\n"
-        f"New phase being added: {target_phase}\n\n"
+        f"New phase: {target_phase}\n\n"
         f"{instructions}\n\n"
         "STRICT RULES:\n"
-        "- Return ONLY the new section. No title, no preamble, no summary.\n"
-        "- Every line must be FULLY BILINGUAL: English / العربية separated "
-        "by ' / '.\n"
-        "- Start with a markdown heading using ## for the section.\n"
-        "- Never use <br> tags. Never use LaTeX, \\(...\\), \\square, "
-        "or dollar signs.\n"
-        "- Never invent code clause numbers. Write 'per ECP guidance' if "
-        "unsure.\n"
-        "- Never invent office addresses, phone numbers, or fees. Say "
-        "'confirm current edition' or 'verify with the authority'.\n"
-        "- Use Unicode: × ≥ ≤ ± ° /.\n\n"
-        f"Tail of existing document for style continuity:\n{context_hint}\n\n"
-        "Now write ONLY the new section:"
+        "- Return ONLY the new section. No preamble.\n"
+        "- Every line: English / العربية separated by ' / '.\n"
+        "- Start with a markdown ## heading.\n"
+        "- No <br>, no LaTeX, no \\(...\\), no \\square.\n"
+        "- Never invent code clause numbers.\n"
+        "- Never invent office addresses, phones, or fees.\n\n"
+        f"Style context (tail of existing):\n{context_hint}\n\n"
+        "Write ONLY the new section now:"
     )
-    return await _call(prompt, json_mode=False, max_tokens=3000)
+    return await _call(prompt, json_mode=False, max_tokens=5000)
 
 
 async def suggest_subtopics(parent_topic, category, n=2):
@@ -257,9 +292,9 @@ async def suggest_subtopics(parent_topic, category, n=2):
         f"an array of exactly {n} short bilingual strings. "
         f"Category: {category}. Parent: {parent_topic}. "
         "Each string: 'English Title / العربية'. English part 4-8 words. "
-        "Keep total output under 200 tokens."
+        "Output under 200 tokens."
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=1500)
+    raw = await _call(prompt, json_mode=True, max_tokens=2500)
     if not raw:
         return []
     try:
@@ -285,9 +320,9 @@ async def suggest_subtemplates(parent_name, category, n=2):
         f"an array of exactly {n} short bilingual strings. "
         f"Category: {category}. Parent: {parent_name}. "
         "Each string: 'English Name / الاسم بالعربية'. English part "
-        "4-8 words. Keep total output under 200 tokens."
+        "4-8 words. Output under 200 tokens."
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=1500)
+    raw = await _call(prompt, json_mode=True, max_tokens=2500)
     if not raw:
         return []
     try:
@@ -311,7 +346,7 @@ async def check_document(filename, file_type, text):
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
     raw = await _call(f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                      json_mode=True, max_tokens=3000)
+                      json_mode=True, max_tokens=4000)
     if not raw:
         return {}
     try:
@@ -345,7 +380,7 @@ async def ai_search(question, knowledge_context):
         f"=== EXCERPTS ===\n{knowledge_context}\n\n"
         f"=== QUESTION ===\n{question}\n"
     )
-    return await _call(prompt, json_mode=False, max_tokens=1500)
+    return await _call(prompt, json_mode=False, max_tokens=3000)
 
 
 async def ocr_image(path):
