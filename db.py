@@ -1,5 +1,6 @@
 # db.py
 # Turso with local fallback. Version replacement + templates + search.
+# v4: added gemini_usage table + daily/hourly quota counter.
 
 import os
 import json
@@ -154,10 +155,92 @@ def init_db():
         compliance TEXT,
         created_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS gemini_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_gemini_usage_ts ON gemini_usage(ts);
     """)
     conn.commit()
 
 
+# ---------------------------------------------------------------
+# Gemini usage counter (daily + hourly soft caps)
+# ---------------------------------------------------------------
+def _utcnow_iso():
+    return datetime.datetime.utcnow().isoformat()
+
+
+def _iso_ago(seconds):
+    return (datetime.datetime.utcnow()
+            - datetime.timedelta(seconds=seconds)).isoformat()
+
+
+def check_and_increment_gemini_usage(day_limit=400, hour_limit=30):
+    """
+    Return True if a Gemini call is allowed right now, and record it.
+    Return False if the daily or hourly cap is reached.
+    Fail-open: if the DB itself is broken, allow the call (log warning).
+    """
+    try:
+        conn = get_conn()
+        day_count = conn.execute(
+            "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
+            (_iso_ago(86400),)
+        ).fetchone()[0]
+        if day_count >= day_limit:
+            return False
+        hour_count = conn.execute(
+            "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
+            (_iso_ago(3600),)
+        ).fetchone()[0]
+        if hour_count >= hour_limit:
+            return False
+        conn.execute("INSERT INTO gemini_usage (ts) VALUES (?)",
+                     (_utcnow_iso(),))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.warning("gemini_usage check failed (allowing call): %s", e)
+        return True
+
+
+def gemini_usage_stats(day_limit=400, hour_limit=30):
+    try:
+        conn = get_conn()
+        day_count = conn.execute(
+            "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
+            (_iso_ago(86400),)
+        ).fetchone()[0]
+        hour_count = conn.execute(
+            "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
+            (_iso_ago(3600),)
+        ).fetchone()[0]
+        return {
+            "last_24h": day_count,
+            "last_1h": hour_count,
+            "day_limit": day_limit,
+            "hour_limit": hour_limit,
+        }
+    except Exception:
+        return {"last_24h": 0, "last_1h": 0,
+                "day_limit": day_limit, "hour_limit": hour_limit}
+
+
+def purge_old_gemini_usage(keep_days=3):
+    """Delete usage rows older than keep_days. Safe to call on startup."""
+    try:
+        conn = get_conn()
+        conn.execute("DELETE FROM gemini_usage WHERE ts < ?",
+                     (_iso_ago(keep_days * 86400),))
+        conn.commit()
+    except Exception as e:
+        logger.warning("purge_old_gemini_usage failed: %s", e)
+
+
+# ---------------------------------------------------------------
+# Knowledge
+# ---------------------------------------------------------------
 def upsert_knowledge(topic, category, content, confidence=0.5):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
@@ -288,6 +371,9 @@ def runs_per_cycle(limit=40):
     """, (limit,)).fetchall()[::-1]
 
 
+# ---------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------
 def upsert_template(name, category, content, confidence=0.5):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
@@ -378,6 +464,9 @@ def template_stats():
     return {"total": total, "refined": refined, "pending": pending}
 
 
+# ---------------------------------------------------------------
+# Pending queues
+# ---------------------------------------------------------------
 def add_pending_topic(topic, category, source="ai", parent_topic=""):
     conn = get_conn()
     topic = (topic or "").strip()
@@ -462,6 +551,9 @@ def pending_template_count():
         "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
 
 
+# ---------------------------------------------------------------
+# Runs
+# ---------------------------------------------------------------
 def log_learning_run(cycle, topic, added, refined, calls, error=""):
     conn = get_conn()
     conn.execute("""
@@ -502,6 +594,9 @@ def recent_template_runs(limit=20):
     """, (limit,)).fetchall()
 
 
+# ---------------------------------------------------------------
+# Check reports
+# ---------------------------------------------------------------
 def save_check_report(filename, file_type, original_text, issues,
                       score, summary, compliance=""):
     conn = get_conn()
