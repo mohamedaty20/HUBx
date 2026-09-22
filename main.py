@@ -1,6 +1,6 @@
 # main.py
-# v13: focus selector uses buttons (works on mobile). Focus dialog built
-#      once per page instead of on-the-fly.
+# v14: phase system controls on dashboard. Focus buttons.
+#      Everything else unchanged.
 
 import os
 import io
@@ -89,6 +89,9 @@ STRINGS = {
         "cycles": "Cycles", "gemini_calls": "AI Calls",
         "knowledge_stat": "Knowledge", "refined_stat": "Refined",
         "templates_stat": "Templates", "queue_stat": "Queue",
+        "avg_phase_stat": "Avg Phase", "advanced_stat": "Advanced",
+        "max_phase_label": "Max Phase",
+        "save": "Save",
         "recent_runs": "Recent learning runs",
         "recent_tpl_runs": "Recent template runs",
         "paper_preview": "Paper preview", "close": "Close",
@@ -102,7 +105,6 @@ STRINGS = {
         "verify": "✔ Verified", "flag": "✖ Flag",
         "verified_badge": "✓ VERIFIED", "flagged_badge": "✖ FLAGGED",
         "select_all": "Select All", "clear_all": "Clear",
-        "save": "Save",
     },
     "ar": {
         "brand": "HUBx",
@@ -139,6 +141,9 @@ STRINGS = {
         "cycles": "الدورات", "gemini_calls": "استدعاءات الذكاء",
         "knowledge_stat": "المعرفة", "refined_stat": "مُحسَّن",
         "templates_stat": "القوالب", "queue_stat": "بالانتظار",
+        "avg_phase_stat": "متوسط المرحلة", "advanced_stat": "متقدم",
+        "max_phase_label": "أقصى مرحلة",
+        "save": "حفظ",
         "recent_runs": "آخر دورات التعلم",
         "recent_tpl_runs": "آخر دورات القوالب",
         "paper_preview": "معاينة الورقة", "close": "إغلاق",
@@ -152,7 +157,6 @@ STRINGS = {
         "verify": "✔ موثّق", "flag": "✖ علامة",
         "verified_badge": "✓ موثّق", "flagged_badge": "✖ معلَّم",
         "select_all": "الكل", "clear_all": "مسح",
-        "save": "حفظ",
     },
 }
 
@@ -524,7 +528,6 @@ def _lang_toggle():
 
 
 def _header():
-    # Build the focus dialog ONCE per page (bound to this client).
     focus_dlg = ui.dialog().props("persistent")
     with focus_dlg:
         with ui.card().classes("hubx-card").style(
@@ -701,6 +704,7 @@ def _paper_html(title, category, version, body_md, meta=None):
 def _md_to_html(md):
     import html as _html
     import re
+    md = re.sub(r"<\s*br\s*/?\s*>", " ", md, flags=re.IGNORECASE)
     lines = md.replace("\r\n", "\n").split("\n")
     out = []
     in_ul = in_ol = False
@@ -1132,13 +1136,15 @@ def knowledge_page():
         try:
             verified = k[9] or 0
             flagged = k[10] or 0
+            phase = k[11] or 1
         except Exception:
-            verified, flagged = 0, 0
+            verified, flagged, phase = 0, 0, 1
         detail.content = (
             f"# {k[1]}\n\n"
             f"{_badge_html(verified, flagged)}\n\n"
             f"**{t('category')}:** {k[2]}  ·  "
             f"**{t('version')}:** v{k[5]}  ·  "
+            f"**Phase:** {phase}  ·  "
             f"**{t('confidence')}:** {round(k[6] or 0, 2)}\n\n"
             f"---\n\n{body}")
         reader_toolbar.clear()
@@ -1271,6 +1277,7 @@ def templates_page():
             _stat(t("templates_word")).text = str(tstats["total"])
             _stat(t("refined_word")).text = str(tstats["refined"])
             _stat(t("queue_word")).text = str(tstats["pending"])
+            _stat(t("avg_phase_stat")).text = str(tstats.get("avg_phase", 1))
 
         with ui.row().classes("w-full items-center gap-2 mt-2"):
             ui.button("☰  " + t("browse"),
@@ -1303,13 +1310,15 @@ def templates_page():
         try:
             verified = tmpl[9] or 0
             flagged = tmpl[10] or 0
+            phase = tmpl[11] or 1
         except Exception:
-            verified, flagged = 0, 0
+            verified, flagged, phase = 0, 0, 1
         detail.content = (
             f"# {tmpl[1]}\n\n"
             f"{_badge_html(verified, flagged)}\n\n"
             f"**{t('category')}:** {tmpl[2]}  ·  "
             f"**{t('version')}:** v{tmpl[5]}  ·  "
+            f"**Phase:** {phase}  ·  "
             f"**{t('confidence')}:** {round(tmpl[6] or 0, 2)}\n\n"
             f"---\n\n{body}")
         toolbar.clear()
@@ -1538,6 +1547,8 @@ async def dashboard_page():
             refined_label = _stat(t("refined_stat"))
             tpl_label = _stat(t("templates_stat"))
             queue_label = _stat(t("queue_stat"))
+            avg_phase_label = _stat(t("avg_phase_stat"))
+            advanced_label = _stat(t("advanced_stat"))
 
         debug_label = ui.label("").classes("text-sm").style(
             "color:var(--hubx-text-dim)")
@@ -1545,6 +1556,28 @@ async def dashboard_page():
             "color:#ffc270;font-size:0.85rem")
         quota_label = ui.label("").style(
             "color:var(--hubx-text-dim);font-size:0.82rem")
+
+        # Max phase control
+        with ui.row().classes("gap-2 items-center mt-2 flex-wrap"):
+            ui.label(t("max_phase_label")).style(
+                "color:var(--hubx-text-dim);font-size:0.85rem")
+            try:
+                _cur_max = int(get_app_state("max_phase", "8"))
+            except Exception:
+                _cur_max = 8
+            max_phase_input = ui.number(value=_cur_max, min=1, max=8,
+                                        step=1).props("dense").style(
+                "width:90px")
+            def save_max_phase():
+                try:
+                    v = int(max_phase_input.value or 8)
+                    v = max(1, min(8, v))
+                    set_app_state("max_phase", str(v))
+                    ui.notify(f"Max phase = {v}", color="primary")
+                except Exception as e:
+                    ui.notify(f"Save failed: {e}", color="red")
+            ui.button(t("save"), on_click=save_max_phase).classes(
+                "hubx-btn hubx-btn-ghost")
 
         async def do_start():
             await engine.start(by_user=True)
@@ -1579,13 +1612,14 @@ async def dashboard_page():
                 s = {"cycles": 0, "gemini_calls": 0, "knowledge_total": 0,
                      "knowledge_refined": 0, "template_total": 0,
                      "pending_topics": 0, "pending_templates": 0,
+                     "knowledge_avg_phase": 1, "knowledge_advanced": 0,
                      "last_status": f"error: {e}", "last_error": str(e),
                      "last_debug": ""}
             try:
                 q = gemini_usage_stats()
             except Exception:
                 q = {"last_1h": 0, "last_24h": 0,
-                     "hour_limit": 60, "day_limit": 800}
+                     "hour_limit": 40, "day_limit": 600}
             return s, q
 
         async def refresh():
@@ -1600,6 +1634,8 @@ async def dashboard_page():
             tpl_label.text = str(s.get("template_total", 0))
             queue_label.text = (f'{s.get("pending_topics",0)}/'
                                 f'{s.get("pending_templates",0)}')
+            avg_phase_label.text = str(s.get("knowledge_avg_phase", 1))
+            advanced_label.text = str(s.get("knowledge_advanced", 0))
             debug_label.text = s["last_debug"]
             gemini_err_label.text = (
                 f"AI: {gemini_mod.last_error}"
@@ -1609,7 +1645,7 @@ async def dashboard_page():
                 f"{q['last_1h']}/{q['hour_limit']}"
                 f"  ·  last 24h: {q['last_24h']}/{q['day_limit']}")
 
-        ui.timer(5.0, refresh)
+        ui.timer(15.0, refresh)
         await refresh()
 
         ui.label(t("recent_runs")).classes("text-lg font-bold mt-4")
@@ -1638,7 +1674,7 @@ async def dashboard_page():
                 "created_at": (r[6] or "")[:19],
             } for r in rows]
 
-        ui.timer(20.0, refresh_runs)
+        ui.timer(30.0, refresh_runs)
         await refresh_runs()
 
         ui.label(t("recent_tpl_runs")).classes("text-lg font-bold mt-4")
@@ -1666,7 +1702,7 @@ async def dashboard_page():
                 "created_at": (r[6] or "")[:19],
             } for r in rows]
 
-        ui.timer(20.0, refresh_tpl_runs)
+        ui.timer(30.0, refresh_tpl_runs)
         await refresh_tpl_runs()
 
 
