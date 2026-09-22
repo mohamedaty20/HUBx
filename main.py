@@ -1433,6 +1433,14 @@ def dashboard_page():
             ui.button(t("one_cycle"), on_click=do_one_cycle).classes(
                 "hubx-btn hubx-btn-primary")
 
+                def _g(*names, default=None):
+            """Get the first attribute on engine that exists."""
+            for n in names:
+                v = getattr(engine, n, None)
+                if v is not None:
+                    return v
+            return default
+
         def _is_paused() -> bool:
             for attr in ("paused", "is_paused", "_paused"):
                 v = getattr(engine, attr, None)
@@ -1443,25 +1451,55 @@ def dashboard_page():
                 return not running
             return True
 
+        def _build_stats() -> dict:
+            """Build the stats dict ourselves. Never call engine.stats()."""
+            # engine-provided bits (defensive)
+            cycles = _g("cycles", "cycles_completed", "_cycles", default=0)
+            gemini = _g("gemini_calls", "ai_calls", "_gemini_calls", default=0)
+            last_status = _g("last_status", "status", default="idle")
+            last_debug  = _g("last_debug", "debug", default="")
+            last_error  = _g("last_error", "error", default="")
+
+            # db-provided counts (functions you already import from db.py)
+            try:
+                ks = knowledge_stats()
+                kb_total    = ks.get("total", 0)
+                kb_refined  = ks.get("refined", 0)
+            except Exception:
+                kb_total = kb_refined = 0
+
+            try:
+                ts = template_stats()
+                tpl_total = ts.get("total", 0)
+                tpl_queue = ts.get("pending", 0)
+            except Exception:
+                tpl_total = tpl_queue = 0
+
+            return {
+                "cycles":           cycles,
+                "gemini_calls":     gemini,
+                "knowledge_total":  kb_total,
+                "knowledge_refined": kb_refined,
+                "template_total":   tpl_total,
+                "pending_topics":   tpl_queue,
+                "last_status":      last_status,
+                "last_error":       last_error,
+                "last_debug":       last_debug,
+            }
+
         def refresh():
+            s = _build_stats()
             try:
-                s = engine.stats()
-            except Exception as e:
-                s = {"cycles": 0, "gemini_calls": 0, "knowledge_total": 0,
-                     "knowledge_refined": 0, "template_total": 0,
-                     "pending_topics": 0, "last_status": f"error: {e}",
-                     "last_error": str(e), "last_debug": ""}
-            try:
-                status_badge.text = s["last_status"]
+                status_badge.text = str(s["last_status"])
                 status_badge.props(
                     f'color={"orange" if _is_paused() else "green"}')
-                cycles_label.text  = str(s["cycles"])
-                gemini_label.text  = str(s["gemini_calls"])
-                kb_label.text      = str(s["knowledge_total"])
-                refined_label.text = str(s["knowledge_refined"])
-                tpl_label.text     = str(s.get("template_total", 0))
-                queue_label.text   = str(s.get("pending_topics", 0))
-                debug_label.text   = s.get("last_debug", "")
+                cycles_label.text   = str(s["cycles"])
+                gemini_label.text   = str(s["gemini_calls"])
+                kb_label.text       = str(s["knowledge_total"])
+                refined_label.text  = str(s["knowledge_refined"])
+                tpl_label.text      = str(s["template_total"])
+                queue_label.text    = str(s["pending_topics"])
+                debug_label.text    = str(s["last_debug"] or "")
                 gemini_err_label.text = (
                     f"Gemini: {gemini_mod.last_error}"
                     if gemini_mod.last_error else "")
