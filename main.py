@@ -1433,79 +1433,74 @@ def dashboard_page():
             ui.button(t("one_cycle"), on_click=do_one_cycle).classes(
                 "hubx-btn hubx-btn-primary")
 
-                def _g(*names, default=None):
-            """Get the first attribute on engine that exists."""
-            for n in names:
+                
+
+        def refresh():
+            # --- engine values (getattr only, never engine.stats()) ---
+            cycles = 0
+            for n in ("cycles", "cycles_completed", "_cycles"):
                 v = getattr(engine, n, None)
                 if v is not None:
-                    return v
-            return default
+                    cycles = v
+                    break
 
-        def _is_paused() -> bool:
-            for attr in ("paused", "is_paused", "_paused"):
-                v = getattr(engine, attr, None)
+            gemini = 0
+            for n in ("gemini_calls", "ai_calls", "_gemini_calls"):
+                v = getattr(engine, n, None)
+                if v is not None:
+                    gemini = v
+                    break
+
+            last_status = (getattr(engine, "last_status", None)
+                           or getattr(engine, "status", None)
+                           or "idle")
+            last_debug = (getattr(engine, "last_debug", None)
+                          or getattr(engine, "debug", None)
+                          or "")
+
+            paused = True
+            for n in ("paused", "is_paused", "_paused"):
+                v = getattr(engine, n, None)
                 if isinstance(v, bool):
-                    return v
-            running = getattr(engine, "running", None)
-            if isinstance(running, bool):
-                return not running
-            return True
+                    paused = v
+                    break
+            else:
+                r = getattr(engine, "running", None)
+                if isinstance(r, bool):
+                    paused = not r
 
-        def _build_stats() -> dict:
-            """Build the stats dict ourselves. Never call engine.stats()."""
-            # engine-provided bits (defensive)
-            cycles = _g("cycles", "cycles_completed", "_cycles", default=0)
-            gemini = _g("gemini_calls", "ai_calls", "_gemini_calls", default=0)
-            last_status = _g("last_status", "status", default="idle")
-            last_debug  = _g("last_debug", "debug", default="")
-            last_error  = _g("last_error", "error", default="")
-
-            # db-provided counts (functions you already import from db.py)
+            # --- db counts ---
+            kb_total = kb_refined = tpl_total = tpl_queue = 0
             try:
                 ks = knowledge_stats()
-                kb_total    = ks.get("total", 0)
-                kb_refined  = ks.get("refined", 0)
+                kb_total = ks.get("total", 0)
+                kb_refined = ks.get("refined", 0)
             except Exception:
-                kb_total = kb_refined = 0
-
+                pass
             try:
                 ts = template_stats()
                 tpl_total = ts.get("total", 0)
                 tpl_queue = ts.get("pending", 0)
             except Exception:
-                tpl_total = tpl_queue = 0
+                pass
 
-            return {
-                "cycles":           cycles,
-                "gemini_calls":     gemini,
-                "knowledge_total":  kb_total,
-                "knowledge_refined": kb_refined,
-                "template_total":   tpl_total,
-                "pending_topics":   tpl_queue,
-                "last_status":      last_status,
-                "last_error":       last_error,
-                "last_debug":       last_debug,
-            }
-
-        def refresh():
-            s = _build_stats()
+            # --- push to UI (never let a bad value crash the page) ---
             try:
-                status_badge.text = str(s["last_status"])
+                status_badge.text = str(last_status)
                 status_badge.props(
-                    f'color={"orange" if _is_paused() else "green"}')
-                cycles_label.text   = str(s["cycles"])
-                gemini_label.text   = str(s["gemini_calls"])
-                kb_label.text       = str(s["knowledge_total"])
-                refined_label.text  = str(s["knowledge_refined"])
-                tpl_label.text      = str(s["template_total"])
-                queue_label.text    = str(s["pending_topics"])
-                debug_label.text    = str(s["last_debug"] or "")
+                    f'color={"orange" if paused else "green"}')
+                cycles_label.text = str(cycles)
+                gemini_label.text = str(gemini)
+                kb_label.text = str(kb_total)
+                refined_label.text = str(kb_refined)
+                tpl_label.text = str(tpl_total)
+                queue_label.text = str(tpl_queue)
+                debug_label.text = str(last_debug)
                 gemini_err_label.text = (
                     f"Gemini: {gemini_mod.last_error}"
                     if gemini_mod.last_error else "")
             except Exception as ex:
                 print(f"[dashboard refresh] {ex}")
-
         ui.timer(2.0, refresh)
         refresh()
 
