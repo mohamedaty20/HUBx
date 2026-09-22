@@ -5,6 +5,8 @@
 #   2) EN / ع language toggle -> every label, RTL layout, Arabic font
 #   3) Paper-format A4 preview + PDF for templates (positioned fields)
 #   4) Arabic-safe PDF export (WeasyPrint + Cairo font)
+# v5: mobile-first layout fixes — no horizontal overflow, wrapping header,
+#     banner uses text glyphs (no Material Icons dependency), stacked sidebar.
 
 import os
 import io
@@ -23,7 +25,8 @@ from db import (init_db, get_all_knowledge, get_knowledge_by_id,
                 runs_per_cycle,
                 get_all_templates, get_template_by_id,
                 template_category_counts, template_stats,
-                recent_template_runs)
+                recent_template_runs,
+                gemini_usage_stats)
 from engine import engine
 from file_reader import extract_text
 from gemini import check_document, ai_search
@@ -424,18 +427,79 @@ body.lang-ar .hubx-side-btn {
                       font-size: 9pt; color: #666;
                       border-top: 1px solid #ccc; padding-top: 4mm; }
 
+/* ---------- MOBILE ---------- */
 @media (max-width: 768px) {
-    .hubx-header { padding: 10px 12px; }
-    .hubx-nav a { padding: 6px 8px; font-size: 0.8rem; }
-    .hubx-title { font-size: 1.3rem; }
-    .hubx-card { padding: 14px; }
-    .hubx-body p, .hubx-body li { font-size: 0.85rem; }
-    .hubx-stack-mobile { flex-direction: column !important; }
+    html, body { overflow-x: hidden !important; max-width: 100vw !important; }
+    .q-page, .nicegui-content { overflow-x: hidden !important; }
+
+    .hubx-header {
+        padding: 8px 10px !important;
+        flex-wrap: wrap !important;
+        gap: 6px !important;
+    }
+    .hubx-header > .row {
+        flex-wrap: wrap !important;
+        gap: 6px !important;
+        width: 100% !important;
+    }
+    .hubx-brand { font-size: 1rem !important; }
+    .hubx-nav {
+        width: 100% !important;
+        flex-wrap: wrap !important;
+        gap: 2px !important;
+        justify-content: space-between !important;
+    }
+    .hubx-nav a {
+        padding: 6px 4px !important;
+        font-size: 0.72rem !important;
+        flex: 1 1 auto !important;
+        text-align: center !important;
+    }
+    .hubx-lang-btn {
+        min-width: 32px !important;
+        min-height: 28px !important;
+        padding: 2px 6px !important;
+        font-size: 0.72rem !important;
+    }
+
+    .hubx-title { font-size: 1.15rem !important; }
+    .hubx-subtitle { font-size: 0.8rem !important; margin-bottom: 10px !important; }
+    .hubx-card { padding: 12px !important; }
+    .hubx-body p, .hubx-body li, .hubx-body th, .hubx-body td {
+        font-size: 0.8rem !important;
+    }
+
+    .hubx-stack-mobile {
+        flex-direction: column !important;
+        flex-wrap: wrap !important;
+    }
+    .hubx-stack-mobile > * {
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        height: auto !important;
+        max-height: 55vh !important;
+        flex: 1 1 auto !important;
+    }
+
+    .hubx-stat { min-width: 80px !important; padding: 8px 10px !important; }
+    .hubx-stat-value { font-size: 1rem !important; }
+    .hubx-stat-label { font-size: 0.62rem !important; }
+
     .hubx-hide-mobile { display: none !important; }
-    .hubx-paper { width: 100%; padding: 12px; min-height: auto; }
+
+    .hubx-paper { width: 100% !important; padding: 10px !important;
+                  min-height: auto !important; }
+
+    .q-table__container { overflow-x: auto !important; }
+    .q-table { font-size: 0.75rem !important; }
+    .q-table th, .q-table td { padding: 4px 6px !important; }
+
+    .q-dialog__inner > div { max-width: 96vw !important; }
 }
 </style>
 """, shared=True)
+
 # ---- paper PDF serving (for the Print button) ----
 import uuid
 from fastapi import Response as _FastResponse
@@ -483,7 +547,6 @@ app.on_startup(lambda: asyncio.create_task(_keepalive()))
 # LANGUAGE + FOCUS HELPERS
 # ============================================================
 def _apply_body_class():
-    """Set body class based on current lang so CSS rules kick in."""
     cls = "lang-ar" if is_rtl() else "lang-en"
     ui.run_javascript(
         f"document.body.classList.remove('lang-ar','lang-en');"
@@ -525,11 +588,11 @@ def _focus_selector():
 # ============================================================
 def _header():
     with ui.row().classes("hubx-header items-center justify-between "
-                          "w-full no-wrap"):
-        with ui.row().classes("items-center gap-3 no-wrap"):
+                          "w-full flex-wrap gap-2"):
+        with ui.row().classes("items-center gap-3 flex-wrap"):
             ui.label(t("brand")).classes("hubx-brand")
             _focus_selector()
-        with ui.row().classes("hubx-nav items-center gap-1 no-wrap"):
+        with ui.row().classes("hubx-nav items-center gap-1 flex-wrap"):
             ui.link(t("nav_check"), "/")
             ui.link(t("nav_knowledge"), "/knowledge")
             ui.link(t("nav_templates"), "/templates")
@@ -542,19 +605,21 @@ def _db_banner():
     h = db_health()
     if h["mode"] == "local":
         with ui.row().classes("items-center gap-2 p-2 rounded w-full "
-                              "mt-1").style(
+                              "mt-1 flex-wrap").style(
                 "background:rgba(246,166,35,0.12);"
                 "border:1px solid rgba(246,166,35,0.35);"):
-            ui.icon("warning").style("color:#f6a623")
+            ui.label("⚠").style("color:#f6a623;font-weight:700;"
+                                "font-size:1.1rem;flex-shrink:0")
             ui.label("Local SQLite - data lost on redeploy. Set "
                      "TURSO_DATABASE_URL on Render.").style(
                 "color:#ffc270;font-size:0.85rem")
     elif h["mode"] == "turso":
         with ui.row().classes("items-center gap-2 p-2 rounded w-full "
-                              "mt-1").style(
+                              "mt-1 flex-wrap").style(
                 "background:rgba(34,211,166,0.10);"
                 "border:1px solid rgba(34,211,166,0.30);"):
-            ui.icon("cloud_done").style("color:#22d3a6")
+            ui.label("✓").style("color:#22d3a6;font-weight:700;"
+                                "font-size:1.1rem;flex-shrink:0")
             ui.label("Connected to Turso - data persists").style(
                 "color:#6ff0cb;font-size:0.85rem")
 
@@ -571,13 +636,11 @@ def _stat(label):
 # ============================================================
 def _paper_html(title: str, category: str, version, body_md: str,
                 meta: dict | None = None) -> str:
-    """Render an A4 paper with cover, positioned meta fields, and body."""
     meta = meta or {}
     rtl = is_rtl()
     rtl_cls = " rtl" if rtl else ""
     today = datetime.utcnow().date().isoformat()
 
-    # minimal markdown -> html (headings, bold, lists, paragraphs, tables)
     body_html = _md_to_html(body_md or "")
 
     fields = [
@@ -621,9 +684,6 @@ def _paper_html(title: str, category: str, version, body_md: str,
 
 
 def _md_to_html(md: str) -> str:
-    """Very small markdown -> html for the paper body.
-    Handles #..###, **bold**, *italic*, -/1. lists, tables, paragraphs, hr.
-    Avoids a hard dependency on the markdown library."""
     import html as _html
     import re
     lines = md.replace("\r\n", "\n").split("\n")
@@ -702,7 +762,6 @@ def _md_to_html(md: str) -> str:
 
 
 def _paper_pdf_bytes(html_str: str, rtl: bool) -> bytes:
-    """Arabic-safe PDF via WeasyPrint. Falls back to a stub if not installed."""
     full = f"""<!doctype html><html><head><meta charset="utf-8">
     <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -741,13 +800,11 @@ def _paper_pdf_bytes(html_str: str, rtl: bool) -> bytes:
         return HTML(string=full).write_pdf()
     except Exception as e:
         print(f"[paper_pdf] WeasyPrint failed: {e}")
-        # fallback: return an empty placeholder PDF is worse than HTML -> raise
         raise
 
 
 def _paper_body_html(title: str, category: str, version,
                      body_md: str, meta: dict | None = None) -> str:
-    """Inner div only — for on-screen preview. No <html>/<head>/<style>."""
     meta = meta or {}
     rtl = is_rtl()
     rtl_cls = " rtl" if rtl else ""
@@ -1045,7 +1102,7 @@ def knowledge_page():
             q_input.on("keydown.enter", do_search)
 
         selected = {"cat": None}
-        with ui.row().classes("w-full gap-3 no-wrap hubx-stack-mobile"):
+        with ui.row().classes("w-full gap-3 flex-wrap hubx-stack-mobile"):
             with ui.card().classes("hubx-card w-72 shrink-0 h-[75vh] "
                                    "overflow-auto"):
                 ui.label(t("categories")).classes("font-bold text-base")
@@ -1139,7 +1196,7 @@ def knowledge_page():
 
 
 # ============================================================
-# /templates  (now with PAPER view)
+# /templates
 # ============================================================
 @ui.page("/templates")
 def templates_page():
@@ -1160,7 +1217,7 @@ def templates_page():
             _stat(t("queue_word")).text = str(tstats["pending"])
 
         selected = {"cat": None}
-        with ui.row().classes("w-full gap-3 no-wrap hubx-stack-mobile"):
+        with ui.row().classes("w-full gap-3 flex-wrap hubx-stack-mobile"):
             with ui.card().classes("hubx-card w-72 shrink-0 h-[75vh] "
                                    "overflow-auto"):
                 ui.label(t("categories")).classes("font-bold text-base")
@@ -1203,7 +1260,6 @@ def templates_page():
                     topic_txt(tmpl[1], tmpl[2], tmpl[5], body),
                     filename=f"hubx_tpl_{tmpl[1][:30]}.txt")
                 ).classes("hubx-btn hubx-btn-ghost")
-                # NEW: paper-format preview
                 ui.button(t("preview_paper"),
                           on_click=lambda: _open_paper_dialog(
                               tmpl[1], tmpl[2], tmpl[5], body, {})
@@ -1406,6 +1462,8 @@ def dashboard_page():
             "color:var(--hubx-text-dim)")
         gemini_err_label = ui.label("").style(
             "color:#ffc270;font-size:0.85rem")
+        quota_label = ui.label("").style(
+            "color:var(--hubx-text-dim);font-size:0.82rem")
 
         async def do_start():
             await engine.start()
@@ -1425,7 +1483,7 @@ def dashboard_page():
                 ui.notify(f"Cycle failed: {e}", color="red")
             refresh()
 
-        with ui.row().classes("gap-2 mt-2"):
+        with ui.row().classes("gap-2 mt-2 flex-wrap"):
             ui.button(t("start"), on_click=do_start).classes(
                 "hubx-btn hubx-btn-accent")
             ui.button(t("pause"), on_click=do_pause).classes(
@@ -1454,6 +1512,13 @@ def dashboard_page():
             gemini_err_label.text = (
                 f"Gemini: {gemini_mod.last_error}"
                 if gemini_mod.last_error else "")
+            try:
+                q = gemini_usage_stats()
+                quota_label.text = (
+                    f"Gemini usage — last 1h: {q['last_1h']}/{q['hour_limit']}"
+                    f"  ·  last 24h: {q['last_24h']}/{q['day_limit']}")
+            except Exception:
+                quota_label.text = ""
 
         ui.timer(2.0, refresh)
         refresh()
