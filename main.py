@@ -1431,11 +1431,9 @@ def dashboard_page():
             ui.button(t("pause"), on_click=do_pause).classes(
                 "hubx-btn hubx-btn-warn")
             ui.button(t("one_cycle"), on_click=do_one_cycle).classes(
-                "hubx-btn hubx-btn-primary")
+                 "hubx-btn hubx-btn-primary")
 
-                
-
-           def refresh():
+        def refresh():
             try:
                 s = engine.stats()
             except Exception as e:
@@ -1457,8 +1455,6 @@ def dashboard_page():
                 f"Gemini: {gemini_mod.last_error}"
                 if gemini_mod.last_error else "")
 
-        ui.timer(2.0, refresh)
-        refresh()
         ui.timer(2.0, refresh)
         refresh()
 
