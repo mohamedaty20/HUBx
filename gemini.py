@@ -26,7 +26,7 @@ from db import (check_and_increment_gemini_usage,
 logger = logging.getLogger(__name__)
 
 # ==================================================================
-MODEL = "openai/gbt-oss-20b"
+MODEL = "openai/gbt-oss-120b"
 # Alternative free models on Groq:
 #   "llama-3.1-8b-instant"        - faster, smaller, ~15k RPD
 #   "mixtral-8x7b-32768"          - longer context
