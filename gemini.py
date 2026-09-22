@@ -1,7 +1,5 @@
 # gemini.py
-# v10: switched from Google Gemini to Groq (Llama 3.3 70B).
-#      14,400 free calls/day, no 429 storms.
-#      Same public API as before so engine.py and main.py don't change.
+# v11: Groq gpt-oss-120b, TPM-safe pacing (30s gap), 2k output.
 
 import os
 import re
@@ -26,18 +24,21 @@ from db import (check_and_increment_gemini_usage,
 logger = logging.getLogger(__name__)
 
 # ==================================================================
-MODEL = "openai/gbt-oss-120b"
-# Alternative free models on Groq:
-#   "llama-3.1-8b-instant"        - faster, smaller, ~15k RPD
-#   "mixtral-8x7b-32768"          - longer context
+MODEL = "openai/gpt-oss-120b"
 # ==================================================================
 
-GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "5000"))
-GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "400"))
-_QUOTA_BLOCK_SECONDS = 120
+# Groq free tier for gpt-oss-120b: 30 RPM, 1,000 RPD, 8,000 TPM.
+# We pace at 2 calls/min to stay well under TPM.
+GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "800"))
+GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "60"))
 
-ATTEMPT_TIMEOUT_SECONDS = 120
-MIN_CALL_GAP = 2.0
+# How long to sit quiet after a 429.
+_QUOTA_BLOCK_SECONDS = 180
+
+ATTEMPT_TIMEOUT_SECONDS = 90
+
+# 30 seconds between calls = 2 calls/min. This is the TPM guard.
+MIN_CALL_GAP = 30.0
 
 _quota_block_until = 0.0
 
@@ -53,7 +54,9 @@ _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 
 try:
-    purge_old_gemini_usage(keep_days=3)
+    # Purge anything older than 1 hour on startup so the counter
+    # restarts clean after a code change.
+    purge_old_gemini_usage(keep_seconds=3600)
 except Exception:
     pass
 
@@ -101,7 +104,7 @@ async def _throttle():
         now = time.monotonic()
         wait = MIN_CALL_GAP - (now - _last_call_time)
         if wait > 0:
-            wait += random.uniform(0, 0.3)
+            wait += random.uniform(0, 1.0)
             await asyncio.sleep(wait)
         _last_call_time = time.monotonic()
 
@@ -112,7 +115,7 @@ def _is_quota_error(err_str):
             or "too many requests" in s or "exceeded" in s)
 
 
-async def _call(prompt, json_mode=False, max_tokens=3000, max_retries=3):
+async def _call(prompt, json_mode=False, max_tokens=2000, max_retries=2):
     global last_error, _quota_block_until
 
     if not _client:
@@ -182,19 +185,19 @@ async def _call(prompt, json_mode=False, max_tokens=3000, max_retries=3):
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=3000)
+                       json_mode=False, max_tokens=2000)
 
 
 async def refine_knowledge(topic, existing):
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:6000])
     return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=3000)
+                       json_mode=False, max_tokens=2000)
 
 
 async def generate_template(name, category):
     user = TEMPLATE_USER_TEMPLATE.format(name=name, category=category)
     return await _call(f"{TEMPLATE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=3000)
+                       json_mode=False, max_tokens=2000)
 
 
 async def refine_template(name, existing):
@@ -204,7 +207,7 @@ async def refine_template(name, existing):
         "mistakes. Keep the same structure. Return only the improved "
         "template, plain text, no LaTeX.\n\n---\n\n"
         f"Template: {name}\n\n{existing[:6000]}",
-        json_mode=False, max_tokens=3000)
+        json_mode=False, max_tokens=2000)
 
 
 async def suggest_subtopics(parent_topic, category, n=3):
@@ -214,12 +217,11 @@ async def suggest_subtopics(parent_topic, category, n=3):
         f"{n} NEW, specific, learnable sub-topics within the same "
         f"category ({category}) that are NOT the same as the parent and "
         "NOT generic. Each should be a concrete topic an engineer would "
-        "search for, 6-14 words long, mentioning the code or method where "
-        "relevant.\n\n"
+        "search for, 6-14 words long.\n\n"
         'Return ONLY a JSON object: {"subtopics": ["...", "..."]}\n\n'
         f"Parent topic: {parent_topic}\n"
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=512)
+    raw = await _call(prompt, json_mode=True, max_tokens=400)
     if not raw:
         return []
     try:
@@ -249,7 +251,7 @@ async def suggest_subtemplates(parent_name, category, n=3):
         'Return ONLY a JSON object: {"templates": ["...", "..."]}\n\n'
         f"Parent template: {parent_name}\n"
     )
-    raw = await _call(prompt, json_mode=True, max_tokens=512)
+    raw = await _call(prompt, json_mode=True, max_tokens=400)
     if not raw:
         return []
     try:
@@ -273,7 +275,7 @@ async def check_document(filename, file_type, text):
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
     raw = await _call(f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                      json_mode=True, max_tokens=4000)
+                      json_mode=True, max_tokens=3000)
     if not raw:
         return {}
     try:
@@ -312,7 +314,7 @@ async def ai_search(question, knowledge_context):
         f"=== KNOWLEDGE BASE EXCERPTS ===\n{knowledge_context}\n\n"
         f"=== USER QUESTION ===\n{question}\n"
     )
-    return await _call(prompt, json_mode=False, max_tokens=2048)
+    return await _call(prompt, json_mode=False, max_tokens=1500)
 
 
 async def ocr_image(path):
