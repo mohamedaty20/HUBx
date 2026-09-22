@@ -1,8 +1,6 @@
 # engine.py
-"""
-Self-learning loop.
-v3: auto-start on boot, persisted pause state in DB.
-"""
+# v4: real expansion loop — pop pending first, suggest sub-topics after
+#     each generation. Refine only unverified/unflagged rows.
 
 from __future__ import annotations
 import asyncio
@@ -12,6 +10,7 @@ import traceback
 from gemini import (
     generate_knowledge, refine_knowledge,
     generate_template, refine_template,
+    suggest_subtopics, suggest_subtemplates,
 )
 
 import db as _db
@@ -56,12 +55,14 @@ _SAVE_LRUN      = _find("save_learning_run", "add_learning_run",
                         "log_learning_run", "insert_learning_run")
 _SAVE_TRUN      = _find("save_template_run", "add_template_run",
                         "log_template_run", "insert_template_run")
-_GET_KNOWLEDGE_BY_TOPIC = _find("get_knowledge_by_topic",
-                                "find_knowledge_by_topic",
-                                "get_knowledge")
-_GET_TEMPLATE_BY_NAME   = _find("get_template_by_name",
-                                "find_template_by_name",
-                                "get_template")
+_GET_KNOWLEDGE_BY_TOPIC = _find("get_knowledge_by_topic")
+_GET_TEMPLATE_BY_NAME   = _find("get_template_by_name")
+_POP_TOPIC      = _find("pop_pending_topic")
+_POP_TEMPLATE   = _find("pop_pending_template")
+_ADD_TOPIC      = _find("add_pending_topic")
+_ADD_TEMPLATE   = _find("add_pending_template")
+_OLDEST_KN      = _find("oldest_unverified_knowledge")
+_OLDEST_TPL     = _find("oldest_unverified_template")
 
 
 def _call_adapt(fn, *args, **kwargs):
@@ -94,53 +95,39 @@ def _call_adapt(fn, *args, **kwargs):
 def _save_knowledge(topic, category, content,
                     version=1, confidence=0.7, parent_id=None):
     if not _SAVE_KNOWLEDGE:
-        print("[engine] db has no save_knowledge — knowledge NOT stored")
+        print("[engine] db has no save_knowledge")
         return False
-    _call_adapt(
-        _SAVE_KNOWLEDGE,
-        topic, category, content,
-        topic=topic, category=category, name=topic, title=topic,
-        content=content, body=content, text=content, markdown=content,
-        version=version, confidence=confidence, parent_id=parent_id,
-    )
+    _call_adapt(_SAVE_KNOWLEDGE, topic, category, content,
+                topic=topic, category=category, name=topic, title=topic,
+                content=content, body=content, text=content,
+                markdown=content, version=version,
+                confidence=confidence, parent_id=parent_id)
     return True
 
 
-def _save_template(name, category, content,
-                   version=1, confidence=0.7):
+def _save_template(name, category, content, version=1, confidence=0.7):
     if not _SAVE_TEMPLATE:
-        print("[engine] db has no save_template — template NOT stored")
+        print("[engine] db has no save_template")
         return False
-    _call_adapt(
-        _SAVE_TEMPLATE,
-        name, category, content,
-        name=name, topic=name, title=name,
-        category=category,
-        content=content, body=content, text=content, markdown=content,
-        version=version, confidence=confidence,
-    )
+    _call_adapt(_SAVE_TEMPLATE, name, category, content,
+                name=name, topic=name, title=name, category=category,
+                content=content, body=content, text=content,
+                markdown=content, version=version, confidence=confidence)
     return True
 
 
 def _save_lrun(cycle, topic, added, refined, calls, error=""):
-    if not _SAVE_LRUN:
-        return
-    _call_adapt(
-        _SAVE_LRUN,
-        cycle, topic, added, refined, calls, error,
-        cycle=cycle, topic=topic, added=added, refined=refined,
-        calls=calls, error=error,
-    )
+    if _SAVE_LRUN:
+        _call_adapt(_SAVE_LRUN, cycle, topic, added, refined, calls, error,
+                    cycle=cycle, topic=topic, added=added,
+                    refined=refined, calls=calls, error=error)
 
 
 def _save_trun(cycle, name, added, refined, error=""):
-    if not _SAVE_TRUN:
-        return
-    _call_adapt(
-        _SAVE_TRUN,
-        cycle, name, added, refined, error,
-        cycle=cycle, name=name, added=added, refined=refined, error=error,
-    )
+    if _SAVE_TRUN:
+        _call_adapt(_SAVE_TRUN, cycle, name, added, refined, error,
+                    cycle=cycle, name=name, added=added,
+                    refined=refined, error=error)
 
 
 def _existing_knowledge(topic):
@@ -190,7 +177,6 @@ class Engine:
         self.last_error = ""
         self.last_debug = "started"
         if by_user:
-            # user explicitly pressed Start -> clear the persisted pause
             _db.set_app_state(PAUSED_KEY, "0")
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop())
@@ -202,7 +188,6 @@ class Engine:
         self.paused = True
         self.last_status = "paused"
         self.last_debug = "paused"
-        # persist so next boot does NOT auto-start
         _db.set_app_state(PAUSED_KEY, "1")
         if self._task and not self._task.done():
             self._task.cancel()
@@ -268,78 +253,126 @@ class Engine:
 
             self.ai_calls = self.gemini_calls
 
+    # -------- knowledge --------
     async def _knowledge_step(self):
-        if not SEED_TOPICS:
-            return
-        topic, category = SEED_TOPICS[self._k_idx % len(SEED_TOPICS)]
-        self._k_idx += 1
-        self.last_debug = f"knowledge: {topic}"
+        # 1. Try pending queue
+        item = None
+        if _POP_TOPIC:
+            try:
+                item = _POP_TOPIC()
+            except Exception:
+                item = None
+
+        if item:
+            topic, category = item[0], item[1]
+            source = "pending"
+        else:
+            # fall back to seeds
+            if not SEED_TOPICS:
+                return
+            topic, category = SEED_TOPICS[self._k_idx % len(SEED_TOPICS)]
+            self._k_idx += 1
+            source = "seed"
 
         existing = _existing_knowledge(topic)
 
+        # Skip already-verified and NOT flagged
         if existing:
-            body = ""
             try:
-                body = existing[4] or existing[3] or ""
+                verified = existing[9] if len(existing) > 9 else 0
+                flagged = existing[10] if len(existing) > 10 else 0
             except Exception:
-                body = ""
+                verified, flagged = 0, 0
+            if verified and not flagged:
+                self.last_debug = f"skipped verified: {topic}"
+                return
+
+        if existing:
+            # refine
+            body = existing[4] or existing[3] or ""
+            self.last_debug = f"refining: {topic}"
             new_body = await refine_knowledge(topic, body)
             self.gemini_calls += 1
             if new_body:
-                ver, conf, pid = 2, 0.7, None
-                try:
-                    ver = (existing[5] or 1) + 1
-                    conf = existing[6] or 0.7
-                    pid = existing[0]
-                except Exception:
-                    pass
+                ver = (existing[5] or 1) + 1
+                conf = existing[6] or 0.7
                 _save_knowledge(topic, category, new_body,
-                                version=ver, confidence=conf, parent_id=pid)
+                                version=ver, confidence=conf)
                 self.last_debug = f"refined: {topic}"
                 _save_lrun(self.cycles, topic, 0, 1, 1, "")
             else:
                 _save_lrun(self.cycles, topic, 0, 0, 1, "refine empty")
             return
 
+        # generate new
+        self.last_debug = f"generating: {topic}"
         content = await generate_knowledge(topic, category)
         self.gemini_calls += 1
-        if content:
-            _save_knowledge(topic, category, content,
-                            version=1, confidence=0.7)
-            self.last_debug = f"generated: {topic}"
-            _save_lrun(self.cycles, topic, 1, 0, 1, "")
-        else:
+        if not content:
             self.last_debug = f"empty: {topic}"
             _save_lrun(self.cycles, topic, 0, 0, 1, "gemini empty")
-
-    async def _template_step(self):
-        if not SEED_TEMPLATES:
             return
-        item = SEED_TEMPLATES[self._t_idx % len(SEED_TEMPLATES)]
-        self._t_idx += 1
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
+
+        _save_knowledge(topic, category, content,
+                        version=1, confidence=0.7)
+        self.last_debug = f"generated: {topic}"
+        _save_lrun(self.cycles, topic, 1, 0, 1, "")
+
+        # expand: ask for sub-topics
+        try:
+            subs = await suggest_subtopics(topic, category,
+                                           n=int(SUGGESTIONS_PER_CYCLE or 3))
+            self.gemini_calls += 1
+            added = 0
+            if _ADD_TOPIC:
+                for s in subs:
+                    if _ADD_TOPIC(s, category, "ai", topic):
+                        added += 1
+            self.last_debug = f"generated: {topic} (+{added} queued)"
+        except Exception as e:
+            print(f"[engine] suggest_subtopics failed: {e}")
+
+    # -------- templates --------
+    async def _template_step(self):
+        item = None
+        if _POP_TEMPLATE:
+            try:
+                item = _POP_TEMPLATE()
+            except Exception:
+                item = None
+
+        if item:
             name, category = item[0], item[1]
         else:
-            name, category = str(item), "administrative"
-        self.last_debug = f"template: {name}"
+            if not SEED_TEMPLATES:
+                return
+            seed = SEED_TEMPLATES[self._t_idx % len(SEED_TEMPLATES)]
+            self._t_idx += 1
+            if isinstance(seed, (list, tuple)) and len(seed) >= 2:
+                name, category = seed[0], seed[1]
+            else:
+                name, category = str(seed), "administrative"
 
         existing = _existing_template(name)
 
         if existing:
-            body = ""
             try:
-                body = existing[4] or existing[3] or ""
+                verified = existing[9] if len(existing) > 9 else 0
+                flagged = existing[10] if len(existing) > 10 else 0
             except Exception:
-                body = ""
+                verified, flagged = 0, 0
+            if verified and not flagged:
+                self.last_debug = f"skipped verified: {name}"
+                return
+
+        if existing:
+            body = existing[4] or existing[3] or ""
+            self.last_debug = f"refining template: {name}"
             new_body = await refine_template(name, body)
             self.gemini_calls += 1
             if new_body:
-                ver, conf = 2, 0.7
-                try:
-                    ver = (existing[5] or 1) + 1
-                    conf = existing[6] or 0.7
-                except Exception:
-                    pass
+                ver = (existing[5] or 1) + 1
+                conf = existing[6] or 0.7
                 _save_template(name, category, new_body,
                                version=ver, confidence=conf)
                 self.last_debug = f"refined template: {name}"
@@ -348,25 +381,41 @@ class Engine:
                 _save_trun(self.cycles, name, 0, 0, "refine empty")
             return
 
+        self.last_debug = f"generating template: {name}"
         content = await generate_template(name, category)
         self.gemini_calls += 1
-        if content:
-            _save_template(name, category, content,
-                           version=1, confidence=0.7)
-            self.last_debug = f"generated template: {name}"
-            _save_trun(self.cycles, name, 1, 0, "")
-        else:
+        if not content:
             self.last_debug = f"empty template: {name}"
             _save_trun(self.cycles, name, 0, 0, "gemini empty")
+            return
+
+        _save_template(name, category, content,
+                       version=1, confidence=0.7)
+        self.last_debug = f"generated template: {name}"
+        _save_trun(self.cycles, name, 1, 0, "")
+
+        try:
+            subs = await suggest_subtemplates(name, category,
+                                              n=int(SUGGESTIONS_PER_CYCLE or 3))
+            self.gemini_calls += 1
+            added = 0
+            if _ADD_TEMPLATE:
+                for s in subs:
+                    if _ADD_TEMPLATE(s, category, "ai", name):
+                        added += 1
+            self.last_debug = f"generated template: {name} (+{added} queued)"
+        except Exception as e:
+            print(f"[engine] suggest_subtemplates failed: {e}")
 
     def stats(self) -> dict:
-        kb_total = kb_refined = 0
+        kb_total = kb_refined = kb_pending = 0
         tpl_total = tpl_pending = 0
         try:
             ks = _db.knowledge_stats() if hasattr(_db, "knowledge_stats") else {}
             if isinstance(ks, dict):
                 kb_total = ks.get("total", 0)
                 kb_refined = ks.get("refined", 0)
+                kb_pending = ks.get("pending", 0)
         except Exception:
             pass
         try:
@@ -383,7 +432,8 @@ class Engine:
             "knowledge_total": kb_total,
             "knowledge_refined": kb_refined,
             "template_total": tpl_total,
-            "pending_topics": tpl_pending,
+            "pending_topics": kb_pending,
+            "pending_templates": tpl_pending,
             "last_status": self.last_status,
             "last_error": self.last_error,
             "last_debug": self.last_debug,
@@ -393,11 +443,7 @@ class Engine:
 engine = Engine()
 
 
-# ==================================================================
-# Boot helper
-# ==================================================================
 async def auto_start_if_needed():
-    """Called on app boot. Starts the engine unless the user had paused it."""
     try:
         paused_flag = _db.get_app_state(PAUSED_KEY, "0")
     except Exception:
