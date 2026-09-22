@@ -1,5 +1,6 @@
 # engine.py
-# v7: honours focus mode + focus categories read from db.app_state.
+# v8: phase-based expansion. Every cycle tries to advance a phase first.
+#     Falls back to generating new when nothing is phaseable.
 
 from __future__ import annotations
 import asyncio
@@ -10,6 +11,7 @@ import traceback
 from gemini import (
     generate_knowledge, refine_knowledge,
     generate_template, refine_template,
+    expand_phase,
     suggest_subtopics, suggest_subtemplates,
 )
 
@@ -17,53 +19,51 @@ import db as _db
 
 from sources import (
     LEARNING_INTERVAL_SECONDS, TEMPLATE_INTERVAL_SECONDS,
-    REFINE_EVERY_N_CYCLES, SUGGESTIONS_PER_CYCLE,
-    MAX_KNOWLEDGE_ITEMS, MAX_TEMPLATES,
-    SEED_TOPICS, SEED_TEMPLATES,
+    SUGGESTIONS_PER_CYCLE, SEED_TOPICS, SEED_TEMPLATES,
 )
 
-try:
-    from state import STATE
-except Exception:
-    class _S:
-        focus = "both"
-        @property
-        def run_knowledge(self): return self.focus in ("knowledge", "both")
-        @property
-        def run_templates(self): return self.focus in ("templates", "both")
-    STATE = _S()
-
-
 PAUSED_KEY = "engine_paused_by_user"
+MAX_PHASE_DEFAULT = 8
+PHASE_MIN_AGE_SECONDS = 14400   # 4 hours between phase advances of same item
 
 
-def _find(*names):
-    for n in names:
-        fn = getattr(_db, n, None)
-        if callable(fn):
-            return fn
-    return None
+def _get_max_phase():
+    try:
+        v = _db.get_app_state("max_phase", str(MAX_PHASE_DEFAULT))
+        n = int(v)
+        return max(1, min(8, n))
+    except Exception:
+        return MAX_PHASE_DEFAULT
 
-_SAVE_KNOWLEDGE = _find("save_knowledge", "add_knowledge",
-                        "insert_knowledge", "upsert_knowledge")
-_SAVE_TEMPLATE  = _find("save_template", "add_template",
-                        "insert_template", "upsert_template")
-_SAVE_LRUN      = _find("save_learning_run", "add_learning_run",
-                        "log_learning_run", "insert_learning_run")
-_SAVE_TRUN      = _find("save_template_run", "add_template_run",
-                        "log_template_run", "insert_template_run")
-_GET_KNOWLEDGE_BY_TOPIC = _find("get_knowledge_by_topic")
-_GET_TEMPLATE_BY_NAME   = _find("get_template_by_name")
-_POP_TOPIC      = _find("pop_pending_topic")
-_POP_TEMPLATE   = _find("pop_pending_template")
-_ADD_TOPIC      = _find("add_pending_topic")
-_ADD_TEMPLATE   = _find("add_pending_template")
-_PENDING_COUNT  = _find("pending_count")
-_PENDING_TPL    = _find("pending_template_count")
+
+def _call_adapt(fn, *args, **kwargs):
+    if not fn:
+        return None
+    if args:
+        try:
+            return fn(*args)
+        except TypeError:
+            pass
+        except Exception as e:
+            print(f"[db] {getattr(fn, '__name__', fn)} failed: {e}")
+            return None
+    try:
+        return fn(**kwargs)
+    except TypeError:
+        pass
+    except Exception as e:
+        print(f"[db] {getattr(fn, '__name__', fn)} failed: {e}")
+        return None
+    try:
+        sig = inspect.signature(fn)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return fn(**filtered)
+    except Exception as e:
+        print(f"[db] {getattr(fn, '__name__', fn)} filtered failed: {e}")
+        return None
 
 
 def _read_focus_state():
-    """Reads focus mode and category filter from db.app_state."""
     try:
         mode = _db.get_app_state("focus_mode", "both") or "both"
         raw = _db.get_app_state("focus_categories", "") or ""
@@ -80,83 +80,16 @@ def _read_focus_state():
         return "both", set()
 
 
-def _call_adapt(fn, *args, **kwargs):
-    if not fn:
-        return None
-    if args:
-        try:
-            return fn(*args)
-        except TypeError:
-            pass
-        except Exception as e:
-            print(f"[db] {getattr(fn, '__name__', fn)} (positional) failed: {e}")
-            return None
-    try:
-        return fn(**kwargs)
-    except TypeError:
-        pass
-    except Exception as e:
-        print(f"[db] {getattr(fn, '__name__', fn)} (kwargs) failed: {e}")
-        return None
-    try:
-        sig = inspect.signature(fn)
-        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return fn(**filtered)
-    except Exception as e:
-        print(f"[db] {getattr(fn, '__name__', fn)} (filtered) failed: {e}")
-        return None
-
-
-def _save_knowledge(topic, category, content,
-                    version=1, confidence=0.7, parent_id=None):
-    if not _SAVE_KNOWLEDGE:
-        return False
-    _call_adapt(_SAVE_KNOWLEDGE, topic, category, content,
-                topic=topic, category=category, name=topic, title=topic,
-                content=content, body=content, text=content,
-                markdown=content, version=version,
-                confidence=confidence, parent_id=parent_id)
-    return True
-
-
-def _save_template(name, category, content, version=1, confidence=0.7):
-    if not _SAVE_TEMPLATE:
-        return False
-    _call_adapt(_SAVE_TEMPLATE, name, category, content,
-                name=name, topic=name, title=name, category=category,
-                content=content, body=content, text=content,
-                markdown=content, version=version, confidence=confidence)
-    return True
-
-
-def _save_lrun(cycle, topic, added, refined, calls, error=""):
-    if _SAVE_LRUN:
-        _call_adapt(_SAVE_LRUN, cycle, topic, added, refined, calls, error,
-                    cycle=cycle, topic=topic, added=added,
-                    refined=refined, calls=calls, error=error)
-
-
-def _save_trun(cycle, name, added, refined, error=""):
-    if _SAVE_TRUN:
-        _call_adapt(_SAVE_TRUN, cycle, name, added, refined, error,
-                    cycle=cycle, name=name, added=added,
-                    refined=refined, error=error)
-
-
 def _existing_knowledge(topic):
-    if not _GET_KNOWLEDGE_BY_TOPIC:
-        return None
     try:
-        return _GET_KNOWLEDGE_BY_TOPIC(topic)
+        return _db.get_knowledge_by_topic(topic)
     except Exception:
         return None
 
 
 def _existing_template(name):
-    if not _GET_TEMPLATE_BY_NAME:
-        return None
     try:
-        return _GET_TEMPLATE_BY_NAME(name)
+        return _db.get_template_by_name(name)
     except Exception:
         return None
 
@@ -240,12 +173,24 @@ class Engine:
     async def _cycle(self):
         async with self._lock:
             self.last_status = "running"
-
             mode, focus_cats = _read_focus_state()
-            run_knowledge = mode in ("knowledge", "both")
-            run_templates = mode in ("templates", "both")
+            max_phase = _get_max_phase()
 
-            if run_knowledge:
+            run_k = mode in ("knowledge", "both")
+            run_t = mode in ("templates", "both")
+
+            # 1. Try phase advancement first (higher priority).
+            if run_k:
+                if await self._advance_knowledge(max_phase):
+                    self.ai_calls = self.gemini_calls
+                    return
+            if run_t:
+                if await self._advance_template(max_phase):
+                    self.ai_calls = self.gemini_calls
+                    return
+
+            # 2. Nothing to phase — generate new content.
+            if run_k:
                 try:
                     await self._knowledge_step(focus_cats)
                 except asyncio.CancelledError:
@@ -253,9 +198,8 @@ class Engine:
                 except Exception as e:
                     self.last_error = f"knowledge: {e}"
                     self.last_debug = f"knowledge error: {e}"
-                    print(f"[engine] knowledge step failed: {e}")
 
-            if run_templates:
+            if run_t:
                 try:
                     await self._template_step(focus_cats)
                 except asyncio.CancelledError:
@@ -263,21 +207,87 @@ class Engine:
                 except Exception as e:
                     self.last_error = f"templates: {e}"
                     self.last_debug = f"templates error: {e}"
-                    print(f"[engine] template step failed: {e}")
 
             self.ai_calls = self.gemini_calls
 
-    async def _knowledge_step(self, focus_cats=None):
+    # ---------------- phase advancement ----------------
+    async def _advance_knowledge(self, max_phase):
+        try:
+            row = _db.phaseable_knowledge(max_phase, PHASE_MIN_AGE_SECONDS)
+        except Exception as e:
+            print(f"[engine] phaseable_knowledge failed: {e}")
+            return False
+        if not row:
+            return False
+
+        kid, topic, category, content, phase = row
+        target = int(phase) + 1
+        if target > max_phase:
+            return False
+
+        self.last_debug = f"phase {phase}->{target}: {topic}"
+        new_content = await expand_phase(topic, category,
+                                         content or "", phase, target)
+        self.gemini_calls += 1
+        if not new_content or len(new_content) < len(content or ""):
+            self.last_debug = f"phase expand failed: {topic}"
+            return True  # we tried, don't fall back to generate in same cycle
+
+        try:
+            _db.advance_knowledge_phase(kid, new_content, target)
+        except Exception as e:
+            print(f"[engine] advance_knowledge_phase failed: {e}")
+            return True
+
+        _db.log_learning_run(self.cycles, topic, 0, 1, 1,
+                             f"phase->{target}")
+        self.last_debug = f"advanced to phase {target}: {topic}"
+        return True
+
+    async def _advance_template(self, max_phase):
+        try:
+            row = _db.phaseable_template(max_phase, PHASE_MIN_AGE_SECONDS)
+        except Exception as e:
+            print(f"[engine] phaseable_template failed: {e}")
+            return False
+        if not row:
+            return False
+
+        tid, name, category, content, phase = row
+        target = int(phase) + 1
+        if target > max_phase:
+            return False
+
+        self.last_debug = f"phase {phase}->{target}: {name}"
+        new_content = await expand_phase(name, category,
+                                         content or "", phase, target)
+        self.gemini_calls += 1
+        if not new_content or len(new_content) < len(content or ""):
+            self.last_debug = f"phase expand failed: {name}"
+            return True
+
+        try:
+            _db.advance_template_phase(tid, new_content, target)
+        except Exception as e:
+            print(f"[engine] advance_template_phase failed: {e}")
+            return True
+
+        _db.log_template_run(self.cycles, name, 0, 1, 1,
+                             f"phase->{target}")
+        self.last_debug = f"advanced to phase {target}: {name}"
+        return True
+
+    # ---------------- generate new ----------------
+    async def _knowledge_step(self, focus_cats):
         focus_cats = focus_cats or set()
         topic = category = None
 
         for _ in range(20):
             item = None
-            if _POP_TOPIC:
-                try:
-                    item = _POP_TOPIC()
-                except Exception:
-                    item = None
+            try:
+                item = _db.pop_pending_topic()
+            except Exception:
+                item = None
 
             if item:
                 t, c = item[0], item[1]
@@ -287,23 +297,19 @@ class Engine:
                 t, c = SEED_TOPICS[self._k_idx % len(SEED_TOPICS)]
                 self._k_idx += 1
 
-            # Category filter for focused mode
             if focus_cats and c not in focus_cats:
                 continue
-
             if _existing_knowledge(t):
                 continue
-
             topic, category = t, c
             break
 
         if not topic:
             queue_empty = True
-            if _PENDING_COUNT:
-                try:
-                    queue_empty = (_PENDING_COUNT() == 0)
-                except Exception:
-                    queue_empty = True
+            try:
+                queue_empty = (_db.pending_count() == 0)
+            except Exception:
+                queue_empty = True
             if not queue_empty:
                 self.last_debug = "no matching topics in queue"
                 return
@@ -315,10 +321,9 @@ class Engine:
                 if subs:
                     t = subs[0]
                     if not _existing_knowledge(t):
-                        topic = t
-                        category = "quality_management"
+                        topic, category = t, "quality_management"
             except Exception as e:
-                print(f"[engine] fresh topic suggestion failed: {e}")
+                print(f"[engine] fresh suggestion failed: {e}")
 
         if not topic:
             self.last_debug = "no new knowledge topics available"
@@ -328,38 +333,36 @@ class Engine:
         content = await generate_knowledge(topic, category)
         self.gemini_calls += 1
         if not content:
-            self.last_debug = f"failed (quota or empty): {topic}"
-            _save_lrun(self.cycles, topic, 0, 0, 1, "gemini empty")
+            self.last_debug = f"failed: {topic}"
+            _db.log_learning_run(self.cycles, topic, 0, 0, 1, "empty")
             return
 
-        _save_knowledge(topic, category, content, version=1, confidence=0.7)
+        _db.upsert_knowledge(topic, category, content, confidence=0.7)
         self.last_debug = f"generated: {topic}"
-        _save_lrun(self.cycles, topic, 1, 0, 1, "")
+        _db.log_learning_run(self.cycles, topic, 1, 0, 1, "")
 
         try:
             subs = await suggest_subtopics(
-                topic, category, n=int(SUGGESTIONS_PER_CYCLE or 3))
+                topic, category, n=int(SUGGESTIONS_PER_CYCLE or 2))
             self.gemini_calls += 1
             added = 0
-            if _ADD_TOPIC:
-                for s in subs:
-                    if _ADD_TOPIC(s, category, "ai", topic):
-                        added += 1
+            for s in subs:
+                if _db.add_pending_topic(s, category, "ai", topic):
+                    added += 1
             self.last_debug = f"generated: {topic} (+{added} queued)"
         except Exception as e:
             print(f"[engine] suggest_subtopics failed: {e}")
 
-    async def _template_step(self, focus_cats=None):
+    async def _template_step(self, focus_cats):
         focus_cats = focus_cats or set()
         name = category = None
 
         for _ in range(20):
             item = None
-            if _POP_TEMPLATE:
-                try:
-                    item = _POP_TEMPLATE()
-                except Exception:
-                    item = None
+            try:
+                item = _db.pop_pending_template()
+            except Exception:
+                item = None
 
             if item:
                 t, c = item[0], item[1]
@@ -375,33 +378,28 @@ class Engine:
 
             if focus_cats and c not in focus_cats:
                 continue
-
             if _existing_template(t):
                 continue
-
             name, category = t, c
             break
 
         if not name:
             queue_empty = True
-            if _PENDING_TPL:
-                try:
-                    queue_empty = (_PENDING_TPL() == 0)
-                except Exception:
-                    queue_empty = True
+            try:
+                queue_empty = (_db.pending_template_count() == 0)
+            except Exception:
+                queue_empty = True
             if not queue_empty:
                 self.last_debug = "no matching templates in queue"
                 return
             try:
                 subs = await suggest_subtemplates(
-                    "Egyptian construction site template",
-                    "quality", n=1)
+                    "Egyptian construction site template", "quality", n=1)
                 self.gemini_calls += 1
                 if subs:
                     t = subs[0]
                     if not _existing_template(t):
-                        name = t
-                        category = "quality"
+                        name, category = t, "quality"
             except Exception as e:
                 print(f"[engine] fresh template suggestion failed: {e}")
 
@@ -413,43 +411,50 @@ class Engine:
         content = await generate_template(name, category)
         self.gemini_calls += 1
         if not content:
-            self.last_debug = f"failed (quota or empty): {name}"
-            _save_trun(self.cycles, name, 0, 0, "gemini empty")
+            self.last_debug = f"failed: {name}"
+            _db.log_template_run(self.cycles, name, 0, 0, "empty")
             return
 
-        _save_template(name, category, content, version=1, confidence=0.7)
+        _db.upsert_template(name, category, content, confidence=0.7)
         self.last_debug = f"generated template: {name}"
-        _save_trun(self.cycles, name, 1, 0, "")
+        _db.log_template_run(self.cycles, name, 1, 0, "")
 
         try:
             subs = await suggest_subtemplates(
-                name, category, n=int(SUGGESTIONS_PER_CYCLE or 3))
+                name, category, n=int(SUGGESTIONS_PER_CYCLE or 2))
             self.gemini_calls += 1
             added = 0
-            if _ADD_TEMPLATE:
-                for s in subs:
-                    if _ADD_TEMPLATE(s, category, "ai", name):
-                        added += 1
-            self.last_debug = f"generated template: {name} (+{added} queued)"
+            for s in subs:
+                if _db.add_pending_template(s, category, "ai", name):
+                    added += 1
+            self.last_debug = f"generated: {name} (+{added} queued)"
         except Exception as e:
             print(f"[engine] suggest_subtemplates failed: {e}")
 
     def stats(self) -> dict:
         kb_total = kb_refined = kb_pending = 0
+        kb_avg_phase = 1.0
+        kb_advanced = 0
         tpl_total = tpl_pending = 0
+        tpl_avg_phase = 1.0
+        tpl_advanced = 0
         try:
-            ks = _db.knowledge_stats() if hasattr(_db, "knowledge_stats") else {}
+            ks = _db.knowledge_stats()
             if isinstance(ks, dict):
                 kb_total = ks.get("total", 0)
                 kb_refined = ks.get("refined", 0)
                 kb_pending = ks.get("pending", 0)
+                kb_avg_phase = ks.get("avg_phase", 1.0)
+                kb_advanced = ks.get("advanced", 0)
         except Exception:
             pass
         try:
-            ts = _db.template_stats() if hasattr(_db, "template_stats") else {}
+            ts = _db.template_stats()
             if isinstance(ts, dict):
                 tpl_total = ts.get("total", 0)
                 tpl_pending = ts.get("pending", 0)
+                tpl_avg_phase = ts.get("avg_phase", 1.0)
+                tpl_advanced = ts.get("advanced", 0)
         except Exception:
             pass
 
@@ -458,9 +463,14 @@ class Engine:
             "gemini_calls": self.gemini_calls,
             "knowledge_total": kb_total,
             "knowledge_refined": kb_refined,
+            "knowledge_avg_phase": kb_avg_phase,
+            "knowledge_advanced": kb_advanced,
             "template_total": tpl_total,
+            "template_avg_phase": tpl_avg_phase,
+            "template_advanced": tpl_advanced,
             "pending_topics": kb_pending,
             "pending_templates": tpl_pending,
+            "max_phase": _get_max_phase(),
             "last_status": self.last_status,
             "last_error": self.last_error,
             "last_debug": self.last_debug,
@@ -479,8 +489,8 @@ async def auto_start_if_needed():
         engine.paused = True
         engine.running = False
         engine.last_status = "paused"
-        engine.last_debug = "auto-start skipped (paused by user)"
-        print("[engine] auto-start skipped — user previously paused")
+        engine.last_debug = "auto-start skipped (user paused)"
+        print("[engine] auto-start skipped")
         return
-    print("[engine] auto-starting on boot")
+    print("[engine] auto-starting")
     await engine.start(by_user=False)
