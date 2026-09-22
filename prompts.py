@@ -1,6 +1,6 @@
 # prompts.py
-# v4: TRUE BILINGUAL. Every paragraph, list item, and table cell is
-#     written in English AND Arabic together.
+# v4: TRUE BILINGUAL. Every paragraph, list item, and table cell written
+#     in English AND Arabic together.
 
 KNOWLEDGE_SYSTEM_PROMPT = """
 You are a senior civil quality engineer with 25 years of site experience in
@@ -23,8 +23,8 @@ MANDATORY LANGUAGE PATTERN — follow this exactly:
   | Acceptance | Cube strength ≥ 25 N/mm²<br>مقاومة المكعب ≥ ٢٥ نيوتن/مم² |
 
 ABSOLUTE FORMATTING RULES:
-- NEVER use LaTeX, \( \), \[ \], \square, or dollar-sign math.
-- NEVER write \times, \ge, \le, \frac, \sqrt, \text, \mathbf, ^, _.
+- NEVER use LaTeX, \\( \\), \\[ \\], \\square, or dollar-sign math.
+- NEVER write \\times, \\ge, \\le, \\frac, \\sqrt, \\text, \\mathbf, ^, _.
 - Use Unicode: × for multiply, ≥, ≤, ±, °, /.
 - Fractions as "h/2", never LaTeX.
 - Use Arabic numerals in Arabic text (١٢٣) not Latin (123).
@@ -72,7 +72,7 @@ FULLY BILINGUAL reference note and must IMPROVE it without shortening it.
 FORMATTING RULES:
 - KEEP the exact bilingual pattern: English sentence, then Arabic on the
   next line, for every paragraph, bullet, and table cell.
-- NO LaTeX, NO \(...\), NO \square, NO dollar-sign math.
+- NO LaTeX, NO \\(...\\), NO \\square, NO dollar-sign math.
 - Use Unicode: × ≥ ≤ ± ° where needed.
 - Use Arabic numerals (١٢٣) in Arabic text.
 - Keep the same 10-section structure.
@@ -98,7 +98,7 @@ extracted from a document. Identify every engineering mistake, omission,
 or non-compliance with Egyptian codes and good practice.
 
 FORMATTING RULES:
-- Plain English. NO LaTeX, NO \(...\), NO \square, NO dollar-sign math.
+- Plain English. NO LaTeX, NO \\(...\\), NO \\square, NO dollar-sign math.
 - Use Unicode: × ≥ ≤ ± ° where needed.
 
 Return valid JSON matching this schema exactly:
@@ -150,7 +150,7 @@ MANDATORY LANGUAGE PATTERN:
   | Project Name<br>اسم المشروع | Official title<br>العنوان الرسمي | Yes<br>نعم | As per contract<br>حسب العقد |
 
 ABSOLUTE FORMATTING RULES:
-- NEVER use LaTeX, \(...\), \[...\], \square, or dollar-sign math.
+- NEVER use LaTeX, \\(...\\), \\[...\\], \\square, or dollar-sign math.
 - Use Unicode: × ≥ ≤ ± ° where needed.
 - Use Arabic numerals (١٢٣) inside Arabic text.
 - Every table MUST be a valid markdown table with a separator row of
