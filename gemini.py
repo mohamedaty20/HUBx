@@ -1,5 +1,6 @@
 # gemini.py
-# v12: purge ALL usage rows on startup. 60s pacing. Clean slate.
+# v13: sanitizer handles \square, \boxed, \checkmark, generic \cmd{...}.
+#      Prompts now English-only, so no bilingual mess.
 
 import os
 import re
@@ -23,20 +24,15 @@ from db import (check_and_increment_gemini_usage,
 
 logger = logging.getLogger(__name__)
 
-# ==================================================================
 MODEL = "openai/gpt-oss-120b"
-# ==================================================================
 
 GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "800"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "60"))
 _QUOTA_BLOCK_SECONDS = 180
 ATTEMPT_TIMEOUT_SECONDS = 90
-
-# One call per minute. Aligns with the 60/hour cap.
 MIN_CALL_GAP = 60.0
 
 _quota_block_until = 0.0
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
 _client = None
@@ -44,12 +40,9 @@ if GROQ_API_KEY:
     _client = AsyncGroq(api_key=GROQ_API_KEY)
 
 last_error = ""
-
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 
-# Wipe the counter completely on every boot. Old rows from previous
-# deploys were clogging the hourly window.
 try:
     purge_old_gemini_usage(keep_seconds=0)
     print("[gemini] usage counter cleared on startup")
@@ -70,6 +63,11 @@ _LATEX_SIMPLE = [
     (r"\\qquad\b", "  "), (r"\\,", " "), (r"\\;", " "),
     (r"\\!", ""), (r"\\%", "%"), (r"\\&", "&"),
     (r"\\#", "#"), (r"\\_", "_"), (r"\\\$", "$"),
+    (r"\\square\b", "□"), (r"\\Box\b", "□"),
+    (r"\\checkmark\b", "✓"), (r"\\check\b", "✓"),
+    (r"\\bullet\b", "•"), (r"\\cdots\b", "…"),
+    (r"\\ldots\b", "…"), (r"\\dots\b", "…"),
+    (r"\\leq\b", "≤"), (r"\\geq\b", "≥"),
 ]
 
 
@@ -77,9 +75,16 @@ def sanitize_text(s):
     if not s:
         return s
     s = str(s)
+    # Remove \( ... \) and \[ ... \] math delimiters entirely
+    s = re.sub(r"\\\(([^)]*)\\\)", r"\1", s)
+    s = re.sub(r"\\\[([^\]]*)\\\]", r"\1", s)
+    # Unwrap \text{...}, \mathbf{...}, etc
     s = re.sub(r"\\text(?:bf|it|rm|sf|tt)?\{([^{}]*)\}", r"\1", s)
     s = re.sub(r"\\math(?:bf|it|rm|sf|tt)\{([^{}]*)\}", r"\1", s)
     s = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", s)
+    # Generic \command{...} -> keep inner content
+    s = re.sub(r"\\[A-Za-z]+\{([^{}]*)\}", r"\1", s)
+    # Fractions, roots, superscripts, subscripts
     s = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", s)
     s = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", s)
     s = re.sub(r"\^\{([^{}]*)\}", r"^(\1)", s)
@@ -135,9 +140,7 @@ async def _call(prompt, json_mode=False, max_tokens=2000, max_retries=2):
 
     for attempt in range(max_retries):
         allowed = check_and_increment_gemini_usage(
-            day_limit=GEMINI_DAY_LIMIT,
-            hour_limit=GEMINI_HOUR_LIMIT,
-        )
+            day_limit=GEMINI_DAY_LIMIT, hour_limit=GEMINI_HOUR_LIMIT)
         if not allowed:
             _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
             last_error = (f"{MODEL}: cap reached "
@@ -167,13 +170,11 @@ async def _call(prompt, json_mode=False, max_tokens=2000, max_retries=2):
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
                 _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
-                last_error = (f"{MODEL}: 429, paused "
-                              f"{_QUOTA_BLOCK_SECONDS}s")
+                last_error = f"{MODEL}: 429, paused {_QUOTA_BLOCK_SECONDS}s"
                 logger.warning(last_error)
                 return ""
             last_error = f"{MODEL}: {err_str}"
-            logger.warning("LLM call failed (attempt %d): %s",
-                           attempt + 1, e)
+            logger.warning("LLM call failed (attempt %d): %s", attempt + 1, e)
             await asyncio.sleep(3 * (attempt + 1))
     return ""
 
@@ -181,41 +182,37 @@ async def _call(prompt, json_mode=False, max_tokens=2000, max_retries=2):
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=2000)
+                       json_mode=False, max_tokens=2400)
 
 
 async def refine_knowledge(topic, existing):
     user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:6000])
     return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=2000)
+                       json_mode=False, max_tokens=2400)
 
 
 async def generate_template(name, category):
     user = TEMPLATE_USER_TEMPLATE.format(name=name, category=category)
     return await _call(f"{TEMPLATE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=2000)
+                       json_mode=False, max_tokens=2400)
 
 
 async def refine_template(name, existing):
     return await _call(
-        "Improve the following construction template. Add missing fields, "
-        "more detail in each section, more sample values, more common "
-        "mistakes. Keep the same structure. Return only the improved "
-        "template, plain text, no LaTeX.\n\n---\n\n"
+        "Improve the following construction template. English only. "
+        "Sample Filled Example must be a markdown table with columns "
+        "Field and Sample Value. Keep the same structure. No LaTeX, "
+        "no Arabic.\n\n---\n\n"
         f"Template: {name}\n\n{existing[:6000]}",
-        json_mode=False, max_tokens=2000)
+        json_mode=False, max_tokens=2400)
 
 
 async def suggest_subtopics(parent_topic, category, n=3):
     prompt = (
-        "You are a senior Egyptian civil quality engineer building a "
-        "self-study knowledge base. Given the parent topic below, propose "
-        f"{n} NEW, specific, learnable sub-topics within the same "
-        f"category ({category}) that are NOT the same as the parent and "
-        "NOT generic. Each should be a concrete topic an engineer would "
-        "search for, 6-14 words long.\n\n"
-        'Return ONLY a JSON object: {"subtopics": ["...", "..."]}\n\n'
-        f"Parent topic: {parent_topic}\n"
+        f"Propose {n} new specific sub-topics within category "
+        f"'{category}', inspired by this parent topic: {parent_topic}. "
+        "English only. No Arabic. 6-14 words each. "
+        'Return ONLY JSON: {"subtopics": ["...", "..."]}'
     )
     raw = await _call(prompt, json_mode=True, max_tokens=400)
     if not raw:
@@ -239,13 +236,10 @@ async def suggest_subtopics(parent_topic, category, n=3):
 
 async def suggest_subtemplates(parent_name, category, n=3):
     prompt = (
-        "You are a senior Egyptian civil quality engineer building a "
-        "library of Egyptian construction site paper templates. Given the "
-        f"parent template below, propose {n} NEW, specific template names "
-        f"within the same category ({category}) that are NOT duplicates and "
-        "NOT generic. Each name 6-14 words.\n\n"
-        'Return ONLY a JSON object: {"templates": ["...", "..."]}\n\n'
-        f"Parent template: {parent_name}\n"
+        f"Propose {n} new specific template names within category "
+        f"'{category}', inspired by this parent: {parent_name}. "
+        "English only. No Arabic. 6-14 words each. "
+        'Return ONLY JSON: {"templates": ["...", "..."]}'
     )
     raw = await _call(prompt, json_mode=True, max_tokens=400)
     if not raw:
@@ -297,18 +291,13 @@ async def check_document(filename, file_type, text):
 
 async def ai_search(question, knowledge_context):
     prompt = (
-        "You are a senior Egyptian civil quality engineer. Answer the "
-        "user's question using ONLY the knowledge base excerpts below. "
-        "If the excerpts do not contain the answer, say so clearly and "
-        "suggest which topic would help.\n\n"
-        "ANSWER RULES:\n"
-        "- 300-600 words.\n"
-        "- Plain English, no LaTeX, no dollar signs.\n"
-        "- Use markdown headings and bullet lists.\n"
-        "- Cite the topic name in brackets when you quote an excerpt.\n"
-        "- End with '## Related topics' list of 3-5 topics.\n\n"
-        f"=== KNOWLEDGE BASE EXCERPTS ===\n{knowledge_context}\n\n"
-        f"=== USER QUESTION ===\n{question}\n"
+        "You are a senior Egyptian civil quality engineer. Answer using "
+        "ONLY the excerpts below. English only. No LaTeX.\n\n"
+        "RULES:\n- 300-600 words.\n- Use markdown headings and bullets.\n"
+        "- Cite topic names in brackets.\n"
+        "- End with '## Related topics' list.\n\n"
+        f"=== EXCERPTS ===\n{knowledge_context}\n\n"
+        f"=== QUESTION ===\n{question}\n"
     )
     return await _call(prompt, json_mode=False, max_tokens=1500)
 
