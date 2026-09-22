@@ -655,13 +655,15 @@ def _md_to_html(md):
     return "\n".join(out)
 
 
-def _paper_pdf_bytes(html_str, rtl):
+def _paper_pdf_bytes(html_str: str, rtl: bool) -> bytes:
+    from arabic_font import css_for_weasyprint
+    font_css = css_for_weasyprint()
     full = f"""<!doctype html><html><head><meta charset="utf-8">
-    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
     <style>
+      {font_css}
       @page {{ size: A4; margin: 0; }}
       body {{ margin:0; background:#fff; color:#111;
-             font-family:'Cairo','JetBrains Mono',sans-serif; }}
+             font-family:'Amiri','Cairo','JetBrains Mono',sans-serif; }}
       .hubx-paper {{ width:210mm; min-height:297mm;
                      padding:20mm 18mm 22mm 18mm;
                      box-sizing:border-box; }}
