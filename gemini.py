@@ -1,5 +1,6 @@
 # gemini.py
-# v17: added expand_phase() for phase-based progression.
+# v18: expand_phase asks ONLY for the new section, not the whole doc.
+#      Massively smaller output, never truncated.
 
 import os
 import re
@@ -16,7 +17,7 @@ from prompts import (
     REFINE_SYSTEM_PROMPT, REFINE_USER_TEMPLATE,
     CHECKER_SYSTEM_PROMPT, CHECKER_USER_TEMPLATE,
     TEMPLATE_SYSTEM_PROMPT, TEMPLATE_USER_TEMPLATE,
-    PHASE_SYSTEM_PROMPT, PHASE_USER_TEMPLATE, PHASE_INSTRUCTIONS,
+    PHASE_INSTRUCTIONS,
 )
 
 from db import (check_and_increment_gemini_usage,
@@ -209,20 +210,45 @@ async def refine_template(name, existing):
 
 async def expand_phase(title, category, current_content,
                        current_phase, target_phase):
-    """Advance a document to the next phase by appending a new section."""
+    """
+    Generate ONLY the new phase section. Engine appends it to the existing
+    document. This keeps output small — never truncated by token budget.
+    """
     instructions = PHASE_INSTRUCTIONS.get(target_phase, "")
     if not instructions:
         return ""
-    user = PHASE_USER_TEMPLATE.format(
-        title=title,
-        category=category,
-        current_phase=current_phase,
-        target_phase=target_phase,
-        phase_instructions=instructions,
-        existing=current_content[:8000],
+
+    # Show only the last 1500 chars of existing content as context,
+    # not the whole document. Prevents input bloat.
+    tail = (current_content or "")[-1500:]
+    context_hint = f"...[existing content ends with]...\n{tail}" if tail else ""
+
+    prompt = (
+        "You are a senior Egyptian civil quality engineer. You are "
+        "writing ONE new section to append to an existing bilingual "
+        "reference document. DO NOT reproduce the existing document. "
+        "Return ONLY the new section.\n\n"
+        f"Document title: {title}\n"
+        f"Category: {category}\n"
+        f"Current phase: {current_phase}\n"
+        f"New phase being added: {target_phase}\n\n"
+        f"{instructions}\n\n"
+        "STRICT RULES:\n"
+        "- Return ONLY the new section. No title, no preamble, no summary.\n"
+        "- Every line must be FULLY BILINGUAL: English / العربية separated "
+        "by ' / '.\n"
+        "- Start with a markdown heading using ## for the section.\n"
+        "- Never use <br> tags. Never use LaTeX, \\(...\\), \\square, "
+        "or dollar signs.\n"
+        "- Never invent code clause numbers. Write 'per ECP guidance' if "
+        "unsure.\n"
+        "- Never invent office addresses, phone numbers, or fees. Say "
+        "'confirm current edition' or 'verify with the authority'.\n"
+        "- Use Unicode: × ≥ ≤ ± ° /.\n\n"
+        f"Tail of existing document for style continuity:\n{context_hint}\n\n"
+        "Now write ONLY the new section:"
     )
-    return await _call(f"{PHASE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=4500)
+    return await _call(prompt, json_mode=False, max_tokens=3000)
 
 
 async def suggest_subtopics(parent_topic, category, n=2):
