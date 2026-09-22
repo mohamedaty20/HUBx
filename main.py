@@ -933,7 +933,7 @@ def check_page():
 
 
 # ============================================================
-# / KNOWLEDGE  (reader state persists across reconnects)
+# / KNOWLEDGE
 # ============================================================
 @ui.page("/knowledge")
 def knowledge_page():
@@ -1123,7 +1123,6 @@ def knowledge_page():
 
     render_categories()
     render_topics()
-    # restore last-read item
     if last_item:
         try:
             show_item(last_item)
@@ -1133,7 +1132,7 @@ def knowledge_page():
 
 
 # ============================================================
-# / TEMPLATES  (reader state persists)
+# / TEMPLATES
 # ============================================================
 @ui.page("/templates")
 def templates_page():
@@ -1428,4 +1427,137 @@ def dashboard_page():
     _header()
     _db_banner()
 
-    with ui.column().classes("w-full max-w-7xl
+    with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-3"):
+        ui.label(t("dash_title")).classes("hubx-title")
+
+        with ui.row().classes("gap-3 items-center flex-wrap"):
+            status_badge = ui.badge("idle", color="grey").classes("text-sm")
+            cycles_label = _stat(t("cycles"))
+            gemini_label = _stat(t("gemini_calls"))
+            kb_label = _stat(t("knowledge_stat"))
+            refined_label = _stat(t("refined_stat"))
+            tpl_label = _stat(t("templates_stat"))
+            queue_label = _stat(t("queue_stat"))
+
+        debug_label = ui.label("").classes("text-sm").style(
+            "color:var(--hubx-text-dim)")
+        gemini_err_label = ui.label("").style(
+            "color:#ffc270;font-size:0.85rem")
+        quota_label = ui.label("").style(
+            "color:var(--hubx-text-dim);font-size:0.82rem")
+
+        async def do_start():
+            await engine.start(by_user=True)
+            refresh()
+
+        async def do_pause():
+            await engine.pause()
+            refresh()
+
+        async def do_one_cycle():
+            ui.notify("Running one cycle…")
+            try:
+                await engine._cycle()
+                engine.cycles_completed += 1
+                ui.notify("Cycle complete.", color="green")
+            except Exception as e:
+                ui.notify(f"Cycle failed: {e}", color="red")
+            refresh()
+
+        with ui.row().classes("gap-2 mt-2 flex-wrap"):
+            ui.button(t("start"), on_click=do_start).classes(
+                "hubx-btn hubx-btn-accent")
+            ui.button(t("pause"), on_click=do_pause).classes(
+                "hubx-btn hubx-btn-warn")
+            ui.button(t("one_cycle"), on_click=do_one_cycle).classes(
+                 "hubx-btn hubx-btn-primary")
+
+        def refresh():
+            try:
+                s = engine.stats()
+            except Exception as e:
+                s = {"cycles": 0, "gemini_calls": 0, "knowledge_total": 0,
+                     "knowledge_refined": 0, "template_total": 0,
+                     "pending_topics": 0, "pending_templates": 0,
+                     "last_status": f"error: {e}", "last_error": str(e),
+                     "last_debug": ""}
+            status_badge.text = s["last_status"]
+            status_badge.props(
+                f'color={"green" if not engine.paused else "orange"}')
+            cycles_label.text = str(s["cycles"])
+            gemini_label.text = str(s["gemini_calls"])
+            kb_label.text = str(s["knowledge_total"])
+            refined_label.text = str(s["knowledge_refined"])
+            tpl_label.text = str(s.get("template_total", 0))
+            queue_label.text = (f'{s.get("pending_topics",0)}/'
+                                f'{s.get("pending_templates",0)}')
+            debug_label.text = s["last_debug"]
+            gemini_err_label.text = (
+                f"Gemini: {gemini_mod.last_error}"
+                if gemini_mod.last_error else "")
+            try:
+                q = gemini_usage_stats()
+                quota_label.text = (
+                    f"Gemini usage — last 1h: "
+                    f"{q['last_1h']}/{q['hour_limit']}"
+                    f"  ·  last 24h: {q['last_24h']}/{q['day_limit']}")
+            except Exception:
+                quota_label.text = ""
+
+        ui.timer(5.0, refresh)
+        refresh()
+
+        ui.label(t("recent_runs")).classes("text-lg font-bold mt-4")
+        runs_table = ui.table(columns=[
+            {"name": "cycle", "label": t("cycles"), "field": "cycle"},
+            {"name": "topic", "label": "Topic", "field": "topic",
+             "align": "left"},
+            {"name": "added", "label": "+", "field": "added"},
+            {"name": "refined", "label": "~", "field": "refined"},
+            {"name": "calls", "label": "Calls", "field": "calls"},
+            {"name": "error", "label": "Error", "field": "error"},
+            {"name": "created_at", "label": "When", "field": "created_at"},
+        ], rows=[]).classes("w-full")
+
+        def refresh_runs():
+            try:
+                rows = recent_learning_runs(30)
+            except Exception:
+                rows = []
+            runs_table.rows = [{
+                "cycle": r[0], "topic": r[1], "added": r[2],
+                "refined": r[3], "calls": r[4], "error": r[5],
+                "created_at": (r[6] or "")[:19],
+            } for r in rows]
+
+        ui.timer(20.0, refresh_runs)
+        refresh_runs()
+
+        ui.label(t("recent_tpl_runs")).classes("text-lg font-bold mt-4")
+        tpl_table = ui.table(columns=[
+            {"name": "cycle", "label": t("cycles"), "field": "cycle"},
+            {"name": "name", "label": t("templates_word"), "field": "name",
+             "align": "left"},
+            {"name": "added", "label": "+", "field": "added"},
+            {"name": "refined", "label": "~", "field": "refined"},
+            {"name": "error", "label": "Error", "field": "error"},
+            {"name": "created_at", "label": "When", "field": "created_at"},
+        ], rows=[]).classes("w-full")
+
+        def refresh_tpl_runs():
+            try:
+                rows = recent_template_runs(20)
+            except Exception:
+                rows = []
+            tpl_table.rows = [{
+                "cycle": r[0], "name": r[1], "added": r[2],
+                "refined": r[3], "error": r[5],
+                "created_at": (r[6] or "")[:19],
+            } for r in rows]
+
+        ui.timer(20.0, refresh_tpl_runs)
+        refresh_tpl_runs()
+
+
+ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx",
+       storage_secret=os.getenv("STORAGE_SECRET", "hubx-dev-secret"))
