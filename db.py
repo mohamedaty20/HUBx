@@ -1,6 +1,7 @@
 # db.py
 # Turso with local fallback. Version replacement + templates + search.
-# v4: added gemini_usage table + daily/hourly quota counter.
+# v4: gemini_usage table + daily/hourly quota counter.
+# v5: app_state key/value table for persisting user pause/resume.
 
 import os
 import json
@@ -160,12 +161,43 @@ def init_db():
         ts TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_gemini_usage_ts ON gemini_usage(ts);
+
+    CREATE TABLE IF NOT EXISTS app_state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
     """)
     conn.commit()
 
 
 # ---------------------------------------------------------------
-# Gemini usage counter (daily + hourly soft caps)
+# App state (small persistent key/value store)
+# ---------------------------------------------------------------
+def get_app_state(key, default=""):
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception as e:
+        logger.warning("get_app_state(%s) failed: %s", key, e)
+        return default
+
+
+def set_app_state(key, value):
+    try:
+        conn = get_conn()
+        conn.execute("""
+            INSERT INTO app_state (key, value) VALUES (?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, str(value)))
+        conn.commit()
+    except Exception as e:
+        logger.warning("set_app_state(%s) failed: %s", key, e)
+
+
+# ---------------------------------------------------------------
+# Gemini usage counter
 # ---------------------------------------------------------------
 def _utcnow_iso():
     return datetime.datetime.utcnow().isoformat()
@@ -228,7 +260,6 @@ def gemini_usage_stats(day_limit=400, hour_limit=30):
 
 
 def purge_old_gemini_usage(keep_days=3):
-    """Delete usage rows older than keep_days. Safe to call on startup."""
     try:
         conn = get_conn()
         conn.execute("DELETE FROM gemini_usage WHERE ts < ?",
