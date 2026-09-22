@@ -1,6 +1,5 @@
 # gemini.py
-# Gemini wrapper with sanitizer, quota-aware pacing,
-# template generation, and AI-powered knowledge search.
+# v4: env-configurable limits, suggest_subtopics / suggest_subtemplates.
 
 import os
 import re
@@ -24,20 +23,15 @@ from db import (check_and_increment_gemini_usage,
 logger = logging.getLogger(__name__)
 
 # ==================================================================
-# HARDCODED MODEL. Edit this line to change model.
-# ==================================================================
 MODEL = "gemini-3.5-flash-lite"
 # ==================================================================
 
-# Daily + hourly soft caps enforced by db.check_and_increment_gemini_usage.
-# Free tier is 500 RPD; leave headroom for manual AI-search / doc-check.
-GEMINI_DAY_LIMIT = 400
-GEMINI_HOUR_LIMIT = 30
-
-# In-memory block so the engine loop does not spin the DB every 20s
-# while we are over the cap. Cleared when the timer expires.
-_quota_block_until = 0.0
+# Configurable via Render env. Free tier is 500 RPD.
+GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "400"))
+GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "30"))
 _QUOTA_BLOCK_SECONDS = 300
+
+_quota_block_until = 0.0
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
@@ -50,16 +44,12 @@ _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 MIN_CALL_GAP = 2.0
 
-# Purge old usage rows once at import time (safe, small).
 try:
     purge_old_gemini_usage(keep_days=3)
 except Exception:
     pass
 
 
-# ---------------------------------------------------------------
-# LaTeX sanitizer
-# ---------------------------------------------------------------
 _LATEX_SIMPLE = [
     (r"\\times\b", "×"), (r"\\cdot\b", "·"), (r"\\div\b", "÷"),
     (r"\\pm\b", "±"), (r"\\mp\b", "∓"), (r"\\geq\b", "≥"),
@@ -77,7 +67,6 @@ _LATEX_SIMPLE = [
 
 
 def sanitize_text(s):
-    """Convert any LaTeX / math markup to plain readable text."""
     if not s:
         return s
     s = str(s)
@@ -98,9 +87,6 @@ def sanitize_text(s):
     return s.strip()
 
 
-# ---------------------------------------------------------------
-# Low-level call
-# ---------------------------------------------------------------
 async def _throttle():
     global _last_call_time
     async with _rate_lock:
@@ -157,7 +143,6 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
         last_error = "GEMINI_API_KEY not set"
         return ""
 
-    # -- soft block set after a previous cap hit -------------------
     now_m = time.monotonic()
     if now_m < _quota_block_until:
         left = int(_quota_block_until - now_m)
@@ -171,7 +156,6 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
 
     model = genai.GenerativeModel(MODEL)
     for attempt in range(max_retries):
-        # quota check BEFORE every attempt (counts retries too)
         allowed = check_and_increment_gemini_usage(
             day_limit=GEMINI_DAY_LIMIT,
             hour_limit=GEMINI_HOUR_LIMIT,
@@ -200,7 +184,6 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
         except Exception as e:
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
-                # Gemini itself says quota — back off hard.
                 backoff = 5 * (2 ** attempt)
                 wait_s = _parse_retry_seconds(str(e), backoff)
                 wait_s = min(max(wait_s, 5.0), 180.0)
@@ -217,7 +200,7 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
 
 
 # ---------------------------------------------------------------
-# Public API
+# Public generation
 # ---------------------------------------------------------------
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
@@ -247,6 +230,69 @@ async def refine_template(name, existing):
         json_mode=False, max_tokens=8192)
 
 
+# ---------------------------------------------------------------
+# Sub-topic expansion (drives the real learning loop)
+# ---------------------------------------------------------------
+async def suggest_subtopics(parent_topic, category, n=3):
+    """
+    Ask Gemini for n new sub-topics inspired by parent_topic.
+    Returns a list of strings (may be shorter than n).
+    """
+    prompt = (
+        "You are a senior Egyptian civil quality engineer building a "
+        "self-study knowledge base. Given the parent topic below, propose "
+        f"{n} NEW, specific, learnable sub-topics within the same "
+        f"category ({category}) that are NOT the same as the parent and "
+        "NOT generic. Each should be a concrete topic an engineer would "
+        "search for, 6-14 words long, mentioning the code or method where "
+        "relevant (e.g. 'Hot weather concrete curing per ECP 203-2-1').\n\n"
+        "Return ONLY a JSON array of strings. No prose, no markdown fences.\n\n"
+        f"Parent topic: {parent_topic}\n"
+    )
+    raw = await _call(prompt, json_mode=True, max_tokens=512)
+    if not raw:
+        return []
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [sanitize_text(str(x)).strip() for x in data
+                    if isinstance(x, (str, int)) and str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+async def suggest_subtemplates(parent_name, category, n=3):
+    prompt = (
+        "You are a senior Egyptian civil quality engineer building a "
+        "library of Egyptian construction site paper templates. Given the "
+        f"parent template below, propose {n} NEW, specific template names "
+        f"within the same category ({category}) that are NOT duplicates and "
+        "NOT generic. Each name 6-14 words, starting with a noun (e.g. "
+        "'Concrete Pour Card for Mass Foundation Pours').\n\n"
+        "Return ONLY a JSON array of strings. No prose, no markdown fences.\n\n"
+        f"Parent template: {parent_name}\n"
+    )
+    raw = await _call(prompt, json_mode=True, max_tokens=512)
+    if not raw:
+        return []
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [sanitize_text(str(x)).strip() for x in data
+                    if isinstance(x, (str, int)) and str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+# ---------------------------------------------------------------
+# Document checker / search / OCR
+# ---------------------------------------------------------------
 async def check_document(filename, file_type, text):
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
@@ -276,10 +322,6 @@ async def check_document(filename, file_type, text):
 
 
 async def ai_search(question, knowledge_context):
-    """
-    Answer a user question by reading the supplied knowledge context.
-    Returns a plain-text answer or "" on failure.
-    """
     prompt = (
         "You are a senior Egyptian civil quality engineer. Answer the "
         "user's question using ONLY the knowledge base excerpts below. "
@@ -289,10 +331,8 @@ async def ai_search(question, knowledge_context):
         "- 300-600 words.\n"
         "- Plain English, no LaTeX, no dollar signs.\n"
         "- Use markdown headings and bullet lists.\n"
-        "- Cite the topic name in brackets when you quote an excerpt, "
-        "e.g. [Hot weather concreting].\n"
-        "- End with a '## Related topics' list of 3-5 topics from the "
-        "excerpts that the user should read next.\n\n"
+        "- Cite the topic name in brackets when you quote an excerpt.\n"
+        "- End with '## Related topics' list of 3-5 topics.\n\n"
         f"=== KNOWLEDGE BASE EXCERPTS ===\n{knowledge_context}\n\n"
         f"=== USER QUESTION ===\n{question}\n"
     )
