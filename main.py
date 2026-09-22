@@ -1435,7 +1435,7 @@ def dashboard_page():
 
                 
 
-                def refresh():
+           def refresh():
             try:
                 s = engine.stats()
             except Exception as e:
