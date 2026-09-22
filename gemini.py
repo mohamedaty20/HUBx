@@ -1,6 +1,5 @@
 # gemini.py
-# v16: JSON calls get 1500 tokens (was 500, caused truncation).
-#      n=2 default for suggestion calls. BadRequestError caught.
+# v17: added expand_phase() for phase-based progression.
 
 import os
 import re
@@ -17,6 +16,7 @@ from prompts import (
     REFINE_SYSTEM_PROMPT, REFINE_USER_TEMPLATE,
     CHECKER_SYSTEM_PROMPT, CHECKER_USER_TEMPLATE,
     TEMPLATE_SYSTEM_PROMPT, TEMPLATE_USER_TEMPLATE,
+    PHASE_SYSTEM_PROMPT, PHASE_USER_TEMPLATE, PHASE_INSTRUCTIONS,
 )
 
 from db import (check_and_increment_gemini_usage,
@@ -108,8 +108,7 @@ def _is_quota_error(err_str):
 
 def _is_json_validation_error(err_str):
     s = (err_str or "").lower()
-    return ("json_validate_failed" in s
-            or "failed to generate json" in s
+    return ("json_validate_failed" in s or "failed to generate json" in s
             or "max completion tokens reached" in s)
 
 
@@ -140,7 +139,7 @@ async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
             day_limit=GEMINI_DAY_LIMIT, hour_limit=GEMINI_HOUR_LIMIT)
         if not allowed:
             _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
-            last_error = (f"{MODEL}: our cap reached "
+            last_error = (f"{MODEL}: cap reached "
                           f"({GEMINI_HOUR_LIMIT}/hour), paused "
                           f"{_QUOTA_BLOCK_SECONDS}s")
             logger.warning(last_error)
@@ -171,8 +170,6 @@ async def _call(prompt, json_mode=False, max_tokens=4000, max_retries=2):
                 logger.warning(last_error)
                 return ""
             if _is_json_validation_error(err_str):
-                # Output was truncated or malformed. Don't retry — same
-                # budget will produce the same truncation.
                 last_error = f"{MODEL}: JSON too large for budget"
                 logger.warning(last_error)
                 return ""
@@ -203,13 +200,29 @@ async def generate_template(name, category):
 async def refine_template(name, existing):
     return await _call(
         "Improve the following construction template. Keep it FULLY "
-        "BILINGUAL: every paragraph, bullet, and table cell in English "
-        "AND Arabic separated by ' / '. Sample Filled Example MUST be "
-        "a markdown table with columns Field | Sample Value. "
+        "BILINGUAL. Sample Filled Example MUST be a markdown table. "
         "Never use <br>. No LaTeX, no \\square, no \\(...\\).\n\n"
         "---\n\n"
         f"Template: {name}\n\n{existing[:6000]}",
         json_mode=False, max_tokens=4000)
+
+
+async def expand_phase(title, category, current_content,
+                       current_phase, target_phase):
+    """Advance a document to the next phase by appending a new section."""
+    instructions = PHASE_INSTRUCTIONS.get(target_phase, "")
+    if not instructions:
+        return ""
+    user = PHASE_USER_TEMPLATE.format(
+        title=title,
+        category=category,
+        current_phase=current_phase,
+        target_phase=target_phase,
+        phase_instructions=instructions,
+        existing=current_content[:8000],
+    )
+    return await _call(f"{PHASE_SYSTEM_PROMPT}\n\n---\n\n{user}",
+                       json_mode=False, max_tokens=4500)
 
 
 async def suggest_subtopics(parent_topic, category, n=2):
