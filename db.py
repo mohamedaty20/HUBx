@@ -1,5 +1,5 @@
 # db.py
-# v7: gemini_usage_stats default hour_limit 100.
+# v8: refined counter counts version > 1 (was refined_content != '').
 
 import os
 import json
@@ -393,7 +393,7 @@ def knowledge_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
     refined = conn.execute(
-        "SELECT COUNT(*) FROM knowledge WHERE refined_content != ''"
+        "SELECT COUNT(*) FROM knowledge WHERE version > 1"
     ).fetchone()[0]
     pending = conn.execute(
         "SELECT COUNT(*) FROM pending_topics").fetchone()[0]
@@ -551,7 +551,7 @@ def template_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) FROM templates").fetchone()[0]
     refined = conn.execute(
-        "SELECT COUNT(*) FROM templates WHERE refined_content != ''"
+        "SELECT COUNT(*) FROM templates WHERE version > 1"
     ).fetchone()[0]
     pending = conn.execute(
         "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
