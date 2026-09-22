@@ -1,5 +1,5 @@
 # gemini.py
-# v11: Groq gpt-oss-120b, TPM-safe pacing (30s gap), 2k output.
+# v12: purge ALL usage rows on startup. 60s pacing. Clean slate.
 
 import os
 import re
@@ -27,18 +27,13 @@ logger = logging.getLogger(__name__)
 MODEL = "openai/gpt-oss-120b"
 # ==================================================================
 
-# Groq free tier for gpt-oss-120b: 30 RPM, 1,000 RPD, 8,000 TPM.
-# We pace at 2 calls/min to stay well under TPM.
 GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "800"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "60"))
-
-# How long to sit quiet after a 429.
 _QUOTA_BLOCK_SECONDS = 180
-
 ATTEMPT_TIMEOUT_SECONDS = 90
 
-# 30 seconds between calls = 2 calls/min. This is the TPM guard.
-MIN_CALL_GAP = 30.0
+# One call per minute. Aligns with the 60/hour cap.
+MIN_CALL_GAP = 60.0
 
 _quota_block_until = 0.0
 
@@ -53,12 +48,13 @@ last_error = ""
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
 
+# Wipe the counter completely on every boot. Old rows from previous
+# deploys were clogging the hourly window.
 try:
-    # Purge anything older than 1 hour on startup so the counter
-    # restarts clean after a code change.
-    purge_old_gemini_usage(keep_seconds=3600)
-except Exception:
-    pass
+    purge_old_gemini_usage(keep_seconds=0)
+    print("[gemini] usage counter cleared on startup")
+except Exception as e:
+    print(f"[gemini] purge failed: {e}")
 
 
 _LATEX_SIMPLE = [
