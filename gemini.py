@@ -1,5 +1,6 @@
 # gemini.py
-# v4: env-configurable limits, suggest_subtopics / suggest_subtemplates.
+# v5: per-attempt timeout on Gemini calls so a network stall can't
+#     freeze the whole learning cycle.
 
 import os
 import re
@@ -26,10 +27,13 @@ logger = logging.getLogger(__name__)
 MODEL = "gemini-3.5-flash-lite"
 # ==================================================================
 
-# Configurable via Render env. Free tier is 500 RPD.
 GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "400"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "30"))
 _QUOTA_BLOCK_SECONDS = 300
+
+# Hard timeout for a single Gemini attempt. Prevents a hung network
+# connection from blocking the entire cycle.
+ATTEMPT_TIMEOUT_SECONDS = 90
 
 _quota_block_until = 0.0
 
@@ -171,16 +175,27 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
 
         await _throttle()
         try:
-            resp = await asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config=genai.types.GenerationConfig(**kwargs),
+            # Hard timeout per attempt so a hung socket cannot block
+            # the whole learning cycle.
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    model.generate_content,
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(**kwargs),
+                ),
+                timeout=ATTEMPT_TIMEOUT_SECONDS,
             )
             text = _extract_text(resp)
             if text:
                 last_error = ""
                 return sanitize_text(text)
             last_error = f"{MODEL}: empty response"
+        except asyncio.TimeoutError:
+            last_error = (f"{MODEL}: attempt {attempt + 1}/{max_retries} "
+                          f"timed out after {ATTEMPT_TIMEOUT_SECONDS}s")
+            logger.warning(last_error)
+            await asyncio.sleep(2)
+            continue
         except Exception as e:
             err_str = f"{type(e).__name__}: {e}"
             if _is_quota_error(err_str):
@@ -199,9 +214,6 @@ async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
     return ""
 
 
-# ---------------------------------------------------------------
-# Public generation
-# ---------------------------------------------------------------
 async def generate_knowledge(topic, category):
     user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
     return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
@@ -230,14 +242,7 @@ async def refine_template(name, existing):
         json_mode=False, max_tokens=8192)
 
 
-# ---------------------------------------------------------------
-# Sub-topic expansion (drives the real learning loop)
-# ---------------------------------------------------------------
 async def suggest_subtopics(parent_topic, category, n=3):
-    """
-    Ask Gemini for n new sub-topics inspired by parent_topic.
-    Returns a list of strings (may be shorter than n).
-    """
     prompt = (
         "You are a senior Egyptian civil quality engineer building a "
         "self-study knowledge base. Given the parent topic below, propose "
@@ -245,7 +250,7 @@ async def suggest_subtopics(parent_topic, category, n=3):
         f"category ({category}) that are NOT the same as the parent and "
         "NOT generic. Each should be a concrete topic an engineer would "
         "search for, 6-14 words long, mentioning the code or method where "
-        "relevant (e.g. 'Hot weather concrete curing per ECP 203-2-1').\n\n"
+        "relevant.\n\n"
         "Return ONLY a JSON array of strings. No prose, no markdown fences.\n\n"
         f"Parent topic: {parent_topic}\n"
     )
@@ -270,8 +275,7 @@ async def suggest_subtemplates(parent_name, category, n=3):
         "library of Egyptian construction site paper templates. Given the "
         f"parent template below, propose {n} NEW, specific template names "
         f"within the same category ({category}) that are NOT duplicates and "
-        "NOT generic. Each name 6-14 words, starting with a noun (e.g. "
-        "'Concrete Pour Card for Mass Foundation Pours').\n\n"
+        "NOT generic. Each name 6-14 words.\n\n"
         "Return ONLY a JSON array of strings. No prose, no markdown fences.\n\n"
         f"Parent template: {parent_name}\n"
     )
@@ -290,9 +294,6 @@ async def suggest_subtemplates(parent_name, category, n=3):
     return []
 
 
-# ---------------------------------------------------------------
-# Document checker / search / OCR
-# ---------------------------------------------------------------
 async def check_document(filename, file_type, text):
     user = CHECKER_USER_TEMPLATE.format(
         filename=filename, file_type=file_type, text=text[:12000])
@@ -353,12 +354,18 @@ async def ocr_image(path):
         img = Image.open(path)
         await _throttle()
         model = genai.GenerativeModel(MODEL)
-        resp = await asyncio.to_thread(
-            model.generate_content,
-            ["Transcribe every word of text in this image. "
-             "Preserve line breaks. Return plain text only.", img],
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(
+                model.generate_content,
+                ["Transcribe every word of text in this image. "
+                 "Preserve line breaks. Return plain text only.", img],
+            ),
+            timeout=ATTEMPT_TIMEOUT_SECONDS,
         )
         return sanitize_text(_extract_text(resp))
+    except asyncio.TimeoutError:
+        last_error = f"OCR: timed out after {ATTEMPT_TIMEOUT_SECONDS}s"
+        return ""
     except Exception as e:
         last_error = f"OCR: {e}"
         return ""
