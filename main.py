@@ -1,9 +1,6 @@
 # main.py
 # NiceGUI app v4
-# v5: mobile-first layout
-# v6: slide-in drawer for categories/topics
-# v7: reader flush-left, tables horizontally scrollable
-# v8: engine auto-starts on boot; pause is persisted in DB.
+# v9: perf — slower timers, smaller payloads, matplotlib off the event loop.
 
 import os
 import io
@@ -1053,7 +1050,7 @@ def knowledge_page():
     _header()
     _db_banner()
 
-    selected = {"cat": None}
+    selected = {"cat": None, "_sig": None}
 
     drawer_cls = ui.right_drawer if is_rtl() else ui.left_drawer
     with drawer_cls(value=False, bordered=True).classes("hubx-drawer") as kdrawer:
@@ -1145,16 +1142,20 @@ def knowledge_page():
         kdrawer.set_value(False)
 
     def render_topics():
-        topic_container.clear()
         cat = selected["cat"]
-        rows = get_all_knowledge(category=cat, limit=1000)
+        rows = get_all_knowledge(category=cat, limit=200)
+        sig = (cat, len(rows))
+        if selected["_sig"] == sig:
+            return
+        selected["_sig"] = sig
+        topic_container.clear()
         topic_label.text = (f"{len(rows)} {t('topics')}"
                             if cat else f"{len(rows)} {t('all_topics')}")
         with topic_container:
             if not rows:
                 ui.label("(empty)").classes("italic text-xs").style(
                     "color:var(--hubx-text-dim);padding:8px")
-            for r in rows[:300]:
+            for r in rows[:100]:
                 kid, topic, ver = r[0], r[1], r[5]
                 b = ui.button(f"{topic[:60]}  ·  v{ver}").classes(
                     "hubx-drawer-btn")
@@ -1176,18 +1177,19 @@ def knowledge_page():
 
     def select_category(cat):
         selected["cat"] = cat
+        selected["_sig"] = None
         render_categories()
         render_topics()
 
     def refresh_all():
         try:
-            render_categories()
             render_topics()
         except Exception as e:
             print(f"refresh error: {e}")
 
-    refresh_all()
-    ui.timer(8.0, refresh_all)
+    render_categories()
+    render_topics()
+    ui.timer(45.0, refresh_all)
 
 
 @ui.page("/templates")
@@ -1199,7 +1201,7 @@ def templates_page():
     _db_banner()
 
     tstats = template_stats()
-    selected = {"cat": None}
+    selected = {"cat": None, "_sig": None}
 
     drawer_cls = ui.right_drawer if is_rtl() else ui.left_drawer
     with drawer_cls(value=False, bordered=True).classes("hubx-drawer") as tdrawer:
@@ -1262,15 +1264,19 @@ def templates_page():
         tdrawer.set_value(False)
 
     def render_templates():
-        t_container.clear()
         cat = selected["cat"]
-        rows = get_all_templates(category=cat, limit=500)
+        rows = get_all_templates(category=cat, limit=200)
+        sig = (cat, len(rows))
+        if selected["_sig"] == sig:
+            return
+        selected["_sig"] = sig
+        t_container.clear()
         topic_label.text = f"{len(rows)} {t('templates_word')}"
         with t_container:
             if not rows:
                 ui.label("(empty)").classes("italic text-xs").style(
                     "color:var(--hubx-text-dim);padding:8px")
-            for r in rows[:300]:
+            for r in rows[:100]:
                 tid, name, ver = r[0], r[1], r[5]
                 b = ui.button(f"{name[:60]}  ·  v{ver}").classes(
                     "hubx-drawer-btn")
@@ -1292,18 +1298,19 @@ def templates_page():
 
     def sel(cat):
         selected["cat"] = cat
+        selected["_sig"] = None
         render_cats()
         render_templates()
 
     def refresh():
         try:
-            render_cats()
             render_templates()
         except Exception as e:
             print(f"tpl refresh: {e}")
 
-    refresh()
-    ui.timer(8.0, refresh)
+    render_cats()
+    render_templates()
+    ui.timer(45.0, refresh)
 
 
 @ui.page("/charts")
@@ -1414,17 +1421,20 @@ def charts_page():
                 t_.set_color("#e8ecf7")
             fig.tight_layout()
 
-        def refresh():
+        def _draw_all():
+            draw_cat(c1.figure); c1.update()
+            draw_conf(c2.figure); c2.update()
+            draw_versions(c3.figure); c3.update()
+            draw_runs(c4.figure); c4.update()
+
+        async def refresh():
             try:
-                draw_cat(c1.figure); c1.update()
-                draw_conf(c2.figure); c2.update()
-                draw_versions(c3.figure); c3.update()
-                draw_runs(c4.figure); c4.update()
+                await asyncio.to_thread(_draw_all)
             except Exception as e:
                 print(f"chart err: {e}")
 
-        refresh()
-        ui.timer(8.0, refresh)
+        _draw_all()
+        ui.timer(60.0, refresh)
 
 
 @ui.page("/dashboard")
@@ -1509,7 +1519,7 @@ def dashboard_page():
             except Exception:
                 quota_label.text = ""
 
-        ui.timer(2.0, refresh)
+        ui.timer(5.0, refresh)
         refresh()
 
         ui.label(t("recent_runs")).classes("text-lg font-bold mt-4")
@@ -1535,7 +1545,7 @@ def dashboard_page():
                 "created_at": (r[6] or "")[:19],
             } for r in rows]
 
-        ui.timer(5.0, refresh_runs)
+        ui.timer(20.0, refresh_runs)
         refresh_runs()
 
         ui.label(t("recent_tpl_runs")).classes("text-lg font-bold mt-4")
@@ -1560,7 +1570,7 @@ def dashboard_page():
                 "created_at": (r[6] or "")[:19],
             } for r in rows]
 
-        ui.timer(5.0, refresh_tpl_runs)
+        ui.timer(20.0, refresh_tpl_runs)
         refresh_tpl_runs()
 
 
