@@ -110,7 +110,30 @@ def _extract_text(resp):
     return ""
 
 
-async def _call(prompt, json_mode=False, max_tokens=8192):
+def _parse_retry_seconds(err_str, fallback):
+    """Extract 'retry in Ns' from a Gemini 429 error; fall back to `fallback`."""
+    try:
+        m = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)\s*s", err_str)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    try:
+        m = re.search(r"'seconds':\s*(\d+)", err_str)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return float(fallback)
+
+
+def _is_quota_error(err_str):
+    s = (err_str or "").lower()
+    return ("429" in s or "quota" in s or "resourceexhausted" in s
+            or "rate limit" in s or "exceeded" in s)
+
+
+async def _call(prompt, json_mode=False, max_tokens=8192, max_retries=6):
     global last_error
     if not GEMINI_API_KEY:
         last_error = "GEMINI_API_KEY not set"
@@ -122,7 +145,7 @@ async def _call(prompt, json_mode=False, max_tokens=8192):
         kwargs["response_mime_type"] = "application/json"
 
     model = genai.GenerativeModel(MODEL)
-    for attempt in range(3):
+    for attempt in range(max_retries):
         await _throttle()
         try:
             resp = await asyncio.to_thread(
@@ -136,7 +159,20 @@ async def _call(prompt, json_mode=False, max_tokens=8192):
                 return sanitize_text(text)
             last_error = f"{MODEL}: empty response"
         except Exception as e:
-            last_error = f"{MODEL}: {type(e).__name__}: {e}"
+            err_str = f"{type(e).__name__}: {e}"
+            if _is_quota_error(err_str):
+                backoff = 5 * (2 ** attempt)  # 5, 10, 20, 40, 80, 160
+                wait_s = _parse_retry_seconds(str(e), backoff)
+                wait_s = min(max(wait_s, 5.0), 180.0)  # clamp to 5..180s
+                last_error = (f"{MODEL}: quota exceeded, "
+                              f"waiting {wait_s:.0f}s "
+                              f"(attempt {attempt + 1}/{max_retries})")
+                logger.warning(
+                    "Gemini quota hit. Sleeping %.0fs before retry %d/%d",
+                    wait_s, attempt + 1, max_retries)
+                await asyncio.sleep(wait_s)
+                continue
+            last_error = f"{MODEL}: {err_str}"
             logger.warning("Gemini call failed (attempt %d): %s",
                            attempt + 1, e)
             await asyncio.sleep(2 ** attempt)
