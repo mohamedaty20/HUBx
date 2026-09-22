@@ -1,6 +1,6 @@
 # engine.py
-# v5: skip existing topics instead of refining them. Drain dupe queue
-#     quickly. Ask Gemini for a fresh topic when queue is exhausted.
+# v6: don't waste Gemini calls. Skip suggest if generation failed.
+#     Only ask for fresh parent topic when queue is truly empty.
 
 from __future__ import annotations
 import asyncio
@@ -58,6 +58,8 @@ _POP_TOPIC      = _find("pop_pending_topic")
 _POP_TEMPLATE   = _find("pop_pending_template")
 _ADD_TOPIC      = _find("add_pending_topic")
 _ADD_TEMPLATE   = _find("add_pending_template")
+_PENDING_COUNT  = _find("pending_count")
+_PENDING_TPL    = _find("pending_template_count")
 
 
 def _call_adapt(fn, *args, **kwargs):
@@ -90,7 +92,6 @@ def _call_adapt(fn, *args, **kwargs):
 def _save_knowledge(topic, category, content,
                     version=1, confidence=0.7, parent_id=None):
     if not _SAVE_KNOWLEDGE:
-        print("[engine] db has no save_knowledge")
         return False
     _call_adapt(_SAVE_KNOWLEDGE, topic, category, content,
                 topic=topic, category=category, name=topic, title=topic,
@@ -102,7 +103,6 @@ def _save_knowledge(topic, category, content,
 
 def _save_template(name, category, content, version=1, confidence=0.7):
     if not _SAVE_TEMPLATE:
-        print("[engine] db has no save_template")
         return False
     _call_adapt(_SAVE_TEMPLATE, name, category, content,
                 name=name, topic=name, title=name, category=category,
@@ -245,13 +245,9 @@ class Engine:
 
             self.ai_calls = self.gemini_calls
 
-    # -------- knowledge --------
     async def _knowledge_step(self):
-        """Find a genuinely new topic. Skip existing. Drain queue fast."""
         topic = category = None
 
-        # Try up to 15 candidates in one cycle. Existing ones are
-        # dropped quickly without a Gemini call.
         for _ in range(15):
             item = None
             if _POP_TOPIC:
@@ -269,14 +265,23 @@ class Engine:
                 self._k_idx += 1
 
             if _existing_knowledge(t):
-                # Already have it. Skip. No Gemini call.
                 continue
 
             topic, category = t, c
             break
 
-        # Nothing new in queue or seeds. Ask Gemini for a fresh topic.
+        # Only ask Gemini for a fresh parent topic when the queue AND
+        # the seed list are exhausted. Otherwise it's a wasted call.
         if not topic:
+            queue_empty = True
+            if _PENDING_COUNT:
+                try:
+                    queue_empty = (_PENDING_COUNT() == 0)
+                except Exception:
+                    queue_empty = True
+            if not queue_empty:
+                self.last_debug = "no new knowledge topics in queue"
+                return
             try:
                 subs = await suggest_subtopics(
                     "Egyptian civil quality engineering",
@@ -298,7 +303,9 @@ class Engine:
         content = await generate_knowledge(topic, category)
         self.gemini_calls += 1
         if not content:
-            self.last_debug = f"empty: {topic}"
+            # Failed (429 or empty). Do NOT call suggest - it would just
+            # burn another call on the same blocked quota.
+            self.last_debug = f"failed (quota or empty): {topic}"
             _save_lrun(self.cycles, topic, 0, 0, 1, "gemini empty")
             return
 
@@ -306,7 +313,7 @@ class Engine:
         self.last_debug = f"generated: {topic}"
         _save_lrun(self.cycles, topic, 1, 0, 1, "")
 
-        # expand the queue
+        # expand only after a successful generation
         try:
             subs = await suggest_subtopics(
                 topic, category, n=int(SUGGESTIONS_PER_CYCLE or 3))
@@ -320,7 +327,6 @@ class Engine:
         except Exception as e:
             print(f"[engine] suggest_subtopics failed: {e}")
 
-    # -------- templates --------
     async def _template_step(self):
         name = category = None
 
@@ -351,6 +357,15 @@ class Engine:
             break
 
         if not name:
+            queue_empty = True
+            if _PENDING_TPL:
+                try:
+                    queue_empty = (_PENDING_TPL() == 0)
+                except Exception:
+                    queue_empty = True
+            if not queue_empty:
+                self.last_debug = "no new templates in queue"
+                return
             try:
                 subs = await suggest_subtemplates(
                     "Egyptian construction site template",
@@ -372,7 +387,7 @@ class Engine:
         content = await generate_template(name, category)
         self.gemini_calls += 1
         if not content:
-            self.last_debug = f"empty template: {name}"
+            self.last_debug = f"failed (quota or empty): {name}"
             _save_trun(self.cycles, name, 0, 0, "gemini empty")
             return
 
