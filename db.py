@@ -1,6 +1,5 @@
 # db.py
-# v9: purge_old_gemini_usage accepts keep_seconds; Gemini usage
-#     defaults raised to match Groq free tier (800/day, 60/hour).
+# v10: phase columns + phase advancement helpers.
 
 import os
 import json
@@ -100,97 +99,63 @@ def init_db():
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS knowledge (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        topic TEXT UNIQUE,
-        category TEXT,
-        content TEXT,
-        refined_content TEXT,
-        version INTEGER DEFAULT 1,
-        confidence REAL DEFAULT 0.5,
-        created_at TEXT,
-        updated_at TEXT
+        topic TEXT UNIQUE, category TEXT, content TEXT,
+        refined_content TEXT, version INTEGER DEFAULT 1,
+        confidence REAL DEFAULT 0.5, created_at TEXT, updated_at TEXT
     );
     CREATE TABLE IF NOT EXISTS templates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,
-        category TEXT,
-        content TEXT,
-        refined_content TEXT,
-        version INTEGER DEFAULT 1,
-        confidence REAL DEFAULT 0.5,
-        created_at TEXT,
-        updated_at TEXT
+        name TEXT UNIQUE, category TEXT, content TEXT,
+        refined_content TEXT, version INTEGER DEFAULT 1,
+        confidence REAL DEFAULT 0.5, created_at TEXT, updated_at TEXT
     );
     CREATE TABLE IF NOT EXISTS pending_topics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        topic TEXT UNIQUE,
-        category TEXT,
-        source TEXT,
-        parent_topic TEXT,
-        created_at TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT UNIQUE,
+        category TEXT, source TEXT, parent_topic TEXT, created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS pending_templates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,
-        category TEXT,
-        source TEXT,
-        parent_name TEXT,
-        created_at TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE,
+        category TEXT, source TEXT, parent_name TEXT, created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS learning_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        cycle INTEGER,
-        topic_processed TEXT,
-        items_added INTEGER DEFAULT 0,
-        items_refined INTEGER DEFAULT 0,
-        gemini_calls INTEGER DEFAULT 0,
-        error TEXT,
-        created_at TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT, cycle INTEGER,
+        topic_processed TEXT, items_added INTEGER DEFAULT 0,
+        items_refined INTEGER DEFAULT 0, gemini_calls INTEGER DEFAULT 0,
+        error TEXT, created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS template_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        cycle INTEGER,
-        template_processed TEXT,
-        items_added INTEGER DEFAULT 0,
-        items_refined INTEGER DEFAULT 0,
-        gemini_calls INTEGER DEFAULT 0,
-        error TEXT,
-        created_at TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT, cycle INTEGER,
+        template_processed TEXT, items_added INTEGER DEFAULT 0,
+        items_refined INTEGER DEFAULT 0, gemini_calls INTEGER DEFAULT 0,
+        error TEXT, created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS check_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        filename TEXT,
-        file_type TEXT,
-        original_text TEXT,
-        issues_json TEXT,
-        score REAL,
-        summary TEXT,
-        compliance TEXT,
-        created_at TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT,
+        file_type TEXT, original_text TEXT, issues_json TEXT,
+        score REAL, summary TEXT, compliance TEXT, created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS gemini_usage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_gemini_usage_ts ON gemini_usage(ts);
-
     CREATE TABLE IF NOT EXISTS app_state (
-        key TEXT PRIMARY KEY,
-        value TEXT
+        key TEXT PRIMARY KEY, value TEXT
     );
     """)
     conn.commit()
 
-    _ensure_column(conn, "knowledge", "verified",
-                   "verified INTEGER DEFAULT 0")
-    _ensure_column(conn, "knowledge", "flagged",
-                   "flagged INTEGER DEFAULT 0")
-    _ensure_column(conn, "templates", "verified",
-                   "verified INTEGER DEFAULT 0")
-    _ensure_column(conn, "templates", "flagged",
-                   "flagged INTEGER DEFAULT 0")
+    for col, ddl in [
+        ("verified", "verified INTEGER DEFAULT 0"),
+        ("flagged", "flagged INTEGER DEFAULT 0"),
+        ("phase", "phase INTEGER DEFAULT 1"),
+        ("phase_ts", "phase_ts TEXT"),
+    ]:
+        _ensure_column(conn, "knowledge", col, ddl)
+        _ensure_column(conn, "templates", col, ddl)
     conn.commit()
 
 
+# ---------------- app_state ----------------
 def get_app_state(key, default=""):
     try:
         conn = get_conn()
@@ -214,6 +179,7 @@ def set_app_state(key, value):
         logger.warning("set_app_state(%s) failed: %s", key, e)
 
 
+# ---------------- gemini usage ----------------
 def _utcnow_iso():
     return datetime.datetime.utcnow().isoformat()
 
@@ -223,19 +189,17 @@ def _iso_ago(seconds):
             - datetime.timedelta(seconds=seconds)).isoformat()
 
 
-def check_and_increment_gemini_usage(day_limit=800, hour_limit=60):
+def check_and_increment_gemini_usage(day_limit=600, hour_limit=40):
     try:
         conn = get_conn()
         day_count = conn.execute(
             "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
-            (_iso_ago(86400),)
-        ).fetchone()[0]
+            (_iso_ago(86400),)).fetchone()[0]
         if day_count >= day_limit:
             return False
         hour_count = conn.execute(
             "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
-            (_iso_ago(3600),)
-        ).fetchone()[0]
+            (_iso_ago(3600),)).fetchone()[0]
         if hour_count >= hour_limit:
             return False
         conn.execute("INSERT INTO gemini_usage (ts) VALUES (?)",
@@ -247,30 +211,21 @@ def check_and_increment_gemini_usage(day_limit=800, hour_limit=60):
         return True
 
 
-def gemini_usage_stats(day_limit=800, hour_limit=60):
+def gemini_usage_stats(day_limit=600, hour_limit=40):
     try:
         conn = get_conn()
-        day_count = conn.execute(
-            "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
-            (_iso_ago(86400),)
-        ).fetchone()[0]
-        hour_count = conn.execute(
-            "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
-            (_iso_ago(3600),)
-        ).fetchone()[0]
-        return {
-            "last_24h": day_count,
-            "last_1h": hour_count,
-            "day_limit": day_limit,
-            "hour_limit": hour_limit,
-        }
+        d = conn.execute("SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
+                         (_iso_ago(86400),)).fetchone()[0]
+        h = conn.execute("SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
+                         (_iso_ago(3600),)).fetchone()[0]
+        return {"last_24h": d, "last_1h": h,
+                "day_limit": day_limit, "hour_limit": hour_limit}
     except Exception:
         return {"last_24h": 0, "last_1h": 0,
                 "day_limit": day_limit, "hour_limit": hour_limit}
 
 
 def purge_old_gemini_usage(keep_days=None, keep_seconds=None):
-    """Delete gemini_usage rows older than the given window."""
     if keep_seconds is None:
         keep_seconds = (keep_days or 3) * 86400
     try:
@@ -278,17 +233,16 @@ def purge_old_gemini_usage(keep_days=None, keep_seconds=None):
         conn.execute("DELETE FROM gemini_usage WHERE ts < ?",
                      (_iso_ago(keep_seconds),))
         conn.commit()
-        print(f"[db] purged gemini_usage older than {keep_seconds}s")
     except Exception as e:
-        logger.warning("purge_old_gemini_usage failed: %s", e)
+        logger.warning("purge failed: %s", e)
 
 
-def upsert_knowledge(topic, category, content, confidence=0.5):
+# ---------------- knowledge ----------------
+def upsert_knowledge(topic, category, content, confidence=0.7):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
     row = conn.execute(
-        "SELECT id, version FROM knowledge WHERE topic = ?", (topic,)
-    ).fetchone()
+        "SELECT id FROM knowledge WHERE topic = ?", (topic,)).fetchone()
     if row:
         conn.execute("""
             UPDATE knowledge SET content=?, confidence=?,
@@ -298,72 +252,41 @@ def upsert_knowledge(topic, category, content, confidence=0.5):
         return row[0]
     cur = conn.execute("""
         INSERT INTO knowledge (topic, category, content, refined_content,
-            version, confidence, created_at, updated_at)
-        VALUES (?,?,?,?,1,?,?,?)
-    """, (topic, category, content, "", confidence, now, now))
+            version, confidence, phase, phase_ts, created_at, updated_at)
+        VALUES (?,?,?,?,1,?,1,?,?,?)
+    """, (topic, category, content, "", confidence, now, now, now))
     conn.commit()
     return cur.lastrowid
 
 
 def get_knowledge_by_topic(topic):
     conn = get_conn()
-    return conn.execute(
-        "SELECT * FROM knowledge WHERE topic=?", (topic,)).fetchone()
+    return conn.execute("SELECT * FROM knowledge WHERE topic=?",
+                        (topic,)).fetchone()
 
 
-def get_knowledge_by_id(knowledge_id):
+def get_knowledge_by_id(kid):
     conn = get_conn()
-    return conn.execute(
-        "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone()
-
-
-def replace_knowledge_with_refined(knowledge_id, refined):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT topic, category, version FROM knowledge WHERE id = ?",
-        (knowledge_id,)).fetchone()
-    if not row:
-        return
-    topic, category, version = row
-    now = datetime.datetime.utcnow().isoformat()
-    conn.execute("DELETE FROM knowledge WHERE id = ?", (knowledge_id,))
-    conn.execute("""
-        INSERT INTO knowledge (topic, category, content, refined_content,
-            version, confidence, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (topic, category, refined, refined, version + 1, 0.85, now, now))
-    conn.commit()
-
-
-def oldest_unverified_knowledge(limit=1):
-    conn = get_conn()
-    return conn.execute("""
-        SELECT id, topic, category, content, refined_content, version
-        FROM knowledge
-        WHERE COALESCE(verified,0)=0 AND COALESCE(flagged,0)=0
-        ORDER BY updated_at ASC LIMIT ?
-    """, (limit,)).fetchall()
+    return conn.execute("SELECT * FROM knowledge WHERE id=?", (kid,)).fetchone()
 
 
 def verify_knowledge(kid):
     conn = get_conn()
-    conn.execute(
-        "UPDATE knowledge SET verified=1, flagged=0, "
-        "confidence=1.0 WHERE id=?", (kid,))
+    conn.execute("UPDATE knowledge SET verified=1, flagged=0, "
+                 "confidence=1.0 WHERE id=?", (kid,))
     conn.commit()
 
 
 def flag_knowledge(kid):
     conn = get_conn()
-    conn.execute(
-        "UPDATE knowledge SET flagged=1, verified=0 WHERE id=?", (kid,))
+    conn.execute("UPDATE knowledge SET flagged=1, verified=0 WHERE id=?",
+                 (kid,))
     conn.commit()
 
 
 def clear_knowledge_flags(kid):
     conn = get_conn()
-    conn.execute(
-        "UPDATE knowledge SET flagged=0 WHERE id=?", (kid,))
+    conn.execute("UPDATE knowledge SET flagged=0 WHERE id=?", (kid,))
     conn.commit()
 
 
@@ -398,8 +321,7 @@ def knowledge_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
     refined = conn.execute(
-        "SELECT COUNT(*) FROM knowledge WHERE version > 1"
-    ).fetchone()[0]
+        "SELECT COUNT(*) FROM knowledge WHERE version > 1").fetchone()[0]
     pending = conn.execute(
         "SELECT COUNT(*) FROM pending_topics").fetchone()[0]
     verified = conn.execute(
@@ -408,8 +330,15 @@ def knowledge_stats():
     flagged = conn.execute(
         "SELECT COUNT(*) FROM knowledge WHERE COALESCE(flagged,0)=1"
     ).fetchone()[0]
+    # Phase stats
+    avg_phase = conn.execute(
+        "SELECT AVG(COALESCE(phase,1)) FROM knowledge").fetchone()[0] or 1.0
+    advanced = conn.execute(
+        "SELECT COUNT(*) FROM knowledge WHERE COALESCE(phase,1) > 1"
+    ).fetchone()[0]
     return {"total": total, "refined": refined, "pending": pending,
-            "verified": verified, "flagged": flagged}
+            "verified": verified, "flagged": flagged,
+            "avg_phase": round(float(avg_phase), 2), "advanced": advanced}
 
 
 def category_counts():
@@ -450,12 +379,39 @@ def runs_per_cycle(limit=40):
     """, (limit,)).fetchall()[::-1]
 
 
-def upsert_template(name, category, content, confidence=0.5):
+# ---------------- phase advancement ----------------
+def phaseable_knowledge(max_phase=7, min_age_seconds=14400):
+    """Oldest knowledge row that can advance. min_age prevents one item
+    from phasing too fast."""
+    conn = get_conn()
+    cutoff = _iso_ago(min_age_seconds)
+    return conn.execute("""
+        SELECT id, topic, category, content, COALESCE(phase,1) AS phase
+        FROM knowledge
+        WHERE COALESCE(flagged,0)=0
+          AND COALESCE(verified,0)=0
+          AND COALESCE(phase,1) < ?
+          AND (phase_ts IS NULL OR phase_ts < ?)
+        ORDER BY phase ASC, COALESCE(phase_ts, created_at) ASC LIMIT 1
+    """, (max_phase, cutoff)).fetchone()
+
+
+def advance_knowledge_phase(kid, new_content, new_phase):
+    conn = get_conn()
+    now = datetime.datetime.utcnow().isoformat()
+    conn.execute("""
+        UPDATE knowledge SET content=?, phase=?, phase_ts=?, updated_at=?
+        WHERE id=?
+    """, (new_content, new_phase, now, now, kid))
+    conn.commit()
+
+
+# ---------------- templates ----------------
+def upsert_template(name, category, content, confidence=0.7):
     conn = get_conn()
     now = datetime.datetime.utcnow().isoformat()
     row = conn.execute(
-        "SELECT id, version FROM templates WHERE name = ?", (name,)
-    ).fetchone()
+        "SELECT id FROM templates WHERE name = ?", (name,)).fetchone()
     if row:
         conn.execute("""
             UPDATE templates SET content=?, confidence=?,
@@ -465,65 +421,35 @@ def upsert_template(name, category, content, confidence=0.5):
         return row[0]
     cur = conn.execute("""
         INSERT INTO templates (name, category, content, refined_content,
-            version, confidence, created_at, updated_at)
-        VALUES (?,?,?,?,1,?,?,?)
-    """, (name, category, content, "", confidence, now, now))
+            version, confidence, phase, phase_ts, created_at, updated_at)
+        VALUES (?,?,?,?,1,?,1,?,?,?)
+    """, (name, category, content, "", confidence, now, now, now))
     conn.commit()
     return cur.lastrowid
 
 
 def get_template_by_name(name):
     conn = get_conn()
-    return conn.execute(
-        "SELECT * FROM templates WHERE name=?", (name,)).fetchone()
+    return conn.execute("SELECT * FROM templates WHERE name=?",
+                        (name,)).fetchone()
 
 
-def get_template_by_id(template_id):
+def get_template_by_id(tid):
     conn = get_conn()
-    return conn.execute(
-        "SELECT * FROM templates WHERE id=?", (template_id,)).fetchone()
-
-
-def replace_template_with_refined(template_id, refined):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT name, category, version FROM templates WHERE id = ?",
-        (template_id,)).fetchone()
-    if not row:
-        return
-    name, category, version = row
-    now = datetime.datetime.utcnow().isoformat()
-    conn.execute("DELETE FROM templates WHERE id = ?", (template_id,))
-    conn.execute("""
-        INSERT INTO templates (name, category, content, refined_content,
-            version, confidence, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (name, category, refined, refined, version + 1, 0.85, now, now))
-    conn.commit()
-
-
-def oldest_unverified_template(limit=1):
-    conn = get_conn()
-    return conn.execute("""
-        SELECT id, name, category, content, refined_content, version
-        FROM templates
-        WHERE COALESCE(verified,0)=0 AND COALESCE(flagged,0)=0
-        ORDER BY updated_at ASC LIMIT ?
-    """, (limit,)).fetchall()
+    return conn.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
 
 
 def verify_template(tid):
     conn = get_conn()
-    conn.execute(
-        "UPDATE templates SET verified=1, flagged=0, "
-        "confidence=1.0 WHERE id=?", (tid,))
+    conn.execute("UPDATE templates SET verified=1, flagged=0, "
+                 "confidence=1.0 WHERE id=?", (tid,))
     conn.commit()
 
 
 def flag_template(tid):
     conn = get_conn()
-    conn.execute(
-        "UPDATE templates SET flagged=1, verified=0 WHERE id=?", (tid,))
+    conn.execute("UPDATE templates SET flagged=1, verified=0 WHERE id=?",
+                 (tid,))
     conn.commit()
 
 
@@ -556,8 +482,7 @@ def template_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) FROM templates").fetchone()[0]
     refined = conn.execute(
-        "SELECT COUNT(*) FROM templates WHERE version > 1"
-    ).fetchone()[0]
+        "SELECT COUNT(*) FROM templates WHERE version > 1").fetchone()[0]
     pending = conn.execute(
         "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
     verified = conn.execute(
@@ -566,10 +491,41 @@ def template_stats():
     flagged = conn.execute(
         "SELECT COUNT(*) FROM templates WHERE COALESCE(flagged,0)=1"
     ).fetchone()[0]
+    avg_phase = conn.execute(
+        "SELECT AVG(COALESCE(phase,1)) FROM templates").fetchone()[0] or 1.0
+    advanced = conn.execute(
+        "SELECT COUNT(*) FROM templates WHERE COALESCE(phase,1) > 1"
+    ).fetchone()[0]
     return {"total": total, "refined": refined, "pending": pending,
-            "verified": verified, "flagged": flagged}
+            "verified": verified, "flagged": flagged,
+            "avg_phase": round(float(avg_phase), 2), "advanced": advanced}
 
 
+def phaseable_template(max_phase=7, min_age_seconds=14400):
+    conn = get_conn()
+    cutoff = _iso_ago(min_age_seconds)
+    return conn.execute("""
+        SELECT id, name, category, content, COALESCE(phase,1) AS phase
+        FROM templates
+        WHERE COALESCE(flagged,0)=0
+          AND COALESCE(verified,0)=0
+          AND COALESCE(phase,1) < ?
+          AND (phase_ts IS NULL OR phase_ts < ?)
+        ORDER BY phase ASC, COALESCE(phase_ts, created_at) ASC LIMIT 1
+    """, (max_phase, cutoff)).fetchone()
+
+
+def advance_template_phase(tid, new_content, new_phase):
+    conn = get_conn()
+    now = datetime.datetime.utcnow().isoformat()
+    conn.execute("""
+        UPDATE templates SET content=?, phase=?, phase_ts=?, updated_at=?
+        WHERE id=?
+    """, (new_content, new_phase, now, now, tid))
+    conn.commit()
+
+
+# ---------------- pending queues ----------------
 def add_pending_topic(topic, category, source="ai", parent_topic=""):
     conn = get_conn()
     topic = (topic or "").strip()
@@ -585,8 +541,7 @@ def add_pending_topic(topic, category, source="ai", parent_topic=""):
             INSERT OR IGNORE INTO pending_topics
             (topic, category, source, parent_topic, created_at)
             VALUES (?,?,?,?,?)
-        """, (topic, category, source, parent_topic,
-              datetime.datetime.utcnow().isoformat()))
+        """, (topic, category, source, parent_topic, _utcnow_iso()))
         conn.commit()
         return True
     except Exception:
@@ -608,8 +563,7 @@ def pop_pending_topic():
 
 def pending_count():
     conn = get_conn()
-    return conn.execute(
-        "SELECT COUNT(*) FROM pending_topics").fetchone()[0]
+    return conn.execute("SELECT COUNT(*) FROM pending_topics").fetchone()[0]
 
 
 def add_pending_template(name, category, source="ai", parent_name=""):
@@ -627,8 +581,7 @@ def add_pending_template(name, category, source="ai", parent_name=""):
             INSERT OR IGNORE INTO pending_templates
             (name, category, source, parent_name, created_at)
             VALUES (?,?,?,?,?)
-        """, (name, category, source, parent_name,
-              datetime.datetime.utcnow().isoformat()))
+        """, (name, category, source, parent_name, _utcnow_iso()))
         conn.commit()
         return True
     except Exception:
@@ -650,18 +603,17 @@ def pop_pending_template():
 
 def pending_template_count():
     conn = get_conn()
-    return conn.execute(
-        "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
+    return conn.execute("SELECT COUNT(*) FROM pending_templates").fetchone()[0]
 
 
+# ---------------- runs ----------------
 def log_learning_run(cycle, topic, added, refined, calls, error=""):
     conn = get_conn()
     conn.execute("""
         INSERT INTO learning_runs (cycle, topic_processed, items_added,
             items_refined, gemini_calls, error, created_at)
         VALUES (?,?,?,?,?,?,?)
-    """, (cycle, topic, added, refined, calls, error[:500],
-          datetime.datetime.utcnow().isoformat()))
+    """, (cycle, topic, added, refined, calls, error[:500], _utcnow_iso()))
     conn.commit()
 
 
@@ -680,8 +632,7 @@ def log_template_run(cycle, name, added, refined, calls, error=""):
         INSERT INTO template_runs (cycle, template_processed, items_added,
             items_refined, gemini_calls, error, created_at)
         VALUES (?,?,?,?,?,?,?)
-    """, (cycle, name, added, refined, calls, error[:500],
-          datetime.datetime.utcnow().isoformat()))
+    """, (cycle, name, added, refined, calls, error[:500], _utcnow_iso()))
     conn.commit()
 
 
@@ -701,8 +652,8 @@ def save_check_report(filename, file_type, original_text, issues,
         INSERT INTO check_reports (filename, file_type, original_text,
             issues_json, score, summary, compliance, created_at)
         VALUES (?,?,?,?,?,?,?,?)
-    """, (filename, file_type, original_text, json.dumps(issues), score,
-          summary, compliance, datetime.datetime.utcnow().isoformat()))
+    """, (filename, file_type, original_text, json.dumps(issues),
+          score, summary, compliance, _utcnow_iso()))
     conn.commit()
     return cur.lastrowid
 
