@@ -1,8 +1,7 @@
 # report_builder.py
-# Build downloadable reports: TXT, PDF, DOCX.
+# v2: Arabic-safe PDF export via Amiri + arabic_reshaper + python-bidi.
 
 import io
-import json
 from typing import Any
 
 from reportlab.lib.pagesizes import A4
@@ -12,10 +11,40 @@ from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
                                 TableStyle)
 from reportlab.lib import colors
 
+from arabic_font import (register_reportlab_fonts, has_arabic,
+                         shape_arabic)
+
+_ARABIC_FONT = register_reportlab_fonts()
+_PDF_FONT = _ARABIC_FONT or "Helvetica"
+
 
 def _safe(s: Any) -> str:
     return (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;"))
+
+
+def _p(text, style):
+    """Build a Paragraph from arbitrary text, Arabic-safe."""
+    raw = str(text or "")
+    shaped = shape_arabic(raw)
+    escaped = (shaped.replace("&", "&amp;")
+                     .replace("<", "&lt;")
+                     .replace(">", "&gt;"))
+    return Paragraph(escaped, style)
+
+
+def _pdf_styles():
+    s = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=s["Heading1"],
+                        fontName=_PDF_FONT, fontSize=18, leading=24)
+    h2 = ParagraphStyle("h2", parent=s["Heading2"],
+                        fontName=_PDF_FONT, fontSize=13, leading=18)
+    body = ParagraphStyle("body", parent=s["BodyText"],
+                          fontName=_PDF_FONT, fontSize=10, leading=14)
+    warn = ParagraphStyle("warn", parent=body, textColor=colors.red)
+    ok = ParagraphStyle("ok", parent=body, textColor=colors.green)
+    cell = ParagraphStyle("cell", parent=body, fontSize=8, leading=11)
+    return h1, h2, body, warn, ok, cell
 
 
 # ---------------- check report ----------------
@@ -41,22 +70,17 @@ def build_pdf(filename: str, result: dict) -> bytes:
     doc = SimpleDocTemplate(buf, pagesize=A4,
                             leftMargin=2 * cm, rightMargin=2 * cm,
                             topMargin=2 * cm, bottomMargin=2 * cm)
-    styles = getSampleStyleSheet()
-    h1 = styles["Heading1"]
-    h2 = styles["Heading2"]
-    body = styles["BodyText"]
-    warn = ParagraphStyle("warn", parent=body, textColor=colors.red)
-    ok = ParagraphStyle("ok", parent=body, textColor=colors.green)
+    h1, h2, body, warn, ok, cell = _pdf_styles()
 
     story = [Paragraph("HUBx Engineering Review", h1),
-             Paragraph(f"File: {_safe(filename)}", body)]
+             _p(f"File: {filename}", body)]
     score = float(result.get("score", 0.0))
     story.append(Paragraph(
         f"Score: <b>{score:.2f}</b> / 1.00",
         ok if score >= 0.7 else warn))
     story.append(Spacer(1, 0.4 * cm))
     story.append(Paragraph("Summary", h2))
-    story.append(Paragraph(_safe(result.get("summary", "")), body))
+    story.append(_p(result.get("summary", ""), body))
     story.append(Spacer(1, 0.4 * cm))
     issues = result.get("issues", []) or []
     story.append(Paragraph(f"Issues ({len(issues)})", h2))
@@ -64,11 +88,11 @@ def build_pdf(filename: str, result: dict) -> bytes:
         data = [["#", "Severity", "Location", "Problem", "Fix", "Reference"]]
         for i, issue in enumerate(issues, 1):
             data.append([str(i),
-                         _safe(issue.get("severity", "")),
-                         Paragraph(_safe(issue.get("location", "")), body),
-                         Paragraph(_safe(issue.get("problem", "")), body),
-                         Paragraph(_safe(issue.get("fix", "")), body),
-                         Paragraph(_safe(issue.get("reference", "")), body)])
+                         _p(issue.get("severity", ""), cell),
+                         _p(issue.get("location", ""), cell),
+                         _p(issue.get("problem", ""), cell),
+                         _p(issue.get("fix", ""), cell),
+                         _p(issue.get("reference", ""), cell)])
         tbl = Table(data, colWidths=[0.8 * cm, 1.8 * cm, 3 * cm,
                                      4.5 * cm, 4.5 * cm, 2.6 * cm])
         tbl.setStyle(TableStyle([
@@ -110,7 +134,6 @@ def build_xlsx(filename: str, result: dict) -> bytes:
 # ---------------- topic / template download ----------------
 
 def _md_to_plain(md: str) -> str:
-    """Very light markdown stripping for text/pdf/docx export."""
     if not md:
         return ""
     lines = []
@@ -133,25 +156,23 @@ def topic_pdf(title: str, category: str, version: int,
     doc = SimpleDocTemplate(buf, pagesize=A4,
                             leftMargin=2 * cm, rightMargin=2 * cm,
                             topMargin=2 * cm, bottomMargin=2 * cm)
-    styles = getSampleStyleSheet()
-    h1 = styles["Heading1"]
-    h2 = styles["Heading2"]
-    body_s = styles["BodyText"]
-    story = [Paragraph(_safe(title), h1),
-             Paragraph(f"Category: {_safe(category)}  |  "
-                       f"Version: v{version}", body_s),
+    h1, h2, body_s, _, _, _ = _pdf_styles()
+
+    story = [_p(title, h1),
+             _p(f"Category: {category}  |  Version: v{version}", body_s),
              Spacer(1, 0.3 * cm)]
+
     for para in _md_to_plain(body).split("\n\n"):
         if not para.strip():
             continue
         first = para.strip().split("\n")[0]
         if first.isupper() and len(first) < 80:
-            story.append(Paragraph(_safe(first), h2))
+            story.append(_p(first, h2))
             rest = "\n".join(para.strip().split("\n")[1:])
             if rest.strip():
-                story.append(Paragraph(_safe(rest), body_s))
+                story.append(_p(rest, body_s))
         else:
-            story.append(Paragraph(_safe(para.strip()), body_s))
+            story.append(_p(para.strip(), body_s))
         story.append(Spacer(1, 0.15 * cm))
     doc.build(story)
     return buf.getvalue()
