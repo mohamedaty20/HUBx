@@ -1,6 +1,5 @@
 # gemini.py
-# v8: max_tokens 3000 for knowledge/template/refine (was 8192),
-#     hourly cap hint 100, 180s timeout, no retry on 429/timeout.
+# v9: MIN_CALL_GAP 15s (4/min), quota block 15 min, 240s timeout.
 
 import os
 import re
@@ -8,6 +7,7 @@ import json
 import asyncio
 import logging
 import time
+import random
 
 import google.generativeai as genai
 
@@ -29,10 +29,10 @@ MODEL = "gemini-3.5-flash-lite"
 
 GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "400"))
 GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "100"))
-_QUOTA_BLOCK_SECONDS = 300
+_QUOTA_BLOCK_SECONDS = 900   # 15 min rest after a 429
 
-ATTEMPT_TIMEOUT_SECONDS = 180
-MIN_CALL_GAP = 5.0
+ATTEMPT_TIMEOUT_SECONDS = 240
+MIN_CALL_GAP = 15.0          # 4 calls per minute, safely under free tier
 
 _quota_block_until = 0.0
 
@@ -93,8 +93,10 @@ async def _throttle():
     global _last_call_time
     async with _rate_lock:
         now = time.monotonic()
+        # fixed gap + small random jitter to avoid per-second bursts
         wait = MIN_CALL_GAP - (now - _last_call_time)
         if wait > 0:
+            wait += random.uniform(0, 1.5)
             await asyncio.sleep(wait)
         _last_call_time = time.monotonic()
 
@@ -122,7 +124,7 @@ def _is_quota_error(err_str):
             or "rate limit" in s or "exceeded" in s)
 
 
-async def _call(prompt, json_mode=False, max_tokens=3000, max_retries=6):
+async def _call(prompt, json_mode=False, max_tokens=3000, max_retries=3):
     global last_error, _quota_block_until
 
     if not GEMINI_API_KEY:
@@ -132,7 +134,7 @@ async def _call(prompt, json_mode=False, max_tokens=3000, max_retries=6):
     now_m = time.monotonic()
     if now_m < _quota_block_until:
         left = int(_quota_block_until - now_m)
-        last_error = f"{MODEL}: quota cap reached, paused {left}s"
+        last_error = f"{MODEL}: paused after 429, {left}s left"
         return ""
 
     kwargs = {"temperature": 0.4 if json_mode else 0.7,
@@ -186,7 +188,7 @@ async def _call(prompt, json_mode=False, max_tokens=3000, max_retries=6):
             last_error = f"{MODEL}: {err_str}"
             logger.warning("Gemini call failed (attempt %d): %s",
                            attempt + 1, e)
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(3 * (attempt + 1))
     return ""
 
 
