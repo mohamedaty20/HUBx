@@ -1,5 +1,6 @@
 # main.py
-# v10: reader state persists across reconnects; verify/flag buttons.
+# v11: dashboard refresh runs DB calls off the event loop (fixes
+#      "connection lost" on dashboard).
 
 import os
 import io
@@ -1448,11 +1449,11 @@ def dashboard_page():
 
         async def do_start():
             await engine.start(by_user=True)
-            refresh()
+            await refresh()
 
         async def do_pause():
             await engine.pause()
-            refresh()
+            await refresh()
 
         async def do_one_cycle():
             ui.notify("Running one cycle…")
@@ -1462,7 +1463,7 @@ def dashboard_page():
                 ui.notify("Cycle complete.", color="green")
             except Exception as e:
                 ui.notify(f"Cycle failed: {e}", color="red")
-            refresh()
+            await refresh()
 
         with ui.row().classes("gap-2 mt-2 flex-wrap"):
             ui.button(t("start"), on_click=do_start).classes(
@@ -1472,7 +1473,8 @@ def dashboard_page():
             ui.button(t("one_cycle"), on_click=do_one_cycle).classes(
                  "hubx-btn hubx-btn-primary")
 
-        def refresh():
+        def _do_refresh_sync():
+            """All blocking DB work runs here, in a worker thread."""
             try:
                 s = engine.stats()
             except Exception as e:
@@ -1481,6 +1483,15 @@ def dashboard_page():
                      "pending_topics": 0, "pending_templates": 0,
                      "last_status": f"error: {e}", "last_error": str(e),
                      "last_debug": ""}
+            try:
+                q = gemini_usage_stats()
+            except Exception:
+                q = {"last_1h": 0, "last_24h": 0,
+                     "hour_limit": 100, "day_limit": 400}
+            return s, q
+
+        async def refresh():
+            s, q = await asyncio.to_thread(_do_refresh_sync)
             status_badge.text = s["last_status"]
             status_badge.props(
                 f'color={"green" if not engine.paused else "orange"}')
@@ -1495,17 +1506,13 @@ def dashboard_page():
             gemini_err_label.text = (
                 f"Gemini: {gemini_mod.last_error}"
                 if gemini_mod.last_error else "")
-            try:
-                q = gemini_usage_stats()
-                quota_label.text = (
-                    f"Gemini usage — last 1h: "
-                    f"{q['last_1h']}/{q['hour_limit']}"
-                    f"  ·  last 24h: {q['last_24h']}/{q['day_limit']}")
-            except Exception:
-                quota_label.text = ""
+            quota_label.text = (
+                f"Gemini usage — last 1h: "
+                f"{q['last_1h']}/{q['hour_limit']}"
+                f"  ·  last 24h: {q['last_24h']}/{q['day_limit']}")
 
         ui.timer(5.0, refresh)
-        refresh()
+        await refresh()
 
         ui.label(t("recent_runs")).classes("text-lg font-bold mt-4")
         runs_table = ui.table(columns=[
@@ -1519,11 +1526,14 @@ def dashboard_page():
             {"name": "created_at", "label": "When", "field": "created_at"},
         ], rows=[]).classes("w-full")
 
-        def refresh_runs():
+        def _fetch_runs():
             try:
-                rows = recent_learning_runs(30)
+                return recent_learning_runs(30)
             except Exception:
-                rows = []
+                return []
+
+        async def refresh_runs():
+            rows = await asyncio.to_thread(_fetch_runs)
             runs_table.rows = [{
                 "cycle": r[0], "topic": r[1], "added": r[2],
                 "refined": r[3], "calls": r[4], "error": r[5],
@@ -1531,7 +1541,7 @@ def dashboard_page():
             } for r in rows]
 
         ui.timer(20.0, refresh_runs)
-        refresh_runs()
+        await refresh_runs()
 
         ui.label(t("recent_tpl_runs")).classes("text-lg font-bold mt-4")
         tpl_table = ui.table(columns=[
@@ -1544,11 +1554,14 @@ def dashboard_page():
             {"name": "created_at", "label": "When", "field": "created_at"},
         ], rows=[]).classes("w-full")
 
-        def refresh_tpl_runs():
+        def _fetch_tpl_runs():
             try:
-                rows = recent_template_runs(20)
+                return recent_template_runs(20)
             except Exception:
-                rows = []
+                return []
+
+        async def refresh_tpl_runs():
+            rows = await asyncio.to_thread(_fetch_tpl_runs)
             tpl_table.rows = [{
                 "cycle": r[0], "name": r[1], "added": r[2],
                 "refined": r[3], "error": r[5],
@@ -1556,7 +1569,7 @@ def dashboard_page():
             } for r in rows]
 
         ui.timer(20.0, refresh_tpl_runs)
-        refresh_tpl_runs()
+        await refresh_tpl_runs()
 
 
 ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx",
