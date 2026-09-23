@@ -1,17 +1,14 @@
 # engine.py
-# v9: phase expansion appends only the new section. On failure, bump
-#     phase_ts so the same item isn't retried immediately.
+# v10: phase advancement removed. Back to generate-only.
 
 from __future__ import annotations
 import asyncio
-import inspect
 import json as _json
 import traceback
 
 from gemini import (
     generate_knowledge, refine_knowledge,
     generate_template, refine_template,
-    expand_phase,
     suggest_subtopics, suggest_subtemplates,
 )
 
@@ -23,17 +20,6 @@ from sources import (
 )
 
 PAUSED_KEY = "engine_paused_by_user"
-MAX_PHASE_DEFAULT = 8
-PHASE_MIN_AGE_SECONDS = 14400   # 4 hours between phase advances of same item
-
-
-def _get_max_phase():
-    try:
-        v = _db.get_app_state("max_phase", str(MAX_PHASE_DEFAULT))
-        n = int(v)
-        return max(1, min(8, n))
-    except Exception:
-        return MAX_PHASE_DEFAULT
 
 
 def _read_focus_state():
@@ -147,19 +133,8 @@ class Engine:
         async with self._lock:
             self.last_status = "running"
             mode, focus_cats = _read_focus_state()
-            max_phase = _get_max_phase()
-
             run_k = mode in ("knowledge", "both")
             run_t = mode in ("templates", "both")
-
-            if run_k:
-                if await self._advance_knowledge(max_phase):
-                    self.ai_calls = self.gemini_calls
-                    return
-            if run_t:
-                if await self._advance_template(max_phase):
-                    self.ai_calls = self.gemini_calls
-                    return
 
             if run_k:
                 try:
@@ -181,91 +156,6 @@ class Engine:
 
             self.ai_calls = self.gemini_calls
 
-    # ---------------- phase advancement ----------------
-    async def _advance_knowledge(self, max_phase):
-        try:
-            row = _db.phaseable_knowledge(max_phase, PHASE_MIN_AGE_SECONDS)
-        except Exception as e:
-            print(f"[engine] phaseable_knowledge failed: {e}")
-            return False
-        if not row:
-            return False
-
-        kid, topic, category, content, phase = row
-        target = int(phase) + 1
-        if target > max_phase:
-            return False
-
-        self.last_debug = f"phase {phase}->{target}: {topic}"
-        new_section = await expand_phase(topic, category,
-                                         content or "", phase, target)
-        self.gemini_calls += 1
-
-        # ALWAYS bump phase_ts so we don't retry the same item for 4h.
-        if not new_section or len(new_section.strip()) < 200:
-            # Failed or too short. Bump timestamp but don't advance.
-            try:
-                _db.advance_knowledge_phase(kid, content or "", phase)
-            except Exception:
-                pass
-            self.last_debug = f"phase expand failed: {topic}"
-            _db.log_learning_run(self.cycles, topic, 0, 0, 1,
-                                 f"phase->{target} failed")
-            return True
-
-        # Append the new section to existing content.
-        combined = (content or "").rstrip() + "\n\n\n" + new_section.strip()
-        try:
-            _db.advance_knowledge_phase(kid, combined, target)
-        except Exception as e:
-            print(f"[engine] advance_knowledge_phase failed: {e}")
-            return True
-
-        _db.log_learning_run(self.cycles, topic, 0, 1, 1, f"phase->{target}")
-        self.last_debug = f"advanced to phase {target}: {topic}"
-        return True
-
-    async def _advance_template(self, max_phase):
-        try:
-            row = _db.phaseable_template(max_phase, PHASE_MIN_AGE_SECONDS)
-        except Exception as e:
-            print(f"[engine] phaseable_template failed: {e}")
-            return False
-        if not row:
-            return False
-
-        tid, name, category, content, phase = row
-        target = int(phase) + 1
-        if target > max_phase:
-            return False
-
-        self.last_debug = f"phase {phase}->{target}: {name}"
-        new_section = await expand_phase(name, category,
-                                         content or "", phase, target)
-        self.gemini_calls += 1
-
-        if not new_section or len(new_section.strip()) < 200:
-            try:
-                _db.advance_template_phase(tid, content or "", phase)
-            except Exception:
-                pass
-            self.last_debug = f"phase expand failed: {name}"
-            _db.log_template_run(self.cycles, name, 0, 0, 1,
-                                 f"phase->{target} failed")
-            return True
-
-        combined = (content or "").rstrip() + "\n\n\n" + new_section.strip()
-        try:
-            _db.advance_template_phase(tid, combined, target)
-        except Exception as e:
-            print(f"[engine] advance_template_phase failed: {e}")
-            return True
-
-        _db.log_template_run(self.cycles, name, 0, 1, 1, f"phase->{target}")
-        self.last_debug = f"advanced to phase {target}: {name}"
-        return True
-
-    # ---------------- generate new ----------------
     async def _knowledge_step(self, focus_cats):
         focus_cats = focus_cats or set()
         topic = category = None
@@ -421,19 +311,13 @@ class Engine:
 
     def stats(self) -> dict:
         kb_total = kb_refined = kb_pending = 0
-        kb_avg_phase = 1.0
-        kb_advanced = 0
         tpl_total = tpl_pending = 0
-        tpl_avg_phase = 1.0
-        tpl_advanced = 0
         try:
             ks = _db.knowledge_stats()
             if isinstance(ks, dict):
                 kb_total = ks.get("total", 0)
                 kb_refined = ks.get("refined", 0)
                 kb_pending = ks.get("pending", 0)
-                kb_avg_phase = ks.get("avg_phase", 1.0)
-                kb_advanced = ks.get("advanced", 0)
         except Exception:
             pass
         try:
@@ -441,8 +325,6 @@ class Engine:
             if isinstance(ts, dict):
                 tpl_total = ts.get("total", 0)
                 tpl_pending = ts.get("pending", 0)
-                tpl_avg_phase = ts.get("avg_phase", 1.0)
-                tpl_advanced = ts.get("advanced", 0)
         except Exception:
             pass
 
@@ -451,14 +333,9 @@ class Engine:
             "gemini_calls": self.gemini_calls,
             "knowledge_total": kb_total,
             "knowledge_refined": kb_refined,
-            "knowledge_avg_phase": kb_avg_phase,
-            "knowledge_advanced": kb_advanced,
             "template_total": tpl_total,
-            "template_avg_phase": tpl_avg_phase,
-            "template_advanced": tpl_advanced,
             "pending_topics": kb_pending,
             "pending_templates": tpl_pending,
-            "max_phase": _get_max_phase(),
             "last_status": self.last_status,
             "last_error": self.last_error,
             "last_debug": self.last_debug,
