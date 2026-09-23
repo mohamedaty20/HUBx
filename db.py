@@ -1,15 +1,19 @@
 # db.py
-# v10: phase columns + phase advancement helpers.
+# v11: thread-safe connection. Every DB op holds an RLock so dashboard
+#      timers and the engine thread can't collide on libsql's connection.
 
 import os
 import json
 import datetime
 import logging
+import threading
 
 import libsql
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+_db_lock = threading.RLock()
 
 
 def _clean(v):
@@ -82,6 +86,22 @@ def db_health():
     }
 
 
+def _exec(sql, params=()):
+    """Thread-safe execute. Returns a cursor."""
+    with _db_lock:
+        conn = get_conn()
+        return conn.execute(sql, params)
+
+
+def _write(sql, params=()):
+    """Thread-safe execute + commit."""
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur
+
+
 def _ensure_column(conn, table, column, ddl):
     try:
         cols = [r[1] for r in
@@ -95,72 +115,71 @@ def _ensure_column(conn, table, column, ddl):
 
 
 def init_db():
-    conn = get_conn()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS knowledge (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        topic TEXT UNIQUE, category TEXT, content TEXT,
-        refined_content TEXT, version INTEGER DEFAULT 1,
-        confidence REAL DEFAULT 0.5, created_at TEXT, updated_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS templates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE, category TEXT, content TEXT,
-        refined_content TEXT, version INTEGER DEFAULT 1,
-        confidence REAL DEFAULT 0.5, created_at TEXT, updated_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS pending_topics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT UNIQUE,
-        category TEXT, source TEXT, parent_topic TEXT, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS pending_templates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE,
-        category TEXT, source TEXT, parent_name TEXT, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS learning_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, cycle INTEGER,
-        topic_processed TEXT, items_added INTEGER DEFAULT 0,
-        items_refined INTEGER DEFAULT 0, gemini_calls INTEGER DEFAULT 0,
-        error TEXT, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS template_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, cycle INTEGER,
-        template_processed TEXT, items_added INTEGER DEFAULT 0,
-        items_refined INTEGER DEFAULT 0, gemini_calls INTEGER DEFAULT 0,
-        error TEXT, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS check_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT,
-        file_type TEXT, original_text TEXT, issues_json TEXT,
-        score REAL, summary TEXT, compliance TEXT, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS gemini_usage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_gemini_usage_ts ON gemini_usage(ts);
-    CREATE TABLE IF NOT EXISTS app_state (
-        key TEXT PRIMARY KEY, value TEXT
-    );
-    """)
-    conn.commit()
-
-    for col, ddl in [
-        ("verified", "verified INTEGER DEFAULT 0"),
-        ("flagged", "flagged INTEGER DEFAULT 0"),
-        ("phase", "phase INTEGER DEFAULT 1"),
-        ("phase_ts", "phase_ts TEXT"),
-    ]:
-        _ensure_column(conn, "knowledge", col, ddl)
-        _ensure_column(conn, "templates", col, ddl)
-    conn.commit()
+    with _db_lock:
+        conn = get_conn()
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS knowledge (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic TEXT UNIQUE, category TEXT, content TEXT,
+            refined_content TEXT, version INTEGER DEFAULT 1,
+            confidence REAL DEFAULT 0.5, created_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE, category TEXT, content TEXT,
+            refined_content TEXT, version INTEGER DEFAULT 1,
+            confidence REAL DEFAULT 0.5, created_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS pending_topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT UNIQUE,
+            category TEXT, source TEXT, parent_topic TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS pending_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE,
+            category TEXT, source TEXT, parent_name TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS learning_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, cycle INTEGER,
+            topic_processed TEXT, items_added INTEGER DEFAULT 0,
+            items_refined INTEGER DEFAULT 0, gemini_calls INTEGER DEFAULT 0,
+            error TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS template_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, cycle INTEGER,
+            template_processed TEXT, items_added INTEGER DEFAULT 0,
+            items_refined INTEGER DEFAULT 0, gemini_calls INTEGER DEFAULT 0,
+            error TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS check_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT,
+            file_type TEXT, original_text TEXT, issues_json TEXT,
+            score REAL, summary TEXT, compliance TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS gemini_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_gemini_usage_ts ON gemini_usage(ts);
+        CREATE TABLE IF NOT EXISTS app_state (
+            key TEXT PRIMARY KEY, value TEXT
+        );
+        """)
+        conn.commit()
+        for col, ddl in [
+            ("verified", "verified INTEGER DEFAULT 0"),
+            ("flagged", "flagged INTEGER DEFAULT 0"),
+            ("phase", "phase INTEGER DEFAULT 1"),
+            ("phase_ts", "phase_ts TEXT"),
+        ]:
+            _ensure_column(conn, "knowledge", col, ddl)
+            _ensure_column(conn, "templates", col, ddl)
+        conn.commit()
 
 
 # ---------------- app_state ----------------
 def get_app_state(key, default=""):
     try:
-        conn = get_conn()
-        row = conn.execute(
-            "SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+        row = _exec("SELECT value FROM app_state WHERE key=?",
+                    (key,)).fetchone()
         return row[0] if row else default
     except Exception as e:
         logger.warning("get_app_state(%s) failed: %s", key, e)
@@ -169,12 +188,10 @@ def get_app_state(key, default=""):
 
 def set_app_state(key, value):
     try:
-        conn = get_conn()
-        conn.execute("""
+        _write("""
             INSERT INTO app_state (key, value) VALUES (?,?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value
         """, (key, str(value)))
-        conn.commit()
     except Exception as e:
         logger.warning("set_app_state(%s) failed: %s", key, e)
 
@@ -191,33 +208,30 @@ def _iso_ago(seconds):
 
 def check_and_increment_gemini_usage(day_limit=600, hour_limit=40):
     try:
-        conn = get_conn()
-        day_count = conn.execute(
+        day_count = _exec(
             "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
             (_iso_ago(86400),)).fetchone()[0]
         if day_count >= day_limit:
             return False
-        hour_count = conn.execute(
+        hour_count = _exec(
             "SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
             (_iso_ago(3600),)).fetchone()[0]
         if hour_count >= hour_limit:
             return False
-        conn.execute("INSERT INTO gemini_usage (ts) VALUES (?)",
-                     (_utcnow_iso(),))
-        conn.commit()
+        _write("INSERT INTO gemini_usage (ts) VALUES (?)",
+               (_utcnow_iso(),))
         return True
     except Exception as e:
-        logger.warning("gemini_usage check failed (allowing call): %s", e)
+        logger.warning("gemini_usage check failed (allowing): %s", e)
         return True
 
 
 def gemini_usage_stats(day_limit=600, hour_limit=40):
     try:
-        conn = get_conn()
-        d = conn.execute("SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
-                         (_iso_ago(86400),)).fetchone()[0]
-        h = conn.execute("SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
-                         (_iso_ago(3600),)).fetchone()[0]
+        d = _exec("SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
+                  (_iso_ago(86400),)).fetchone()[0]
+        h = _exec("SELECT COUNT(*) FROM gemini_usage WHERE ts >= ?",
+                  (_iso_ago(3600),)).fetchone()[0]
         return {"last_24h": d, "last_1h": h,
                 "day_limit": day_limit, "hour_limit": hour_limit}
     except Exception:
@@ -229,77 +243,61 @@ def purge_old_gemini_usage(keep_days=None, keep_seconds=None):
     if keep_seconds is None:
         keep_seconds = (keep_days or 3) * 86400
     try:
-        conn = get_conn()
-        conn.execute("DELETE FROM gemini_usage WHERE ts < ?",
-                     (_iso_ago(keep_seconds),))
-        conn.commit()
+        _write("DELETE FROM gemini_usage WHERE ts < ?",
+               (_iso_ago(keep_seconds),))
     except Exception as e:
         logger.warning("purge failed: %s", e)
 
 
 # ---------------- knowledge ----------------
 def upsert_knowledge(topic, category, content, confidence=0.7):
-    conn = get_conn()
-    now = datetime.datetime.utcnow().isoformat()
-    row = conn.execute(
-        "SELECT id FROM knowledge WHERE topic = ?", (topic,)).fetchone()
+    now = _utcnow_iso()
+    row = _exec("SELECT id FROM knowledge WHERE topic = ?",
+                (topic,)).fetchone()
     if row:
-        conn.execute("""
+        _write("""
             UPDATE knowledge SET content=?, confidence=?,
                 version=version+1, updated_at=? WHERE id=?
         """, (content, confidence, now, row[0]))
-        conn.commit()
         return row[0]
-    cur = conn.execute("""
+    cur = _write("""
         INSERT INTO knowledge (topic, category, content, refined_content,
             version, confidence, phase, phase_ts, created_at, updated_at)
         VALUES (?,?,?,?,1,?,1,?,?,?)
     """, (topic, category, content, "", confidence, now, now, now))
-    conn.commit()
     return cur.lastrowid
 
 
 def get_knowledge_by_topic(topic):
-    conn = get_conn()
-    return conn.execute("SELECT * FROM knowledge WHERE topic=?",
-                        (topic,)).fetchone()
+    return _exec("SELECT * FROM knowledge WHERE topic=?", (topic,)).fetchone()
 
 
 def get_knowledge_by_id(kid):
-    conn = get_conn()
-    return conn.execute("SELECT * FROM knowledge WHERE id=?", (kid,)).fetchone()
+    return _exec("SELECT * FROM knowledge WHERE id=?", (kid,)).fetchone()
 
 
 def verify_knowledge(kid):
-    conn = get_conn()
-    conn.execute("UPDATE knowledge SET verified=1, flagged=0, "
-                 "confidence=1.0 WHERE id=?", (kid,))
-    conn.commit()
+    _write("UPDATE knowledge SET verified=1, flagged=0, "
+           "confidence=1.0 WHERE id=?", (kid,))
 
 
 def flag_knowledge(kid):
-    conn = get_conn()
-    conn.execute("UPDATE knowledge SET flagged=1, verified=0 WHERE id=?",
-                 (kid,))
-    conn.commit()
+    _write("UPDATE knowledge SET flagged=1, verified=0 WHERE id=?", (kid,))
 
 
 def clear_knowledge_flags(kid):
-    conn = get_conn()
-    conn.execute("UPDATE knowledge SET flagged=0 WHERE id=?", (kid,))
-    conn.commit()
+    _write("UPDATE knowledge SET flagged=0 WHERE id=?", (kid,))
 
 
 def get_all_knowledge(category=None, limit=500):
-    conn = get_conn()
     if category:
-        return conn.execute("""
+        return _exec("""
             SELECT id, topic, category, content, refined_content, version,
                    confidence, updated_at
             FROM knowledge WHERE category=?
             ORDER BY updated_at DESC LIMIT ?
         """, (category, limit)).fetchall()
-    return conn.execute("""
+    return _exec("""
         SELECT id, topic, category, content, refined_content, version,
                confidence, updated_at
         FROM knowledge ORDER BY updated_at DESC LIMIT ?
@@ -307,9 +305,8 @@ def get_all_knowledge(category=None, limit=500):
 
 
 def search_knowledge(query, limit=8):
-    conn = get_conn()
     like = f"%{query}%"
-    return conn.execute("""
+    return _exec("""
         SELECT id, topic, category, content, refined_content, version
         FROM knowledge
         WHERE topic LIKE ? OR content LIKE ? OR refined_content LIKE ?
@@ -318,32 +315,22 @@ def search_knowledge(query, limit=8):
 
 
 def knowledge_stats():
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
-    refined = conn.execute(
-        "SELECT COUNT(*) FROM knowledge WHERE version > 1").fetchone()[0]
-    pending = conn.execute(
-        "SELECT COUNT(*) FROM pending_topics").fetchone()[0]
-    verified = conn.execute(
+    total = _exec("SELECT COUNT(*) FROM knowledge").fetchone()[0]
+    refined = _exec("SELECT COUNT(*) FROM knowledge WHERE version > 1"
+                    ).fetchone()[0]
+    pending = _exec("SELECT COUNT(*) FROM pending_topics").fetchone()[0]
+    verified = _exec(
         "SELECT COUNT(*) FROM knowledge WHERE COALESCE(verified,0)=1"
     ).fetchone()[0]
-    flagged = conn.execute(
+    flagged = _exec(
         "SELECT COUNT(*) FROM knowledge WHERE COALESCE(flagged,0)=1"
     ).fetchone()[0]
-    # Phase stats
-    avg_phase = conn.execute(
-        "SELECT AVG(COALESCE(phase,1)) FROM knowledge").fetchone()[0] or 1.0
-    advanced = conn.execute(
-        "SELECT COUNT(*) FROM knowledge WHERE COALESCE(phase,1) > 1"
-    ).fetchone()[0]
     return {"total": total, "refined": refined, "pending": pending,
-            "verified": verified, "flagged": flagged,
-            "avg_phase": round(float(avg_phase), 2), "advanced": advanced}
+            "verified": verified, "flagged": flagged}
 
 
 def category_counts():
-    conn = get_conn()
-    return conn.execute("""
+    return _exec("""
         SELECT category, COUNT(*) FROM knowledge
         WHERE category IS NOT NULL AND category != ''
         GROUP BY category ORDER BY COUNT(*) DESC
@@ -351,8 +338,7 @@ def category_counts():
 
 
 def confidence_bins():
-    conn = get_conn()
-    rows = conn.execute(
+    rows = _exec(
         "SELECT confidence FROM knowledge WHERE confidence IS NOT NULL"
     ).fetchall()
     bins = {f"{i/10:.1f}": 0 for i in range(0, 11)}
@@ -364,105 +350,65 @@ def confidence_bins():
 
 
 def version_counts():
-    conn = get_conn()
-    return conn.execute("""
+    return _exec("""
         SELECT version, COUNT(*) FROM knowledge
         GROUP BY version ORDER BY version
     """).fetchall()
 
 
 def runs_per_cycle(limit=40):
-    conn = get_conn()
-    return conn.execute("""
+    rows = _exec("""
         SELECT cycle, items_added, items_refined
         FROM learning_runs ORDER BY id DESC LIMIT ?
-    """, (limit,)).fetchall()[::-1]
-
-
-# ---------------- phase advancement ----------------
-def phaseable_knowledge(max_phase=7, min_age_seconds=14400):
-    """Oldest knowledge row that can advance. min_age prevents one item
-    from phasing too fast."""
-    conn = get_conn()
-    cutoff = _iso_ago(min_age_seconds)
-    return conn.execute("""
-        SELECT id, topic, category, content, COALESCE(phase,1) AS phase
-        FROM knowledge
-        WHERE COALESCE(flagged,0)=0
-          AND COALESCE(verified,0)=0
-          AND COALESCE(phase,1) < ?
-          AND (phase_ts IS NULL OR phase_ts < ?)
-        ORDER BY phase ASC, COALESCE(phase_ts, created_at) ASC LIMIT 1
-    """, (max_phase, cutoff)).fetchone()
-
-
-def advance_knowledge_phase(kid, new_content, new_phase):
-    conn = get_conn()
-    now = datetime.datetime.utcnow().isoformat()
-    conn.execute("""
-        UPDATE knowledge SET content=?, phase=?, phase_ts=?, updated_at=?
-        WHERE id=?
-    """, (new_content, new_phase, now, now, kid))
-    conn.commit()
+    """, (limit,)).fetchall()
+    return rows[::-1]
 
 
 # ---------------- templates ----------------
 def upsert_template(name, category, content, confidence=0.7):
-    conn = get_conn()
-    now = datetime.datetime.utcnow().isoformat()
-    row = conn.execute(
-        "SELECT id FROM templates WHERE name = ?", (name,)).fetchone()
+    now = _utcnow_iso()
+    row = _exec("SELECT id FROM templates WHERE name = ?",
+                (name,)).fetchone()
     if row:
-        conn.execute("""
+        _write("""
             UPDATE templates SET content=?, confidence=?,
                 version=version+1, updated_at=? WHERE id=?
         """, (content, confidence, now, row[0]))
-        conn.commit()
         return row[0]
-    cur = conn.execute("""
+    cur = _write("""
         INSERT INTO templates (name, category, content, refined_content,
             version, confidence, phase, phase_ts, created_at, updated_at)
         VALUES (?,?,?,?,1,?,1,?,?,?)
     """, (name, category, content, "", confidence, now, now, now))
-    conn.commit()
     return cur.lastrowid
 
 
 def get_template_by_name(name):
-    conn = get_conn()
-    return conn.execute("SELECT * FROM templates WHERE name=?",
-                        (name,)).fetchone()
+    return _exec("SELECT * FROM templates WHERE name=?", (name,)).fetchone()
 
 
 def get_template_by_id(tid):
-    conn = get_conn()
-    return conn.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
+    return _exec("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
 
 
 def verify_template(tid):
-    conn = get_conn()
-    conn.execute("UPDATE templates SET verified=1, flagged=0, "
-                 "confidence=1.0 WHERE id=?", (tid,))
-    conn.commit()
+    _write("UPDATE templates SET verified=1, flagged=0, "
+           "confidence=1.0 WHERE id=?", (tid,))
 
 
 def flag_template(tid):
-    conn = get_conn()
-    conn.execute("UPDATE templates SET flagged=1, verified=0 WHERE id=?",
-                 (tid,))
-    conn.commit()
+    _write("UPDATE templates SET flagged=1, verified=0 WHERE id=?", (tid,))
 
 
 def get_all_templates(category=None, limit=200):
-    conn = get_conn()
     if category:
-        return conn.execute("""
+        return _exec("""
             SELECT id, name, category, content, refined_content, version,
                    confidence, updated_at
             FROM templates WHERE category=?
             ORDER BY updated_at DESC LIMIT ?
         """, (category, limit)).fetchall()
-    return conn.execute("""
+    return _exec("""
         SELECT id, name, category, content, refined_content, version,
                confidence, updated_at
         FROM templates ORDER BY updated_at DESC LIMIT ?
@@ -470,8 +416,7 @@ def get_all_templates(category=None, limit=200):
 
 
 def template_category_counts():
-    conn = get_conn()
-    return conn.execute("""
+    return _exec("""
         SELECT category, COUNT(*) FROM templates
         WHERE category IS NOT NULL AND category != ''
         GROUP BY category ORDER BY COUNT(*) DESC
@@ -479,147 +424,102 @@ def template_category_counts():
 
 
 def template_stats():
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM templates").fetchone()[0]
-    refined = conn.execute(
-        "SELECT COUNT(*) FROM templates WHERE version > 1").fetchone()[0]
-    pending = conn.execute(
-        "SELECT COUNT(*) FROM pending_templates").fetchone()[0]
-    verified = conn.execute(
+    total = _exec("SELECT COUNT(*) FROM templates").fetchone()[0]
+    refined = _exec("SELECT COUNT(*) FROM templates WHERE version > 1"
+                    ).fetchone()[0]
+    pending = _exec("SELECT COUNT(*) FROM pending_templates").fetchone()[0]
+    verified = _exec(
         "SELECT COUNT(*) FROM templates WHERE COALESCE(verified,0)=1"
     ).fetchone()[0]
-    flagged = conn.execute(
+    flagged = _exec(
         "SELECT COUNT(*) FROM templates WHERE COALESCE(flagged,0)=1"
     ).fetchone()[0]
-    avg_phase = conn.execute(
-        "SELECT AVG(COALESCE(phase,1)) FROM templates").fetchone()[0] or 1.0
-    advanced = conn.execute(
-        "SELECT COUNT(*) FROM templates WHERE COALESCE(phase,1) > 1"
-    ).fetchone()[0]
     return {"total": total, "refined": refined, "pending": pending,
-            "verified": verified, "flagged": flagged,
-            "avg_phase": round(float(avg_phase), 2), "advanced": advanced}
-
-
-def phaseable_template(max_phase=7, min_age_seconds=14400):
-    conn = get_conn()
-    cutoff = _iso_ago(min_age_seconds)
-    return conn.execute("""
-        SELECT id, name, category, content, COALESCE(phase,1) AS phase
-        FROM templates
-        WHERE COALESCE(flagged,0)=0
-          AND COALESCE(verified,0)=0
-          AND COALESCE(phase,1) < ?
-          AND (phase_ts IS NULL OR phase_ts < ?)
-        ORDER BY phase ASC, COALESCE(phase_ts, created_at) ASC LIMIT 1
-    """, (max_phase, cutoff)).fetchone()
-
-
-def advance_template_phase(tid, new_content, new_phase):
-    conn = get_conn()
-    now = datetime.datetime.utcnow().isoformat()
-    conn.execute("""
-        UPDATE templates SET content=?, phase=?, phase_ts=?, updated_at=?
-        WHERE id=?
-    """, (new_content, new_phase, now, now, tid))
-    conn.commit()
+            "verified": verified, "flagged": flagged}
 
 
 # ---------------- pending queues ----------------
 def add_pending_topic(topic, category, source="ai", parent_topic=""):
-    conn = get_conn()
     topic = (topic or "").strip()
     category = (category or "").strip() or "general"
     if not topic or len(topic) < 6:
         return False
-    ex = conn.execute(
-        "SELECT 1 FROM knowledge WHERE topic = ?", (topic,)).fetchone()
+    ex = _exec("SELECT 1 FROM knowledge WHERE topic = ?",
+               (topic,)).fetchone()
     if ex:
         return False
     try:
-        conn.execute("""
+        _write("""
             INSERT OR IGNORE INTO pending_topics
             (topic, category, source, parent_topic, created_at)
             VALUES (?,?,?,?,?)
         """, (topic, category, source, parent_topic, _utcnow_iso()))
-        conn.commit()
         return True
     except Exception:
         return False
 
 
 def pop_pending_topic():
-    conn = get_conn()
-    row = conn.execute("""
+    row = _exec("""
         SELECT id, topic, category FROM pending_topics
         ORDER BY id ASC LIMIT 1
     """).fetchone()
     if not row:
         return None
-    conn.execute("DELETE FROM pending_topics WHERE id = ?", (row[0],))
-    conn.commit()
+    _write("DELETE FROM pending_topics WHERE id = ?", (row[0],))
     return (row[1], row[2])
 
 
 def pending_count():
-    conn = get_conn()
-    return conn.execute("SELECT COUNT(*) FROM pending_topics").fetchone()[0]
+    return _exec("SELECT COUNT(*) FROM pending_topics").fetchone()[0]
 
 
 def add_pending_template(name, category, source="ai", parent_name=""):
-    conn = get_conn()
     name = (name or "").strip()
     category = (category or "").strip() or "administrative"
     if not name or len(name) < 6:
         return False
-    ex = conn.execute(
-        "SELECT 1 FROM templates WHERE name = ?", (name,)).fetchone()
+    ex = _exec("SELECT 1 FROM templates WHERE name = ?",
+               (name,)).fetchone()
     if ex:
         return False
     try:
-        conn.execute("""
+        _write("""
             INSERT OR IGNORE INTO pending_templates
             (name, category, source, parent_name, created_at)
             VALUES (?,?,?,?,?)
         """, (name, category, source, parent_name, _utcnow_iso()))
-        conn.commit()
         return True
     except Exception:
         return False
 
 
 def pop_pending_template():
-    conn = get_conn()
-    row = conn.execute("""
+    row = _exec("""
         SELECT id, name, category FROM pending_templates
         ORDER BY id ASC LIMIT 1
     """).fetchone()
     if not row:
         return None
-    conn.execute("DELETE FROM pending_templates WHERE id = ?", (row[0],))
-    conn.commit()
+    _write("DELETE FROM pending_templates WHERE id = ?", (row[0],))
     return (row[1], row[2])
 
 
 def pending_template_count():
-    conn = get_conn()
-    return conn.execute("SELECT COUNT(*) FROM pending_templates").fetchone()[0]
+    return _exec("SELECT COUNT(*) FROM pending_templates").fetchone()[0]
 
 
 # ---------------- runs ----------------
 def log_learning_run(cycle, topic, added, refined, calls, error=""):
-    conn = get_conn()
-    conn.execute("""
+    _write("""
         INSERT INTO learning_runs (cycle, topic_processed, items_added,
             items_refined, gemini_calls, error, created_at)
         VALUES (?,?,?,?,?,?,?)
     """, (cycle, topic, added, refined, calls, error[:500], _utcnow_iso()))
-    conn.commit()
 
 
 def recent_learning_runs(limit=20):
-    conn = get_conn()
-    return conn.execute("""
+    return _exec("""
         SELECT cycle, topic_processed, items_added, items_refined,
                gemini_calls, error, created_at
         FROM learning_runs ORDER BY id DESC LIMIT ?
@@ -627,18 +527,15 @@ def recent_learning_runs(limit=20):
 
 
 def log_template_run(cycle, name, added, refined, calls, error=""):
-    conn = get_conn()
-    conn.execute("""
+    _write("""
         INSERT INTO template_runs (cycle, template_processed, items_added,
             items_refined, gemini_calls, error, created_at)
         VALUES (?,?,?,?,?,?,?)
     """, (cycle, name, added, refined, calls, error[:500], _utcnow_iso()))
-    conn.commit()
 
 
 def recent_template_runs(limit=20):
-    conn = get_conn()
-    return conn.execute("""
+    return _exec("""
         SELECT cycle, template_processed, items_added, items_refined,
                gemini_calls, error, created_at
         FROM template_runs ORDER BY id DESC LIMIT ?
@@ -647,20 +544,17 @@ def recent_template_runs(limit=20):
 
 def save_check_report(filename, file_type, original_text, issues,
                       score, summary, compliance=""):
-    conn = get_conn()
-    cur = conn.execute("""
+    cur = _write("""
         INSERT INTO check_reports (filename, file_type, original_text,
             issues_json, score, summary, compliance, created_at)
         VALUES (?,?,?,?,?,?,?,?)
     """, (filename, file_type, original_text, json.dumps(issues),
           score, summary, compliance, _utcnow_iso()))
-    conn.commit()
     return cur.lastrowid
 
 
 def recent_check_reports(limit=50):
-    conn = get_conn()
-    return conn.execute("""
+    return _exec("""
         SELECT id, filename, file_type, score, summary, created_at
         FROM check_reports ORDER BY id DESC LIMIT ?
     """, (limit,)).fetchall()
