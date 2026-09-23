@@ -1705,14 +1705,6 @@ async def dashboard_page():
         ui.timer(30.0, refresh_tpl_runs)
         await refresh_tpl_runs()
         
-# --- redirect every visitor to the new Cloudflare site ---
-from fastapi import Request as _Req
-from fastapi.responses import RedirectResponse as _Redir
-_NEW_SITE = os.getenv("NEW_SITE_URL", "https://hubx.mohamedabdalaty63.workers.dev")
-
-@app.middleware("http")
-async def _redirect_all(request: _Req, call_next):
-    return _Redir(_NEW_SITE, status_code=302)
 
 ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx",
        storage_secret=os.getenv("STORAGE_SECRET", "hubx-dev-secret"))
