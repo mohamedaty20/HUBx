@@ -1,14 +1,15 @@
 # db.py
-# v11: thread-safe connection. Every DB op holds an RLock so dashboard
-#      timers and the engine thread can't collide on libsql's connection.
+# v12: Cloudflare D1 backend via REST API. Local SQLite fallback for dev.
+#      Same public API as before — nothing else in the project changes.
 
 import os
 import json
 import datetime
 import logging
 import threading
+import sqlite3
 
-import libsql
+import httpx
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -23,36 +24,115 @@ def _clean(v):
     return v
 
 
-def _find_url():
-    for k, v in os.environ.items():
-        v = _clean(v)
-        if v.startswith("libsql://"):
-            return k, v
-    return None, ""
+# ------------------------------------------------------------------
+# D1 credentials (all three must be present to use D1)
+# ------------------------------------------------------------------
+def _find_d1_creds():
+    account_id = _clean(os.getenv("CLOUDFLARE_ACCOUNT_ID", ""))
+    database_id = _clean(os.getenv("CLOUDFLARE_D1_DATABASE_ID", ""))
+    api_token = _clean(os.getenv("CLOUDFLARE_API_TOKEN", ""))
+    return account_id, database_id, api_token
 
 
-def _find_token():
-    for k, v in os.environ.items():
-        v = _clean(v)
-        if v.startswith("eyJ") and len(v) > 100:
-            return k, v
-    return None, ""
+# ------------------------------------------------------------------
+# D1 HTTP connection (mimics the libsql connection surface we need)
+# ------------------------------------------------------------------
+class _D1Cursor:
+    """Cursor-like object returned by _D1Connection.execute()."""
+
+    def __init__(self, rows=None, lastrowid=None):
+        self._rows = rows or []
+        self._idx = 0
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        if self._idx < len(self._rows):
+            row = self._rows[self._idx]
+            self._idx += 1
+            return row
+        return None
+
+    def fetchall(self):
+        remaining = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return remaining
 
 
-_URL_KEY, _TURSO_URL_RAW = _find_url()
-_TOKEN_KEY, _TURSO_TOKEN_RAW = _find_token()
+class _D1Connection:
+    """
+    Minimal synchronous wrapper around Cloudflare D1's /raw REST endpoint.
+    Exposes .execute(sql, params), .executescript(sql), .commit().
+    Rows are returned as tuples/arrays (same as libsql / sqlite3).
+    """
 
+    _BASE = "https://api.cloudflare.com/client/v4/accounts"
+
+    def __init__(self, account_id, database_id, api_token):
+        self._account_id = account_id
+        self._database_id = database_id
+        self._api_token = api_token
+        self._url = (
+            f"{self._BASE}/{account_id}/d1/database/{database_id}/raw"
+        )
+        self._headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json",
+        }
+        self._client = httpx.Client(timeout=30.0)
+
+    def _post(self, sql, params=None):
+        payload = {"sql": sql}
+        if params:
+            payload["params"] = list(params)
+        resp = self._client.post(
+            self._url, json=payload, headers=self._headers
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            errors = data.get("errors") or data
+            raise RuntimeError(f"D1 query failed: {errors}")
+        return data["result"][0]
+
+    def execute(self, sql, params=()):
+        result = self._post(sql, params)
+        rows = (result.get("results") or {}).get("rows") or []
+        last_id = (result.get("meta") or {}).get("last_row_id")
+        return _D1Cursor(rows, lastrowid=last_id)
+
+    def executescript(self, script):
+        # Split on ';' and run each statement. The schema in init_db()
+        # contains no semicolons inside string literals, so this is safe.
+        for stmt in script.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self.execute(stmt)
+
+    def commit(self):
+        # D1 auto-commits every statement.
+        pass
+
+    def close(self):
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------
+# Connection singleton
+# ------------------------------------------------------------------
 _conn = None
 _db_mode = "not connected"
 _db_error = ""
 
 
-def _try_turso():
-    if not _TURSO_URL_RAW.startswith("libsql://"):
-        raise ValueError("no libsql:// URL found")
-    if not _TURSO_TOKEN_RAW:
-        raise ValueError("no Turso token found")
-    conn = libsql.connect(_TURSO_URL_RAW, auth_token=_TURSO_TOKEN_RAW)
+def _try_d1():
+    account_id, database_id, api_token = _find_d1_creds()
+    if not (account_id and database_id and api_token):
+        raise ValueError("Cloudflare D1 credentials not set")
+    conn = _D1Connection(account_id, database_id, api_token)
+    # Smoke-test
     conn.execute("SELECT 1").fetchone()
     return conn
 
@@ -62,27 +142,29 @@ def get_conn():
     if _conn is not None:
         return _conn
     try:
-        _conn = _try_turso()
-        _db_mode = "turso"
+        _conn = _try_d1()
+        _db_mode = "d1"
         _db_error = ""
-        print(f"DB MODE = turso ({_TURSO_URL_RAW[:40]}...)")
+        db_id = _find_d1_creds()[1]
+        print(f"DB MODE = d1 ({db_id[:20]}...)")
         return _conn
     except Exception as e:
         _db_error = f"{type(e).__name__}: {e}"
-        print(f"Turso failed: {_db_error}")
-    _conn = libsql.connect("hubx.db")
+        print(f"D1 failed: {_db_error}")
+    # Fallback: local SQLite (dev only)
+    _conn = sqlite3.connect("hubx.db", check_same_thread=False)
     _db_mode = "local"
     print("DB MODE = local SQLite")
     return _conn
 
 
 def db_health():
+    account_id, database_id, api_token = _find_d1_creds()
     return {
         "mode": _db_mode,
-        "connection": _TURSO_URL_RAW[:40] if _db_mode == "turso"
-                      else "hubx.db",
+        "connection": database_id[:20] if _db_mode == "d1" else "hubx.db",
         "error": _db_error,
-        "ok": _db_mode == "turso",
+        "ok": _db_mode == "d1",
     }
 
 
@@ -174,6 +256,12 @@ def init_db():
             _ensure_column(conn, "templates", col, ddl)
         conn.commit()
 
+
+# ==================================================================
+# The rest of the file is IDENTICAL to your original db.py
+# (app_state, gemini usage, knowledge, templates, pending queues,
+#  runs, check_reports — all unchanged)
+# ==================================================================
 
 # ---------------- app_state ----------------
 def get_app_state(key, default=""):
