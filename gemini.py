@@ -1,7 +1,5 @@
 # gemini.py
-# v19: gpt-oss-20b is a reasoning model — reasoning_effort=low + bigger
-#      budget. Otherwise the whole budget is burned by internal thinking
-#      and content comes back empty.
+# v20: suggest_subtemplates now returns category alongside name.
 
 import os
 import re
@@ -317,10 +315,14 @@ async def suggest_subtopics(parent_topic, category, n=2):
 async def suggest_subtemplates(parent_name, category, n=2):
     prompt = (
         f"Return a JSON object with one key 'templates' whose value is "
-        f"an array of exactly {n} short bilingual strings. "
-        f"Category: {category}. Parent: {parent_name}. "
-        "Each string: 'English Name / الاسم بالعربية'. English part "
-        "4-8 words. Output under 200 tokens."
+        f"an array of objects. Each object has a 'name' string and a "
+        f"'category' string. "
+        f"Category must be one of: administrative, quality, safety, "
+        f"technical, financial, legal, handover. "
+        f"Parent category: {category}. Parent name: {parent_name}. "
+        f"Propose exactly {n} new bilingual template names. "
+        f"Name format: 'English Name / الاسم بالعربية'. English part 4-8 words. "
+        "Output under 300 tokens."
     )
     raw = await _call(prompt, json_mode=True, max_tokens=2500)
     if not raw:
@@ -335,8 +337,20 @@ async def suggest_subtemplates(parent_name, category, n=2):
                     data = data[key]
                     break
         if isinstance(data, list):
-            return [sanitize_text(str(x)).strip() for x in data
-                    if isinstance(x, (str, int)) and str(x).strip()]
+            result = []
+            for x in data:
+                if isinstance(x, dict) and "name" in x:
+                    name_val = sanitize_text(str(x["name"])).strip()
+                    cat_val = sanitize_text(str(x.get("category", category))).strip().lower()
+                    # Validate category
+                    valid_cats = ["administrative", "quality", "safety", "technical", "financial", "legal", "handover"]
+                    if cat_val not in valid_cats:
+                        cat_val = category  # fallback to parent
+                    result.append({"name": name_val, "category": cat_val})
+                elif isinstance(x, str):
+                    # backward compatibility if AI ignores format
+                    result.append({"name": sanitize_text(x).strip(), "category": category})
+            return result
     except Exception:
         pass
     return []
