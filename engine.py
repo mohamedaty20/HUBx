@@ -1,5 +1,5 @@
 # engine.py
-# v10: phase advancement removed. Back to generate-only.
+# v11: template_step now uses the AI's suggested category.
 
 from __future__ import annotations
 import asyncio
@@ -275,9 +275,10 @@ class Engine:
                     "Egyptian construction site template", "quality", n=1)
                 self.gemini_calls += 1
                 if subs:
-                    t = subs[0]
+                    t = subs[0].get("name", "")
+                    c = subs[0].get("category", "quality")
                     if not _existing_template(t):
-                        name, category = t, "quality"
+                        name, category = t, c
             except Exception as e:
                 print(f"[engine] fresh template suggestion failed: {e}")
 
@@ -303,7 +304,9 @@ class Engine:
             self.gemini_calls += 1
             added = 0
             for s in subs:
-                if _db.add_pending_template(s, category, "ai", name):
+                s_name = s.get("name", "")
+                s_cat = s.get("category", category)
+                if _db.add_pending_template(s_name, s_cat, "ai", name):
                     added += 1
             self.last_debug = f"generated: {name} (+{added} queued)"
         except Exception as e:
