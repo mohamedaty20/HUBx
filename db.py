@@ -1,8 +1,12 @@
 # db.py
-# v12: Cloudflare D1 backend via REST API. Local SQLite fallback for dev.
-#      Same public API as before — nothing else in the project changes.
+# v13: Canonical matching + deduplication.
+#      - upsert_knowledge / upsert_template now match by normalized name
+#      - deduplicate_all() merges near-duplicate rows, keeping the highest
+#        version, so the UI shows only the newest version of each row.
+#      - Same public API as before.
 
 import os
+import re
 import json
 import datetime
 import logging
@@ -25,7 +29,31 @@ def _clean(v):
 
 
 # ------------------------------------------------------------------
-# D1 credentials (all three must be present to use D1)
+# Canonicalization: reduce a name to a normalized form so that
+# "Concrete Pour Record (بيان)" and "concrete pour record" match.
+# ------------------------------------------------------------------
+_WS_RE = re.compile(r"\s+")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _canonical(s: str) -> str:
+    """Normalize a template/topic name for duplicate detection."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    # Drop the Arabic part if " / " is present
+    if " / " in s:
+        s = s.split(" / ", 1)[0]
+    # Drop any parenthesized content (Arabic side, notes, etc.)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = s.lower()
+    s = _NON_ALNUM_RE.sub(" ", s)
+    s = _WS_RE.sub(" ", s).strip()
+    return s
+
+
+# ------------------------------------------------------------------
+# D1 credentials
 # ------------------------------------------------------------------
 def _find_d1_creds():
     account_id = _clean(os.getenv("CLOUDFLARE_ACCOUNT_ID", ""))
@@ -35,11 +63,9 @@ def _find_d1_creds():
 
 
 # ------------------------------------------------------------------
-# D1 HTTP connection (mimics the libsql connection surface we need)
+# D1 HTTP connection
 # ------------------------------------------------------------------
 class _D1Cursor:
-    """Cursor-like object returned by _D1Connection.execute()."""
-
     def __init__(self, rows=None, lastrowid=None):
         self._rows = rows or []
         self._idx = 0
@@ -59,12 +85,6 @@ class _D1Cursor:
 
 
 class _D1Connection:
-    """
-    Minimal synchronous wrapper around Cloudflare D1's /raw REST endpoint.
-    Exposes .execute(sql, params), .executescript(sql), .commit().
-    Rows are returned as tuples/arrays (same as libsql / sqlite3).
-    """
-
     _BASE = "https://api.cloudflare.com/client/v4/accounts"
 
     def __init__(self, account_id, database_id, api_token):
@@ -101,15 +121,12 @@ class _D1Connection:
         return _D1Cursor(rows, lastrowid=last_id)
 
     def executescript(self, script):
-        # Split on ';' and run each statement. The schema in init_db()
-        # contains no semicolons inside string literals, so this is safe.
         for stmt in script.split(";"):
             stmt = stmt.strip()
             if stmt:
                 self.execute(stmt)
 
     def commit(self):
-        # D1 auto-commits every statement.
         pass
 
     def close(self):
@@ -119,9 +136,6 @@ class _D1Connection:
             pass
 
 
-# ------------------------------------------------------------------
-# Connection singleton
-# ------------------------------------------------------------------
 _conn = None
 _db_mode = "not connected"
 _db_error = ""
@@ -132,7 +146,6 @@ def _try_d1():
     if not (account_id and database_id and api_token):
         raise ValueError("Cloudflare D1 credentials not set")
     conn = _D1Connection(account_id, database_id, api_token)
-    # Smoke-test
     conn.execute("SELECT 1").fetchone()
     return conn
 
@@ -151,7 +164,6 @@ def get_conn():
     except Exception as e:
         _db_error = f"{type(e).__name__}: {e}"
         print(f"D1 failed: {_db_error}")
-    # Fallback: local SQLite (dev only)
     _conn = sqlite3.connect("hubx.db", check_same_thread=False)
     _db_mode = "local"
     print("DB MODE = local SQLite")
@@ -169,14 +181,12 @@ def db_health():
 
 
 def _exec(sql, params=()):
-    """Thread-safe execute. Returns a cursor."""
     with _db_lock:
         conn = get_conn()
         return conn.execute(sql, params)
 
 
 def _write(sql, params=()):
-    """Thread-safe execute + commit."""
     with _db_lock:
         conn = get_conn()
         cur = conn.execute(sql, params)
@@ -258,10 +268,118 @@ def init_db():
 
 
 # ==================================================================
-# The rest of the file is IDENTICAL to your original db.py
-# (app_state, gemini usage, knowledge, templates, pending queues,
-#  runs, check_reports — all unchanged)
+# DEDUPLICATION
 # ==================================================================
+def _dedupe_table(table, name_col):
+    """Group rows by canonical name, delete all but the best version."""
+    try:
+        rows = _exec(
+            f"SELECT id, {name_col}, version, updated_at FROM {table}"
+        ).fetchall()
+    except Exception as e:
+        logger.warning("dedupe %s: fetch failed: %s", table, e)
+        return 0
+    groups = {}
+    for r in rows:
+        rid = r[0]
+        name = r[1] or ""
+        ver = r[2] or 1
+        upd = r[3] or ""
+        canon = _canonical(name)
+        if not canon:
+            continue
+        groups.setdefault(canon, []).append(
+            {"id": rid, "ver": int(ver), "upd": str(upd)}
+        )
+    deleted = 0
+    for canon, items in groups.items():
+        if len(items) <= 1:
+            continue
+        # keep the highest version; tie-break by newest updated_at
+        items.sort(key=lambda x: (x["ver"], x["upd"]), reverse=True)
+        for it in items[1:]:
+            try:
+                _write(f"DELETE FROM {table} WHERE id=?", (it["id"],))
+                deleted += 1
+            except Exception as e:
+                logger.warning("dedupe delete %s id=%s failed: %s",
+                               table, it["id"], e)
+    if deleted:
+        print(f"[dedupe] {table}: removed {deleted} duplicate row(s)")
+    return deleted
+
+
+def _dedupe_pending(table, name_col):
+    """Same idea for pending queues."""
+    try:
+        rows = _exec(f"SELECT id, {name_col} FROM {table}").fetchall()
+    except Exception:
+        return 0
+    seen = {}
+    to_delete = []
+    for r in rows:
+        rid = r[0]
+        name = r[1] or ""
+        canon = _canonical(name)
+        if not canon:
+            continue
+        if canon in seen:
+            to_delete.append(rid)
+        else:
+            seen[canon] = rid
+    deleted = 0
+    for rid in to_delete:
+        try:
+            _write(f"DELETE FROM {table} WHERE id=?", (rid,))
+            deleted += 1
+        except Exception:
+            pass
+    if deleted:
+        print(f"[dedupe] {table}: removed {deleted} duplicate row(s)")
+    return deleted
+
+
+def deduplicate_all():
+    """Remove all near-duplicate rows from knowledge, templates, and queues."""
+    d1 = _dedupe_table("templates", "name")
+    d2 = _dedupe_table("knowledge", "topic")
+    d3 = _dedupe_pending("pending_templates", "name")
+    d4 = _dedupe_pending("pending_topics", "topic")
+    return {"templates": d1, "knowledge": d2,
+            "pending_templates": d3, "pending_topics": d4}
+
+
+# ==================================================================
+# Canonical existence checks
+# ==================================================================
+def template_canonical_exists(name) -> bool:
+    """Return True if a template with the same canonical name exists."""
+    canon = _canonical(name)
+    if not canon:
+        return False
+    try:
+        rows = _exec("SELECT name FROM templates").fetchall()
+        for r in rows:
+            if _canonical(r[0]) == canon:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def knowledge_canonical_exists(topic) -> bool:
+    canon = _canonical(topic)
+    if not canon:
+        return False
+    try:
+        rows = _exec("SELECT topic FROM knowledge").fetchall()
+        for r in rows:
+            if _canonical(r[0]) == canon:
+                return True
+    except Exception:
+        pass
+    return False
+
 
 # ---------------- app_state ----------------
 def get_app_state(key, default=""):
@@ -339,14 +457,34 @@ def purge_old_gemini_usage(keep_days=None, keep_seconds=None):
 
 # ---------------- knowledge ----------------
 def upsert_knowledge(topic, category, content, confidence=0.7):
+    """Insert or update a knowledge row.
+
+    Match order:
+      1. exact topic name
+      2. canonical topic name (catches near-duplicates)
+
+    If matched, the existing row is updated and its version bumps.
+    """
     now = _utcnow_iso()
     row = _exec("SELECT id FROM knowledge WHERE topic = ?",
                 (topic,)).fetchone()
+    if not row:
+        # canonical fallback
+        canon = _canonical(topic)
+        if canon:
+            try:
+                all_rows = _exec("SELECT id, topic FROM knowledge").fetchall()
+                for r in all_rows:
+                    if _canonical(r[1]) == canon:
+                        row = (r[0],)
+                        break
+            except Exception:
+                pass
     if row:
         _write("""
-            UPDATE knowledge SET content=?, confidence=?,
-                version=version+1, updated_at=? WHERE id=?
-        """, (content, confidence, now, row[0]))
+            UPDATE knowledge SET topic=?, category=?, content=?,
+                confidence=?, version=version+1, updated_at=? WHERE id=?
+        """, (topic, category, content, confidence, now, row[0]))
         return row[0]
     cur = _write("""
         INSERT INTO knowledge (topic, category, content, refined_content,
@@ -454,14 +592,33 @@ def runs_per_cycle(limit=40):
 
 # ---------------- templates ----------------
 def upsert_template(name, category, content, confidence=0.7):
+    """Insert or update a template row.
+
+    Match order:
+      1. exact name
+      2. canonical name (catches near-duplicates)
+
+    If matched, the existing row is updated and its version bumps.
+    """
     now = _utcnow_iso()
     row = _exec("SELECT id FROM templates WHERE name = ?",
                 (name,)).fetchone()
+    if not row:
+        canon = _canonical(name)
+        if canon:
+            try:
+                all_rows = _exec("SELECT id, name FROM templates").fetchall()
+                for r in all_rows:
+                    if _canonical(r[1]) == canon:
+                        row = (r[0],)
+                        break
+            except Exception:
+                pass
     if row:
         _write("""
-            UPDATE templates SET content=?, confidence=?,
-                version=version+1, updated_at=? WHERE id=?
-        """, (content, confidence, now, row[0]))
+            UPDATE templates SET name=?, category=?, content=?,
+                confidence=?, version=version+1, updated_at=? WHERE id=?
+        """, (name, category, content, confidence, now, row[0]))
         return row[0]
     cur = _write("""
         INSERT INTO templates (name, category, content, refined_content,
@@ -532,10 +689,23 @@ def add_pending_topic(topic, category, source="ai", parent_topic=""):
     category = (category or "").strip() or "general"
     if not topic or len(topic) < 6:
         return False
+    # Exact check in knowledge
     ex = _exec("SELECT 1 FROM knowledge WHERE topic = ?",
                (topic,)).fetchone()
     if ex:
         return False
+    # Canonical check in knowledge
+    if knowledge_canonical_exists(topic):
+        return False
+    # Canonical check in pending queue (avoid stacking near-dupes)
+    try:
+        pend = _exec("SELECT topic FROM pending_topics").fetchall()
+        canon = _canonical(topic)
+        for p in pend:
+            if _canonical(p[0]) == canon:
+                return False
+    except Exception:
+        pass
     try:
         _write("""
             INSERT OR IGNORE INTO pending_topics
@@ -567,10 +737,23 @@ def add_pending_template(name, category, source="ai", parent_name=""):
     category = (category or "").strip() or "administrative"
     if not name or len(name) < 6:
         return False
+    # Exact check in templates
     ex = _exec("SELECT 1 FROM templates WHERE name = ?",
                (name,)).fetchone()
     if ex:
         return False
+    # Canonical check in templates
+    if template_canonical_exists(name):
+        return False
+    # Canonical check in pending queue
+    try:
+        pend = _exec("SELECT name FROM pending_templates").fetchall()
+        canon = _canonical(name)
+        for p in pend:
+            if _canonical(p[0]) == canon:
+                return False
+    except Exception:
+        pass
     try:
         _write("""
             INSERT OR IGNORE INTO pending_templates
