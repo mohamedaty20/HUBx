@@ -1,6 +1,5 @@
 # prompts.py
-# v6: added PHASE_SYSTEM_PROMPT and PHASE_USER_TEMPLATE for 8-phase
-#     progressive expansion. Base knowledge/template prompts unchanged.
+# v7: suggest_subtemplates now asks for category per template.
 
 KNOWLEDGE_SYSTEM_PROMPT = """
 You are a senior civil quality engineer with 25 years of site experience in
@@ -303,7 +302,11 @@ SUGGEST_TOPICS_USER = (
 SUGGEST_TEMPLATES_SYSTEM = (
     "Return ONLY a JSON object with one key: templates, whose value is an "
     "array of objects. Each object has a name and category string. "
-    "Names must be bilingual: 'English Name / الاسم بالعربية'. "
+    "Name must be bilingual: 'English Name / الاسم بالعربية'. "
+    "Category must be one of: administrative, quality, safety, technical, "
+    "financial, legal, handover. "
+    "Use the parent's category as a default, but if the new template "
+    "clearly belongs to a different category, use that one instead. "
     "No HTML, no markdown fences."
 )
 
@@ -311,7 +314,8 @@ SUGGEST_TEMPLATES_USER = (
     "Parent template: {name}\n"
     "Parent category: {category}\n\n"
     "Propose exactly {n} new bilingual template names. "
-    "Format: 'English / العربية'."
+    "Format: 'English / العربية' for the name field. "
+    "Return a JSON object with 'name' and 'category' for each."
 )
 
 MIN_DOMAIN_DELAY = 3.0
