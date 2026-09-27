@@ -1,6 +1,5 @@
 # main.py
-# v14: phase system controls on dashboard. Focus buttons.
-#      Everything else unchanged.
+# v15: D1 backend banner. Everything else unchanged.
 
 import os
 import io
@@ -640,16 +639,16 @@ def _db_banner():
             ui.label("⚠").style("color:#f6a623;font-weight:700;"
                                 "font-size:1.1rem;flex-shrink:0")
             ui.label("Local SQLite - data lost on redeploy. Set "
-                     "TURSO_DATABASE_URL on Render.").style(
+                     "Cloudflare D1 environment variables on Render.").style(
                 "color:#ffc270;font-size:0.85rem")
-    elif h["mode"] == "turso":
+    elif h["mode"] in ("d1", "turso"):
         with ui.row().classes("items-center gap-2 p-2 rounded w-full "
                               "mt-1 flex-wrap").style(
                 "background:rgba(34,211,166,0.10);"
                 "border:1px solid rgba(34,211,166,0.30);"):
             ui.label("✓").style("color:#22d3a6;font-weight:700;"
                                 "font-size:1.1rem;flex-shrink:0")
-            ui.label("Connected to Turso - data persists").style(
+            ui.label("Connected to Cloudflare D1 - data persists").style(
                 "color:#6ff0cb;font-size:0.85rem")
 
 
