@@ -1,5 +1,5 @@
 # main.py
-# v15: D1 backend banner. Everything else unchanged.
+# v16: runs deduplicate_all() on startup.
 
 import os
 import io
@@ -23,7 +23,8 @@ from db import (init_db, get_all_knowledge, get_knowledge_by_id,
                 gemini_usage_stats,
                 get_app_state, set_app_state,
                 verify_knowledge, flag_knowledge, clear_knowledge_flags,
-                verify_template, flag_template)
+                verify_template, flag_template,
+                deduplicate_all)
 from engine import engine, auto_start_if_needed
 from file_reader import extract_text
 from gemini import check_document, ai_search
@@ -166,6 +167,13 @@ def is_rtl() -> bool:
     return STATE.lang == "ar"
 
 init_db()
+
+# Clean up any duplicate rows that already exist in D1.
+try:
+    _dedup_result = deduplicate_all()
+    print(f"[startup] deduplicate_all -> {_dedup_result}")
+except Exception as _e:
+    print(f"[startup] deduplicate_all failed: {_e}")
 
 ui.add_head_html("""
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1556,7 +1564,6 @@ async def dashboard_page():
         quota_label = ui.label("").style(
             "color:var(--hubx-text-dim);font-size:0.82rem")
 
-        # Max phase control
         with ui.row().classes("gap-2 items-center mt-2 flex-wrap"):
             ui.label(t("max_phase_label")).style(
                 "color:var(--hubx-text-dim);font-size:0.85rem")
@@ -1577,6 +1584,15 @@ async def dashboard_page():
                     ui.notify(f"Save failed: {e}", color="red")
             ui.button(t("save"), on_click=save_max_phase).classes(
                 "hubx-btn hubx-btn-ghost")
+
+        async def do_dedup():
+            ui.notify("Running duplicate cleanup…")
+            try:
+                res = await asyncio.to_thread(deduplicate_all)
+                ui.notify(f"Cleanup: {res}", color="green")
+            except Exception as e:
+                ui.notify(f"Cleanup failed: {e}", color="red")
+            await refresh()
 
         async def do_start():
             await engine.start(by_user=True)
@@ -1603,6 +1619,8 @@ async def dashboard_page():
                 "hubx-btn hubx-btn-warn")
             ui.button(t("one_cycle"), on_click=do_one_cycle).classes(
                  "hubx-btn hubx-btn-primary")
+            ui.button("🧹 Remove duplicates", on_click=do_dedup).classes(
+                 "hubx-btn hubx-btn-ghost")
 
         def _do_refresh_sync():
             try:
