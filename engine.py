@@ -1,8 +1,6 @@
 # engine.py
-# v12: Canonical duplicate protection + periodic dedup.
-#      - Never generates a template/topic whose canonical name exists.
-#      - Runs deduplicate_all() every N cycles.
-#      - Uses AI-suggested category when provided.
+# v13: Auto phase advancement when no new templates available.
+#      Keeps v1->v2->v3 workflow, replaces old versions in DB.
 
 from __future__ import annotations
 import asyncio
@@ -13,6 +11,7 @@ from gemini import (
     generate_knowledge, refine_knowledge,
     generate_template, refine_template,
     suggest_subtopics, suggest_subtemplates,
+    expand_phase,
 )
 
 import db as _db
@@ -45,7 +44,6 @@ def _read_focus_state():
 
 
 def _existing_knowledge(topic):
-    """Return a row if the topic exists by exact OR canonical match."""
     try:
         row = _db.get_knowledge_by_topic(topic)
         if row:
@@ -127,8 +125,7 @@ class Engine:
                         try:
                             res = await asyncio.to_thread(
                                 db.deduplicate_all)
-                            self.last_debug = (
-                                f"dedup: {res}")
+                            self.last_debug = f"dedup: {res}"
                         except Exception as e:
                             print(f"[engine] dedup failed: {e}")
                 except asyncio.CancelledError:
@@ -184,7 +181,6 @@ class Engine:
         focus_cats = focus_cats or set()
         topic = category = None
 
-        # Preload canonical set of existing topics (fast skip-check).
         existing_topics = set()
         try:
             rows = await asyncio.to_thread(
@@ -277,7 +273,6 @@ class Engine:
         focus_cats = focus_cats or set()
         name = category = None
 
-        # Preload canonical set of existing templates.
         existing_templates = set()
         try:
             rows = await asyncio.to_thread(
@@ -343,6 +338,10 @@ class Engine:
                 print(f"[engine] fresh template suggestion failed: {e}")
 
         if not name:
+            # No new templates available. Try to advance an existing one.
+            advanced = await self._advance_template_phase()
+            if advanced:
+                return
             self.last_debug = "no new templates available"
             return
 
@@ -371,6 +370,66 @@ class Engine:
             self.last_debug = f"generated: {name} (+{added} queued)"
         except Exception as e:
             print(f"[engine] suggest_subtemplates failed: {e}")
+
+    async def _advance_template_phase(self):
+        """Pick the oldest template below max_phase and upgrade it.
+        This replaces v1 with v2 (bumps version) in the DB."""
+        try:
+            max_phase = int(_db.get_app_state("max_phase", "8") or "8")
+        except Exception:
+            max_phase = 8
+        if max_phase <= 1:
+            return False
+        try:
+            rows = await asyncio.to_thread(
+                lambda: _db.get_all_templates(limit=5000))
+        except Exception:
+            return False
+        candidates = []
+        for r in rows:
+            # r = (id, name, category, content, refined, version,
+            #      confidence, updated_at)
+            tid, tname, tcat = r[0], r[1], r[2]
+            content = r[4] or r[3] or ""
+            version = r[5] or 1
+            # we store phase in version-1 terms: v2 = Phase 2, etc.
+            current_phase = version if version >= 1 else 1
+            if current_phase >= max_phase:
+                continue
+            if not content.strip():
+                continue
+            candidates.append((tid, tname, tcat, content, current_phase))
+        if not candidates:
+            return False
+        # Pick the least recently updated / oldest version
+        candidates.sort(key=lambda x: x[4])  # lowest phase first
+        tid, tname, tcat, old_content, cur_phase = candidates[0]
+        target_phase = cur_phase + 1
+        self.last_debug = (f"advancing {tname[:40]} "
+                           f"(v{cur_phase} → v{target_phase})")
+        try:
+            new_section = await expand_phase(
+                tname, tcat, old_content, cur_phase, target_phase)
+            self.gemini_calls += 1
+        except Exception as e:
+            print(f"[engine] expand_phase failed: {e}")
+            return False
+        if not new_section:
+            self.last_debug = f"expand failed: {tname}"
+            return False
+        # Append the new phase to the existing content
+        merged = old_content.rstrip() + "\n\n---\n\n" + new_section.strip()
+        try:
+            _db.upsert_template(tname, tcat, merged, confidence=0.7)
+            _db.log_template_run(
+                self.cycles, f"{tname} (v{cur_phase}->v{target_phase})",
+                1, 1, "")
+            self.last_debug = (f"advanced: {tname[:40]} "
+                               f"(v{cur_phase}->v{target_phase})")
+        except Exception as e:
+            print(f"[engine] upsert after advance failed: {e}")
+            return False
+        return True
 
     def stats(self) -> dict:
         kb_total = kb_refined = kb_pending = 0
