@@ -1,5 +1,8 @@
 # engine.py
-# v11: template_step now uses the AI's suggested category.
+# v12: Canonical duplicate protection + periodic dedup.
+#      - Never generates a template/topic whose canonical name exists.
+#      - Runs deduplicate_all() every N cycles.
+#      - Uses AI-suggested category when provided.
 
 from __future__ import annotations
 import asyncio
@@ -13,6 +16,7 @@ from gemini import (
 )
 
 import db as _db
+import db
 
 from sources import (
     LEARNING_INTERVAL_SECONDS, TEMPLATE_INTERVAL_SECONDS,
@@ -20,6 +24,7 @@ from sources import (
 )
 
 PAUSED_KEY = "engine_paused_by_user"
+DEDUP_EVERY_N_CYCLES = 20
 
 
 def _read_focus_state():
@@ -40,17 +45,28 @@ def _read_focus_state():
 
 
 def _existing_knowledge(topic):
+    """Return a row if the topic exists by exact OR canonical match."""
     try:
-        return _db.get_knowledge_by_topic(topic)
+        row = _db.get_knowledge_by_topic(topic)
+        if row:
+            return row
+        if db.knowledge_canonical_exists(topic):
+            return True
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _existing_template(name):
     try:
-        return _db.get_template_by_name(name)
+        row = _db.get_template_by_name(name)
+        if row:
+            return row
+        if db.template_canonical_exists(name):
+            return True
     except Exception:
-        return None
+        pass
+    return None
 
 
 class Engine:
@@ -107,6 +123,14 @@ class Engine:
                     await self._cycle()
                     self.cycles += 1
                     self.cycles_completed = self.cycles
+                    if self.cycles % DEDUP_EVERY_N_CYCLES == 0:
+                        try:
+                            res = await asyncio.to_thread(
+                                db.deduplicate_all)
+                            self.last_debug = (
+                                f"dedup: {res}")
+                        except Exception as e:
+                            print(f"[engine] dedup failed: {e}")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -160,6 +184,24 @@ class Engine:
         focus_cats = focus_cats or set()
         topic = category = None
 
+        # Preload canonical set of existing topics (fast skip-check).
+        existing_topics = set()
+        try:
+            rows = await asyncio.to_thread(
+                lambda: _db.get_all_knowledge(limit=10000))
+            for r in rows:
+                c = db._canonical(r[1])
+                if c:
+                    existing_topics.add(c)
+        except Exception:
+            pass
+
+        def _exists(t):
+            if t in existing_topics:
+                return True
+            c = db._canonical(t)
+            return bool(c and c in existing_topics)
+
         for _ in range(20):
             item = None
             try:
@@ -177,7 +219,7 @@ class Engine:
 
             if focus_cats and c not in focus_cats:
                 continue
-            if _existing_knowledge(t):
+            if _exists(t):
                 continue
             topic, category = t, c
             break
@@ -198,7 +240,7 @@ class Engine:
                 self.gemini_calls += 1
                 if subs:
                     t = subs[0]
-                    if not _existing_knowledge(t):
+                    if not _exists(t):
                         topic, category = t, "quality_management"
             except Exception as e:
                 print(f"[engine] fresh suggestion failed: {e}")
@@ -235,6 +277,24 @@ class Engine:
         focus_cats = focus_cats or set()
         name = category = None
 
+        # Preload canonical set of existing templates.
+        existing_templates = set()
+        try:
+            rows = await asyncio.to_thread(
+                lambda: _db.get_all_templates(limit=10000))
+            for r in rows:
+                c = db._canonical(r[1])
+                if c:
+                    existing_templates.add(c)
+        except Exception:
+            pass
+
+        def _exists(nm):
+            if nm in existing_templates:
+                return True
+            c = db._canonical(nm)
+            return bool(c and c in existing_templates)
+
         for _ in range(20):
             item = None
             try:
@@ -256,7 +316,7 @@ class Engine:
 
             if focus_cats and c not in focus_cats:
                 continue
-            if _existing_template(t):
+            if _exists(t):
                 continue
             name, category = t, c
             break
@@ -277,7 +337,7 @@ class Engine:
                 if subs:
                     t = subs[0].get("name", "")
                     c = subs[0].get("category", "quality")
-                    if not _existing_template(t):
+                    if not _exists(t):
                         name, category = t, c
             except Exception as e:
                 print(f"[engine] fresh template suggestion failed: {e}")
