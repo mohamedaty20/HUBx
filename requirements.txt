@@ -1,5 +1,4 @@
 nicegui==3.4.1
-libsql
 httpx
 beautifulsoup4
 feedparser
