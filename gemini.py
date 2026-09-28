@@ -1,7 +1,6 @@
 # gemini.py
 # Groq client for the HUBx knowledge / templates / checker features.
-# v21: shares the same daily-cap gate as prices_gemini.py so both engines
-#       draw from one budget (600/day, 40/hour). Handles 429 gracefully.
+# Contains every function engine.py imports.
 
 import os
 import re
@@ -21,10 +20,7 @@ from prompts import (
     PHASE_INSTRUCTIONS,
 )
 
-from db import (
-    check_and_increment_gemini_usage,
-    gemini_usage_stats,
-)
+from db import check_and_increment_gemini_usage
 
 logger = logging.getLogger(__name__)
 
@@ -121,15 +117,8 @@ def _extract_content(resp):
         content = content.strip()
     else:
         content = ""
-    reasoning = ""
-    try:
-        reasoning = getattr(msg, "reasoning", None) or ""
-    except Exception:
-        reasoning = ""
     if content:
         return content, True
-    if reasoning:
-        return "", False
     return "", False
 
 
