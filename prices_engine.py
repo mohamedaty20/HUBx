@@ -1,8 +1,10 @@
 # prices_engine.py
-# Self-learning price crawler loop. Mirror of engine.py but for prices.
+# Self-learning price crawler loop.
+# v2: much slower cadence, 429-aware cooldown, shared daily quota.
 
 from __future__ import annotations
 import asyncio
+import time
 import traceback
 
 import db as _db
@@ -12,8 +14,16 @@ from prices_fetcher import fetch_page
 from prices_sources import SEED_PRICE_SOURCES
 
 PAUSED_KEY = "prices_crawler_paused"
-CRAWL_INTERVAL_SECONDS = 90
-BATCH_SIZE = 3
+
+# Crawl every 20 minutes. Matches the careful pacing of the
+# knowledge/templates engines so we never burn the Groq quota.
+CRAWL_INTERVAL_SECONDS = 20 * 60  # 1200s
+
+# Only 1 source per cycle — keeps each cycle small.
+BATCH_SIZE = 1
+
+# If Groq returns 429, pause for 30 minutes before trying again.
+QUOTA_COOLDOWN_SECONDS = 30 * 60
 
 
 class PricesEngine:
@@ -30,6 +40,7 @@ class PricesEngine:
         self._wake = asyncio.Event()
         self._lock = asyncio.Lock()
         self._seed_idx = 0
+        self._quota_block_until = 0.0
 
     async def start(self, by_user=True):
         if self.running:
@@ -74,8 +85,16 @@ class PricesEngine:
                     traceback.print_exc()
                 if not self.running:
                     break
-                elapsed = asyncio.get_event_loop().time() - t0
-                wait = max(0.0, CRAWL_INTERVAL_SECONDS - elapsed)
+
+                # If we are in quota cooldown, wait that long instead.
+                now = time.monotonic()
+                if now < self._quota_block_until:
+                    wait = self._quota_block_until - now
+                    self.last_debug = f"quota cooldown ({int(wait)}s left)"
+                else:
+                    elapsed = asyncio.get_event_loop().time() - t0
+                    wait = max(0.0, CRAWL_INTERVAL_SECONDS - elapsed)
+
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=wait)
                     self._wake.clear()
@@ -87,25 +106,24 @@ class PricesEngine:
 
     async def _cycle(self):
         async with self._lock:
-            self.last_status = "running"
+            # Respect a prior 429 cooldown.
+            if time.monotonic() < self._quota_block_until:
+                return
 
-            # 1. Get next N sources
+            self.last_status = "running"
             sources = _pdb.next_sources_to_run(n=BATCH_SIZE)
             if not sources:
-                # No sources yet? Seed them once.
                 if _pdb.source_stats()["total"] == 0:
                     self.last_debug = "seeding sources…"
                     for name, url, kind in SEED_PRICE_SOURCES:
                         _pdb.add_source(name, url, kind)
                     self.last_debug = f"seeded {len(SEED_PRICE_SOURCES)} sources"
                     return
-                # Otherwise use seed list as a rolling fallback
                 name, url, kind = SEED_PRICE_SOURCES[
                     self._seed_idx % len(SEED_PRICE_SOURCES)]
                 self._seed_idx += 1
                 sources = [(0, name, url, kind)]
 
-            # 2. Process each source
             for src in sources:
                 sid, name, url, kind = src[0], src[1], src[2], src[3]
                 await self._process_source(sid, name, url)
@@ -120,17 +138,31 @@ class PricesEngine:
             self.last_error = text_or_err
             return
 
+        # Skip useless pages before spending a token.
+        if len(text_or_err) < 400:
+            if sid:
+                _pdb.mark_source_run(sid, "skip: page too short")
+            self.last_debug = f"skip: {name} (short)"
+            return
+
         self.last_debug = f"extracting: {name} ({len(text_or_err)} chars)"
         existing_cats = [c[2] for c in _pdb.all_categories()]
         result = await _pg.extract_prices(text_or_err, name, existing_cats)
         self.calls += 1
 
-        # Add new regions
+        # If Groq returned a 429, back off for 30 minutes.
+        err_lower = (_pg.last_error or "").lower()
+        if "429" in err_lower or "quota" in err_lower or "cooling" in err_lower:
+            self._quota_block_until = time.monotonic() + QUOTA_COOLDOWN_SECONDS
+            self.last_debug = "Groq 429 — cooling down 30m"
+            self.last_error = _pg.last_error
+            if sid:
+                _pdb.mark_source_run(sid, "quota_cooldown")
+            return
+
         for rn in (result.get("new_regions") or []):
             _pdb.add_region(rn)
 
-        # Add new categories (and any parent categories)
-        new_cat_ids = {}
         for c in (result.get("new_categories") or []):
             parent_id = None
             parent_name = c.get("parent")
@@ -142,14 +174,10 @@ class PricesEngine:
                 else:
                     parent_id = _pdb.add_category(
                         parent_name, None, "ai", 0.5)
-            cid = _pdb.add_category(c["name"], parent_id, "ai", 0.6)
-            if cid:
-                new_cat_ids[c["name"]] = cid
+            _pdb.add_category(c["name"], parent_id, "ai", 0.6)
 
-        # Insert observations
         inserted = 0
         for p in (result.get("prices") or []):
-            # Find category — try to match against existing slugs
             cat_id = None
             mat_lower = p["material"].lower()
             all_cats = _pdb.all_categories()
