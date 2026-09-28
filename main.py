@@ -1,5 +1,5 @@
 # main.py
-# v16: runs deduplicate_all() on startup.
+# v17: registers the Jobs engine + /jobs admin page.
 
 import os
 import io
@@ -11,6 +11,8 @@ from collections import Counter
 from datetime import datetime
 from prices_page import render_prices_page
 from prices_engine import auto_start_prices_if_needed
+from jobs_page import render_jobs_page
+from jobs_engine import auto_start_jobs_if_needed
 
 from nicegui import ui, app
 
@@ -170,7 +172,6 @@ def is_rtl() -> bool:
 
 init_db()
 
-# Clean up any duplicate rows that already exist in D1.
 try:
     _dedup_result = deduplicate_all()
     print(f"[startup] deduplicate_all -> {_dedup_result}")
@@ -496,7 +497,8 @@ async def _keepalive():
 def _boot_tasks():
     asyncio.create_task(_keepalive())
     asyncio.create_task(auto_start_if_needed())
-    asyncio.create_task(auto_start_prices_if_needed())   # ← new
+    asyncio.create_task(auto_start_prices_if_needed())
+    asyncio.create_task(auto_start_jobs_if_needed())
 
 
 app.on_startup(_boot_tasks)
@@ -638,6 +640,7 @@ def _header():
             ui.link(t("nav_charts"), "/charts")
             ui.link(t("nav_dashboard"), "/dashboard")
             ui.link("Live Prices", "/prices")
+            ui.link("Jobs", "/jobs")
         _lang_toggle()
 
 
@@ -1735,6 +1738,16 @@ def prices_page():
     _header()
     _db_banner()
     render_prices_page()
+
+
+@ui.page("/jobs")
+def jobs_page():
+    STATE.lang = app.storage.user.get("lang", STATE.lang)
+    STATE.focus = app.storage.user.get("focus", STATE.focus)
+    _apply_body_class()
+    _header()
+    _db_banner()
+    render_jobs_page()
 
 
 ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx",
