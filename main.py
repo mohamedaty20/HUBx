@@ -1725,13 +1725,17 @@ async def dashboard_page():
 
         ui.timer(30.0, refresh_tpl_runs)
         await refresh_tpl_runs()
-        @ui.page("/prices")
-        def prices_page():
-            STATE.lang = app.storage.user.get("lang", STATE.lang)
-            _apply_body_class()
-            _header()
-            _db_banner()
-            render_prices_page()
+
+
+@ui.page("/prices")
+def prices_page():
+    STATE.lang = app.storage.user.get("lang", STATE.lang)
+    STATE.focus = app.storage.user.get("focus", STATE.focus)
+    _apply_body_class()
+    _header()
+    _db_banner()
+    render_prices_page()
+
 
 ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx",
        storage_secret=os.getenv("STORAGE_SECRET", "hubx-dev-secret"))
