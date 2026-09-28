@@ -1,6 +1,5 @@
 # gemini.py
 # Groq client for the HUBx knowledge / templates / checker features.
-# Contains every function engine.py imports.
 
 import os
 import re
