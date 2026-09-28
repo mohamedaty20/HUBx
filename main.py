@@ -9,6 +9,8 @@ import csv
 import json
 from collections import Counter
 from datetime import datetime
+from prices_page import render_prices_page
+from prices_engine import auto_start_prices_if_needed
 
 from nicegui import ui, app
 
@@ -494,6 +496,7 @@ async def _keepalive():
 def _boot_tasks():
     asyncio.create_task(_keepalive())
     asyncio.create_task(auto_start_if_needed())
+    asyncio.create_task(auto_start_prices_if_needed())   # ← new
 
 
 app.on_startup(_boot_tasks)
@@ -634,6 +637,7 @@ def _header():
             ui.link(t("nav_templates"), "/templates")
             ui.link(t("nav_charts"), "/charts")
             ui.link(t("nav_dashboard"), "/dashboard")
+            ui.link("Live Prices", "/prices")
         _lang_toggle()
 
 
@@ -1721,7 +1725,13 @@ async def dashboard_page():
 
         ui.timer(30.0, refresh_tpl_runs)
         await refresh_tpl_runs()
-        
+        @ui.page("/prices")
+        def prices_page():
+            STATE.lang = app.storage.user.get("lang", STATE.lang)
+            _apply_body_class()
+            _header()
+            _db_banner()
+            render_prices_page()
 
 ui.run(host="0.0.0.0", port=PORT, reload=False, title="HUBx",
        storage_secret=os.getenv("STORAGE_SECRET", "hubx-dev-secret"))
