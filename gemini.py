@@ -1,8 +1,8 @@
-# gemini.py
-# v20: suggest_subtemplates now returns category alongside name.
+# prices_gemini.py
+# Groq-based extraction of material prices, categories, and regions.
+# v2: much smaller prompts, shared daily quota, 429-aware.
 
 import os
-import re
 import json
 import asyncio
 import logging
@@ -11,32 +11,17 @@ import random
 
 from groq import AsyncGroq
 
-from prompts import (
-    KNOWLEDGE_SYSTEM_PROMPT, KNOWLEDGE_USER_TEMPLATE,
-    REFINE_SYSTEM_PROMPT, REFINE_USER_TEMPLATE,
-    CHECKER_SYSTEM_PROMPT, CHECKER_USER_TEMPLATE,
-    TEMPLATE_SYSTEM_PROMPT, TEMPLATE_USER_TEMPLATE,
-    PHASE_INSTRUCTIONS,
-)
-
-from db import (check_and_increment_gemini_usage,
-                gemini_usage_stats)
-
 logger = logging.getLogger(__name__)
 
 MODEL = "openai/gpt-oss-20b"
-
-GEMINI_DAY_LIMIT = int(os.getenv("GEMINI_DAY_LIMIT", "600"))
-GEMINI_HOUR_LIMIT = int(os.getenv("GEMINI_HOUR_LIMIT", "40"))
-_QUOTA_BLOCK_SECONDS = 240
-ATTEMPT_TIMEOUT_SECONDS = 240
-MIN_CALL_GAP = 240.0
-
-# Reasoning models need a lot of headroom. Set low to save tokens.
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")
-
-_quota_block_until = 0.0
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+
+# Small model + small prompt = small token budget.
+# Groq's free daily token limit is 200k. Keep each call under ~4000 tokens
+# so we can still do ~50 calls per day without hitting the ceiling.
+MAX_INPUT_CHARS = 6000
+MAX_OUTPUT_TOKENS = 1500
 
 _client = None
 if GROQ_API_KEY:
@@ -45,50 +30,15 @@ if GROQ_API_KEY:
 last_error = ""
 _rate_lock = asyncio.Lock()
 _last_call_time = 0.0
+MIN_CALL_GAP = 8.0  # seconds between calls — keeps us well under 30 req/min
 
-
-_LATEX_SIMPLE = [
-    (r"\\times\b", "×"), (r"\\cdot\b", "·"), (r"\\div\b", "÷"),
-    (r"\\pm\b", "±"), (r"\\mp\b", "∓"), (r"\\geq\b", "≥"),
-    (r"\\ge\b", "≥"), (r"\\leq\b", "≤"), (r"\\le\b", "≤"),
-    (r"\\neq\b", "≠"), (r"\\ne\b", "≠"), (r"\\approx\b", "≈"),
-    (r"\\propto\b", "∝"), (r"\\infty\b", "∞"),
-    (r"\\rightarrow\b", "→"), (r"\\to\b", "→"),
-    (r"\\leftarrow\b", "←"), (r"\\degree\b", "°"),
-    (r"\\circ\b", "°"), (r"\\left\b", ""), (r"\\right\b", ""),
-    (r"\\displaystyle\b", ""), (r"\\quad\b", " "),
-    (r"\\qquad\b", "  "), (r"\\,", " "), (r"\\;", " "),
-    (r"\\!", ""), (r"\\%", "%"), (r"\\&", "&"),
-    (r"\\#", "#"), (r"\\_", "_"), (r"\\\$", "$"),
-    (r"\\square\b", "□"), (r"\\Box\b", "□"),
-    (r"\\checkmark\b", "✓"), (r"\\check\b", "✓"),
-    (r"\\bullet\b", "•"), (r"\\cdots\b", "…"),
-    (r"\\ldots\b", "…"), (r"\\dots\b", "…"),
-]
-
-
-def sanitize_text(s):
-    if not s:
-        return s
-    s = str(s)
-    s = re.sub(r"\\\(([^)]*)\\\)", r"\1", s)
-    s = re.sub(r"\\\[([^\]]*)\\\]", r"\1", s)
-    s = re.sub(r"\\text(?:bf|it|rm|sf|tt)?\{([^{}]*)\}", r"\1", s)
-    s = re.sub(r"\\math(?:bf|it|rm|sf|tt)\{([^{}]*)\}", r"\1", s)
-    s = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", s)
-    s = re.sub(r"\\[A-Za-z]+\{([^{}]*)\}", r"\1", s)
-    s = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", s)
-    s = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", s)
-    s = re.sub(r"\^\{([^{}]*)\}", r"^(\1)", s)
-    s = re.sub(r"_\{([^{}]*)\}", r"_\1", s)
-    s = re.sub(r"\^([0-9A-Za-z])", r"^\1", s)
-    for pat, rep in _LATEX_SIMPLE:
-        s = re.sub(pat, rep, s)
-    s = s.replace("$$", " ").replace("$", "")
-    s = re.sub(r"\\[A-Za-z]+\b", "", s).replace("\\", "")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+# Shared daily-cap gate — imported from the main db module.
+def _usage_gate():
+    try:
+        from db import check_and_increment_gemini_usage
+        return check_and_increment_gemini_usage(day_limit=600, hour_limit=40)
+    except Exception:
+        return True
 
 
 async def _throttle():
@@ -97,307 +47,150 @@ async def _throttle():
         now = time.monotonic()
         wait = MIN_CALL_GAP - (now - _last_call_time)
         if wait > 0:
-            wait += random.uniform(0, 3.0)
+            wait += random.uniform(0, 2.0)
             await asyncio.sleep(wait)
         _last_call_time = time.monotonic()
 
 
-def _is_quota_error(err_str):
-    s = (err_str or "").lower()
-    return ("429" in s or "quota" in s or "rate limit" in s
-            or "too many requests" in s or "exceeded" in s
-            or ("tokens" in s and "limit" in s))
-
-
-def _is_json_validation_error(err_str):
-    s = (err_str or "").lower()
-    return ("json_validate_failed" in s or "failed to generate json" in s
-            or "max completion tokens reached" in s)
-
-
 def _extract_content(resp):
-    """
-    Groq gpt-oss models return message.content OR message.reasoning.
-    If content is empty but reasoning exists, that means the model
-    thought but never produced the final answer.
-    """
     try:
         msg = resp.choices[0].message
     except Exception:
-        return "", False
-
-    content = getattr(msg, "content", None)
-    if isinstance(content, str):
-        content = content.strip()
-    else:
-        content = ""
-
-    reasoning = ""
-    try:
-        reasoning = getattr(msg, "reasoning", None) or ""
-    except Exception:
-        reasoning = ""
-
-    if content:
-        return content, True
-    if reasoning:
-        # Got reasoning but no output. Not usable.
-        return "", False
-    return "", False
+        return ""
+    c = getattr(msg, "content", None)
+    if isinstance(c, str) and c.strip():
+        return c.strip()
+    return ""
 
 
-async def _call(prompt, json_mode=False, max_tokens=6000, max_retries=2):
-    global last_error, _quota_block_until
-
+async def _groq(prompt, max_tokens=MAX_OUTPUT_TOKENS, json_mode=True):
+    global last_error
     if not _client:
         last_error = "GROQ_API_KEY not set"
         return ""
-
-    now_m = time.monotonic()
-    if now_m < _quota_block_until:
-        left = int(_quota_block_until - now_m)
-        last_error = f"{MODEL}: cooling down, {left}s left"
+    if not _usage_gate():
+        last_error = "shared daily cap reached"
         return ""
 
+    await _throttle()
     kwargs = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.4 if json_mode else 0.7,
+        "temperature": 0.3,
         "max_tokens": max_tokens,
         "reasoning_effort": REASONING_EFFORT,
     }
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
-
-    for attempt in range(max_retries):
-        allowed = check_and_increment_gemini_usage(
-            day_limit=GEMINI_DAY_LIMIT, hour_limit=GEMINI_HOUR_LIMIT)
-        if not allowed:
-            _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
-            last_error = (f"{MODEL}: cap reached "
-                          f"({GEMINI_HOUR_LIMIT}/hour), paused "
-                          f"{_QUOTA_BLOCK_SECONDS}s")
-            logger.warning(last_error)
+    try:
+        resp = await asyncio.wait_for(
+            _client.chat.completions.create(**kwargs), timeout=90)
+        text = _extract_content(resp)
+        if not text:
+            last_error = "empty content"
             return ""
-
-        await _throttle()
-        try:
-            resp = await asyncio.wait_for(
-                _client.chat.completions.create(**kwargs),
-                timeout=ATTEMPT_TIMEOUT_SECONDS,
-            )
-            text, ok = _extract_content(resp)
-            if ok and text:
-                last_error = ""
-                return sanitize_text(text)
-            # Emtpy content OR only reasoning — treat as failure.
-            # Try once more with a nudge.
-            if attempt == 0:
-                last_error = f"{MODEL}: empty content, retrying"
-                logger.warning(last_error)
-                continue
-            last_error = f"{MODEL}: empty content twice"
+        last_error = ""
+        return text
+    except Exception as e:
+        msg = str(e)
+        # Detect the 429/token-limit error precisely.
+        if "429" in msg or "rate_limit" in msg.lower() or "tokens per day" in msg.lower():
+            last_error = "429 quota — cooling down"
+            logger.warning("Groq 429: %s", msg[:200])
             return ""
-        except asyncio.TimeoutError:
-            last_error = (f"{MODEL}: attempt {attempt + 1}/{max_retries} "
-                          f"timed out after {ATTEMPT_TIMEOUT_SECONDS}s")
-            logger.warning(last_error)
-            return ""
-        except Exception as e:
-            err_str = f"{type(e).__name__}: {e}"
-            if _is_quota_error(err_str):
-                _quota_block_until = time.monotonic() + _QUOTA_BLOCK_SECONDS
-                last_error = (f"{MODEL}: Groq 429, cooling "
-                              f"{_QUOTA_BLOCK_SECONDS}s")
-                logger.warning(last_error)
-                return ""
-            if _is_json_validation_error(err_str):
-                last_error = f"{MODEL}: JSON too large for budget"
-                logger.warning(last_error)
-                return ""
-            last_error = f"{MODEL}: {err_str}"
-            logger.warning("LLM call failed (attempt %d): %s", attempt + 1, e)
-            await asyncio.sleep(4 * (attempt + 1))
-    return ""
-
-
-async def generate_knowledge(topic, category):
-    user = KNOWLEDGE_USER_TEMPLATE.format(topic=topic, category=category)
-    return await _call(f"{KNOWLEDGE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=6000)
-
-
-async def refine_knowledge(topic, existing):
-    user = REFINE_USER_TEMPLATE.format(topic=topic, content=existing[:6000])
-    return await _call(f"{REFINE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=6000)
-
-
-async def generate_template(name, category):
-    user = TEMPLATE_USER_TEMPLATE.format(name=name, category=category)
-    return await _call(f"{TEMPLATE_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                       json_mode=False, max_tokens=6000)
-
-
-async def refine_template(name, existing):
-    return await _call(
-        "Improve the following construction template. Keep it FULLY "
-        "BILINGUAL. Sample Filled Example MUST be a markdown table. "
-        "Never use <br>. No LaTeX, no \\square, no \\(...\\).\n\n"
-        "---\n\n"
-        f"Template: {name}\n\n{existing[:6000]}",
-        json_mode=False, max_tokens=6000)
-
-
-async def expand_phase(title, category, current_content,
-                       current_phase, target_phase):
-    """
-    Generate ONLY the new phase section. Appended by engine.
-    Reasoning models get extra token budget + low reasoning effort.
-    """
-    instructions = PHASE_INSTRUCTIONS.get(target_phase, "")
-    if not instructions:
+        last_error = f"{type(e).__name__}: {msg[:120]}"
+        logger.warning("Groq call failed: %s", msg[:200])
         return ""
 
-    tail = (current_content or "")[-1500:]
-    context_hint = f"...[existing ends with]...\n{tail}" if tail else ""
 
+def _strip_fences(s):
+    if s.startswith("```"):
+        s = s.split("\n", 1)[-1]
+        s = s.rsplit("```", 1)[0]
+    return s.strip()
+
+
+PRICE_SYSTEM = (
+    "Extract construction material prices from the text. "
+    "Return ONLY JSON: "
+    '{"prices":[{"material":"","spec":"","price":0,'
+    '"currency":"EGP","unit":"","region":"","confidence":0.5}],'
+    '"new_categories":[{"name":"","parent":""}],"new_regions":[""]}. '
+    "Only include prices clearly stated. Never invent prices. "
+    "Drop anything uncertain. English material names."
+)
+
+
+async def extract_prices(page_text, source_name, existing_categories):
+    if not page_text:
+        return {"prices": [], "new_categories": [], "new_regions": []}
+
+    # Hard-truncate to keep the token count low.
+    snippet = page_text[:MAX_INPUT_CHARS]
+
+    # Skip obviously useless pages before spending a token.
+    if len(snippet) < 400:
+        return {"prices": [], "new_categories": [], "new_regions": []}
+
+    cats = ", ".join(existing_categories[:30]) if existing_categories else "(none)"
     prompt = (
-        "You are a senior Egyptian civil quality engineer. Write ONE new "
-        "section to append to an existing bilingual document. Do NOT "
-        "reproduce the existing document. Return ONLY the new section.\n\n"
-        f"Document title: {title}\n"
-        f"Category: {category}\n"
-        f"Current phase: {current_phase}\n"
-        f"New phase: {target_phase}\n\n"
-        f"{instructions}\n\n"
-        "STRICT RULES:\n"
-        "- Return ONLY the new section. No preamble.\n"
-        "- Every line: English / العربية separated by ' / '.\n"
-        "- Start with a markdown ## heading.\n"
-        "- No <br>, no LaTeX, no \\(...\\), no \\square.\n"
-        "- Never invent code clause numbers.\n"
-        "- Never invent office addresses, phones, or fees.\n\n"
-        f"Style context (tail of existing):\n{context_hint}\n\n"
-        "Write ONLY the new section now:"
+        f"{PRICE_SYSTEM}\n\n"
+        f"Existing categories: {cats}\n"
+        f"Source name: {source_name}\n\n"
+        f"Page text:\n{snippet}\n\n"
+        "Return the JSON now."
     )
-    return await _call(prompt, json_mode=False, max_tokens=5000)
-
-
-async def suggest_subtopics(parent_topic, category, n=2):
-    prompt = (
-        f"Return a JSON object with one key 'subtopics' whose value is "
-        f"an array of exactly {n} short bilingual strings. "
-        f"Category: {category}. Parent: {parent_topic}. "
-        "Each string: 'English Title / العربية'. English part 4-8 words. "
-        "Output under 200 tokens."
-    )
-    raw = await _call(prompt, json_mode=True, max_tokens=2500)
+    raw = await _groq(prompt)
     if not raw:
-        return []
+        return {"prices": [], "new_categories": [], "new_regions": []}
     try:
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            for key in ("subtopics", "topics", "items"):
-                if key in data and isinstance(data[key], list):
-                    data = data[key]
-                    break
-        if isinstance(data, list):
-            return [sanitize_text(str(x)).strip() for x in data
-                    if isinstance(x, (str, int)) and str(x).strip()]
-    except Exception:
-        pass
-    return []
+        data = json.loads(_strip_fences(raw))
+    except Exception as e:
+        logger.warning("extract_prices JSON parse failed: %s", e)
+        return {"prices": [], "new_categories": [], "new_regions": []}
+    if not isinstance(data, dict):
+        return {"prices": [], "new_categories": [], "new_regions": []}
 
-
-async def suggest_subtemplates(parent_name, category, n=2):
-    prompt = (
-        f"Return a JSON object with one key 'templates' whose value is "
-        f"an array of objects. Each object has a 'name' string and a "
-        f"'category' string. "
-        f"Category must be one of: administrative, quality, safety, "
-        f"technical, financial, legal, handover. "
-        f"Parent category: {category}. Parent name: {parent_name}. "
-        f"Propose exactly {n} new bilingual template names. "
-        f"Name format: 'English Name / الاسم بالعربية'. English part 4-8 words. "
-        "Output under 300 tokens."
-    )
-    raw = await _call(prompt, json_mode=True, max_tokens=2500)
-    if not raw:
-        return []
-    try:
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            for key in ("templates", "items", "names"):
-                if key in data and isinstance(data[key], list):
-                    data = data[key]
-                    break
-        if isinstance(data, list):
-            result = []
-            for x in data:
-                if isinstance(x, dict) and "name" in x:
-                    name_val = sanitize_text(str(x["name"])).strip()
-                    cat_val = sanitize_text(str(x.get("category", category))).strip().lower()
-                    # Validate category
-                    valid_cats = ["administrative", "quality", "safety", "technical", "financial", "legal", "handover"]
-                    if cat_val not in valid_cats:
-                        cat_val = category  # fallback to parent
-                    result.append({"name": name_val, "category": cat_val})
-                elif isinstance(x, str):
-                    # backward compatibility if AI ignores format
-                    result.append({"name": sanitize_text(x).strip(), "category": category})
-            return result
-    except Exception:
-        pass
-    return []
-
-
-async def check_document(filename, file_type, text):
-    user = CHECKER_USER_TEMPLATE.format(
-        filename=filename, file_type=file_type, text=text[:12000])
-    raw = await _call(f"{CHECKER_SYSTEM_PROMPT}\n\n---\n\n{user}",
-                      json_mode=True, max_tokens=4000)
-    if not raw:
-        return {}
-    try:
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
-        result = json.loads(raw)
-    except Exception:
-        return {}
-    if not isinstance(result, dict):
-        return {}
-    result["summary"] = sanitize_text(result.get("summary", ""))
-    issues = result.get("issues", []) or []
-    for it in issues:
-        if not isinstance(it, dict):
+    clean_prices = []
+    for p in (data.get("prices") or [])[:40]:
+        if not isinstance(p, dict):
             continue
-        for k in ("location", "problem", "fix", "reference", "severity"):
-            if k in it:
-                it[k] = sanitize_text(it[k])
-    result["issues"] = issues
-    result.setdefault("score", 0.0)
-    return result
+        try:
+            price = float(str(p.get("price", "")).replace(",", "").strip())
+        except Exception:
+            continue
+        if price <= 0 or price > 1_000_000_000:
+            continue
+        mat = str(p.get("material", "")).strip()[:200]
+        if not mat or len(mat) < 3:
+            continue
+        clean_prices.append({
+            "material": mat,
+            "spec": str(p.get("spec", "")).strip()[:120] or None,
+            "price": price,
+            "currency": str(p.get("currency", "EGP")).strip()[:8] or "EGP",
+            "unit": str(p.get("unit", "")).strip()[:40] or None,
+            "region": str(p.get("region", "")).strip()[:120] or None,
+            "confidence": max(0.0, min(1.0, float(p.get("confidence", 0.5) or 0.5))),
+        })
 
+    new_cats = []
+    for c in (data.get("new_categories") or [])[:20]:
+        if isinstance(c, dict):
+            nm = str(c.get("name", "")).strip()[:120]
+            if nm and len(nm) >= 2:
+                new_cats.append({
+                    "name": nm,
+                    "parent": str(c.get("parent", "")).strip()[:120] or None,
+                })
 
-async def ai_search(question, knowledge_context):
-    prompt = (
-        "You are a senior Egyptian civil quality engineer. Answer using "
-        "ONLY the excerpts below. No LaTeX, no <br>.\n\n"
-        "RULES:\n- 300-600 words.\n- Markdown headings and bullets.\n"
-        "- Cite topic names in brackets.\n"
-        "- End with '## Related topics'.\n\n"
-        f"=== EXCERPTS ===\n{knowledge_context}\n\n"
-        f"=== QUESTION ===\n{question}\n"
-    )
-    return await _call(prompt, json_mode=False, max_tokens=3000)
+    new_regions = []
+    for r in (data.get("new_regions") or [])[:20]:
+        if isinstance(r, str):
+            nm = r.strip()[:120]
+            if nm:
+                new_regions.append(nm)
 
-
-async def ocr_image(path):
-    global last_error
-    last_error = "OCR not supported on Groq provider"
-    return ""
+    return {"prices": clean_prices,
+            "new_categories": new_cats,
+            "new_regions": new_regions}
